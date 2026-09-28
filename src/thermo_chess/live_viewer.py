@@ -1,0 +1,287 @@
+"""Dynamic browser viewer for saved thermodynamic chess matches."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import posixpath
+import webbrowser
+from dataclasses import dataclass
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import unquote, urlparse
+
+
+
+LIVE_VIEWER_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Thermodynamic Chess Live Viewer</title>
+  <style>
+    :root { --bg: #f4f1ea; --ink: #161616; --muted: #66615a; --line: #c8c1b5; --panel: #fffdfa; --light: #e9d8b7; --dark: #58806a; --accent: #176b87; --accent-2: #9a3412; --good: #146c43; --bad: #b42318; color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; } body { margin: 0; background: var(--bg); color: var(--ink); }
+    .app { min-height: 100vh; display: grid; grid-template-rows: auto 1fr; }
+    header { border-bottom: 1px solid var(--line); background: #fffaf2; padding: 12px 18px; display: grid; grid-template-columns: minmax(260px, 1fr) auto; gap: 14px; align-items: center; }
+    h1 { margin: 0; font-size: 18px; font-weight: 760; letter-spacing: 0; }
+    .meta { color: var(--muted); font-size: 13px; display: flex; gap: 14px; flex-wrap: wrap; }
+    .game-select { display: flex; gap: 8px; align-items: center; justify-content: end; flex-wrap: wrap; }
+    select { height: 36px; min-width: 280px; border: 1px solid var(--line); background: var(--panel); border-radius: 6px; color: var(--ink); padding: 0 8px; }
+    button { height: 36px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 6px; font-size: 15px; cursor: pointer; padding: 0 10px; }
+    button:hover { border-color: var(--accent); }
+    main { display: grid; grid-template-columns: minmax(330px, 430px) 1fr; gap: 16px; padding: 16px; align-items: start; }
+    .board-zone { display: grid; gap: 12px; position: sticky; top: 12px; }
+    .board-wrap { width: min(100%, 430px); aspect-ratio: 1 / 1; border: 1px solid #2f3b35; box-shadow: 0 12px 32px rgb(35 31 26 / 16%); }
+    .board { display: grid; grid-template-columns: repeat(8, 1fr); grid-template-rows: repeat(8, 1fr); width: 100%; height: 100%; }
+    .sq { position: relative; display: grid; place-items: center; font-size: clamp(28px, 7.5vw, 48px); line-height: 1; }
+    .sq.light { background: var(--light); } .sq.dark { background: var(--dark); }
+    .sq.last-from::after, .sq.last-to::after { content: ""; position: absolute; inset: 7%; border: 3px solid rgba(255, 232, 82, 0.9); border-radius: 4px; pointer-events: none; }
+    .coord { position: absolute; left: 4px; bottom: 3px; font-size: 10px; color: rgb(0 0 0 / 56%); }
+    .controls { display: grid; grid-template-columns: 42px 42px 1fr 42px 42px; gap: 8px; align-items: center; }
+    .controls button { font-size: 18px; padding: 0; } input[type="range"] { width: 100%; accent-color: var(--accent); }
+    .position-strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .stat, .panel, .notice { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+    .stat, .notice { padding: 10px 12px; }
+    .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+    .value { font-size: 18px; font-weight: 720; margin-top: 2px; }
+    .content { display: grid; gap: 16px; min-width: 0; }
+    .panels { display: grid; gap: 10px; align-items: start; }
+    .panel { overflow: hidden; } .panel-head { padding: 12px 14px; border-bottom: 1px solid var(--line); }
+    .comparison-table th.group-head { text-align: center; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--ink); }
+    .comparison-table .shared-col { text-align: center; background: #fffaf2; }
+    .comparison-table .shared-start { border-left: 2px solid var(--line); }
+    .comparison-table .shared-end { border-right: 2px solid var(--line); }
+    .panel-title { font-size: 16px; font-weight: 760; } .style { color: var(--muted); font-size: 12px; margin-top: 2px; overflow-wrap: anywhere; }
+    .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+    .metric { min-width: 0; } .metric .value { font-size: 15px; }
+    .best { padding: 0 14px 12px; color: var(--muted); font-size: 13px; }
+    .eval-bar-card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+    .eval-bar-labels { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+    .eval-bar-track { position: relative; height: 18px; border-radius: 999px; overflow: hidden; background: linear-gradient(90deg, #2f3b35 0 50%, #f7ead1 50% 100%); border: 1px solid var(--line); }
+    .eval-bar-fill { position: absolute; top: 0; bottom: 0; left: 50%; width: 0; background: var(--accent); }
+    .eval-bar-fill.black { left: auto; right: 50%; background: var(--accent-2); }
+    .eval-bar-zero { position: absolute; top: -2px; bottom: -2px; left: 50%; width: 2px; background: #fffdfa; box-shadow: 0 0 0 1px rgb(0 0 0 / 18%); }
+    .table-note { padding: 0 14px 8px; color: var(--muted); font-size: 12px; }
+    .table-wrap { max-height: 520px; overflow: auto; } table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { padding: 7px 8px; border-bottom: 1px solid #eee5da; text-align: right; white-space: nowrap; }
+    th { position: sticky; top: 0; background: #fff7eb; color: var(--muted); font-weight: 700; z-index: 1; }
+    th:first-child, td:first-child, .comparison-table .shared-move { text-align: left; }
+    tr.played td { background: #e7f4f5; }
+    tr.white-best td:nth-child(-n+6) { border-top: 3px solid #a3a3a3; border-bottom: 3px solid #a3a3a3; }
+    tr.white-best td:first-child { border-left: 3px solid #a3a3a3; }
+    tr.white-best td:nth-child(6) { border-right: 3px solid #a3a3a3; }
+    tr.black-best td:nth-child(n+9) { border-top: 3px solid #111; border-bottom: 3px solid #111; }
+    tr.black-best td:nth-child(9) { border-left: 3px solid #111; }
+    tr.black-best td:nth-child(14) { border-right: 3px solid #111; }
+    .positive { color: var(--good); } .negative { color: var(--bad); }
+    .move-list { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; max-height: 180px; overflow: auto; font-size: 13px; line-height: 1.8; }
+    .move-chip { display: inline-block; border: 1px solid transparent; border-radius: 5px; padding: 0 5px; cursor: pointer; }
+    .move-chip:hover { border-color: var(--accent); } .move-chip.active { background: var(--accent); color: white; }
+    .fen { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+    .loading { padding: 16px; color: var(--muted); }
+    .positive-bg { background: #edf8f2; }
+    .thermo-panel { overflow: hidden; }
+    .thermo-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+    .thermo-card { min-width: 0; border-left: 3px solid var(--line); padding-left: 9px; }
+    .thermo-detail { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px 14px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+    @media (max-width: 1050px) { header { grid-template-columns: 1fr; } .game-select { justify-content: start; } main { grid-template-columns: 1fr; } .board-zone { position: static; justify-items: center; } .panels { grid-template-columns: 1fr; } }
+    @media (max-width: 620px) { main { padding: 10px; } .metrics, .thermo-cards, .thermo-detail { grid-template-columns: 1fr 1fr; } .controls { grid-template-columns: 38px 38px 1fr 38px 38px; } select { min-width: 180px; width: 100%; } }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div><h1>Thermodynamic Chess Live Viewer</h1><div class="meta"><span id="source"></span><span id="result"></span><span id="ply-count"></span><span id="status"></span></div></div>
+      <div class="game-select"><label class="label" for="game-select">Game</label><select id="game-select"></select><button id="refresh" title="Refresh games">Refresh</button></div>
+    </header>
+    <main id="main">
+      <section class="board-zone">
+        <div class="board-wrap"><div class="board" id="board"></div></div>
+        <div class="controls"><button id="first" title="First position">⏮</button><button id="prev" title="Previous ply">◀</button><input id="slider" type="range" min="0" value="0"><button id="next" title="Next ply">▶</button><button id="last" title="Last position">⏭</button></div>
+        <div class="position-strip"><div class="stat"><div class="label">Position</div><div class="value" id="position-label"></div></div><div class="stat"><div class="label">Side To Move</div><div class="value" id="turn"></div></div><div class="stat"><div class="label">Static E(B)</div><div class="value" id="static-v"></div></div></div>
+        <div class="eval-bar-card"><div class="eval-bar-labels"><span id="white-e-label"></span><span id="black-e-label"></span></div><div class="eval-bar-track"><div class="eval-bar-fill" id="white-e-fill"></div><div class="eval-bar-fill black" id="black-e-fill"></div><div class="eval-bar-zero"></div></div></div>
+        <div class="fen" id="fen"></div><div class="move-list" id="move-list"></div>
+      </section>
+      <section class="content"><div class="panels"><article class="panel thermo-panel" id="thermo-panel"><div class="loading">Loading transition accounting...</div></article><article class="panel comparison-panel" id="comparison-panel"><div class="loading">Loading games...</div></article></div></section>
+    </main>
+  </div>
+  <script>
+    const PIECES = { P:'♙', N:'♘', B:'♗', R:'♖', Q:'♕', K:'♔', p:'♟', n:'♞', b:'♝', r:'♜', q:'♛', k:'♚' };
+    let summaries = []; let game = null; let states = []; let index = 0; let loadedId = '';
+    const els = { gameSelect: document.getElementById('game-select'), refresh: document.getElementById('refresh'), source: document.getElementById('source'), result: document.getElementById('result'), plyCount: document.getElementById('ply-count'), status: document.getElementById('status'), fen: document.getElementById('fen'), board: document.getElementById('board'), slider: document.getElementById('slider'), first: document.getElementById('first'), prev: document.getElementById('prev'), next: document.getElementById('next'), last: document.getElementById('last'), positionLabel: document.getElementById('position-label'), turn: document.getElementById('turn'), staticV: document.getElementById('static-v'), whiteELabel: document.getElementById('white-e-label'), blackELabel: document.getElementById('black-e-label'), whiteEFill: document.getElementById('white-e-fill'), blackEFill: document.getElementById('black-e-fill'), moveList: document.getElementById('move-list'), thermoPanel: document.getElementById('thermo-panel'), comparisonPanel: document.getElementById('comparison-panel') };
+    function fmt(x, digits = 3) { if (x === null || x === undefined || Number.isNaN(Number(x))) return '—'; return Number(x).toFixed(digits); }
+    function signedClass(x) { const n = Number(x); if (Number.isNaN(n) || Math.abs(n) < 1e-9) return ''; return n > 0 ? 'positive' : 'negative'; }
+    function turnFromFen(fen) { return fen.split(' ')[1] === 'w' ? 'white' : 'black'; }
+    function boardMatrix(fen) { const rows = []; const ranks = fen.split(' ')[0].split('/'); for (let r = 0; r < ranks.length; r++) { const row = []; let file = 0; for (const ch of ranks[r]) { if (/\d/.test(ch)) { for (let i = 0; i < Number(ch); i++) row.push({ square: 'abcdefgh'[file++] + String(8 - r), piece: '' }); } else { row.push({ square: 'abcdefgh'[file++] + String(8 - r), piece: PIECES[ch] || ch }); } } rows.push(row); } return rows; }
+    function lastSquares(state) { if (!state.uci) return new Set(); return new Set([state.uci.slice(0, 2), state.uci.slice(2, 4)]); }
+    function renderBoard(state) { const highlights = lastSquares(state); els.board.innerHTML = ''; boardMatrix(state.fen).flat().forEach((sq, i) => { const div = document.createElement('div'); const rank = Math.floor(i / 8); const file = i % 8; div.className = `sq ${(rank + file) % 2 === 0 ? 'light' : 'dark'}`; if (highlights.has(sq.square)) div.classList.add(sq.square === state.uci?.slice(0, 2) ? 'last-from' : 'last-to'); div.innerHTML = `<span>${sq.piece}</span>`; if (file === 0 || rank === 7) { const coord = document.createElement('span'); coord.className = 'coord'; coord.textContent = rank === 7 ? sq.square[0] : sq.square[1]; div.appendChild(coord); } els.board.appendChild(div); }); }
+    function renderEvalBar(eValue) { const scale = 20; const white = Number(eValue); const black = -white; const pct = Math.min(Math.abs(white) / scale, 1) * 50; els.whiteELabel.textContent = `White E ${fmt(white)}`; els.blackELabel.textContent = `Black E ${fmt(black)}`; els.whiteEFill.style.width = white > 0 ? `${pct}%` : '0%'; els.blackEFill.style.width = white < 0 ? `${pct}%` : '0%'; }
+    function stateFromSaved(saved, i, plies) { const nextEntry = plies[i] || null; const previousEntry = i > 0 ? (plies[i - 1] || null) : null; return { ...saved, ply: Number(saved.ply ?? i), moveLabel: saved.move_label || (i === 0 ? 'Start' : `${saved.ply}. ${saved.san}`), staticEvaluation: saved.static_evaluation, nextEntry, previousEntry }; }
+    function buildLegacyStates(raw) { const plies = raw.plies || []; const built = []; if (!plies.length) return [{ ply: 0, moveLabel: 'Start', fen: raw.final_fen || '', uci: '', san: '', turn: raw.final_fen ? turnFromFen(raw.final_fen) : '', staticEvaluation: null, nextEntry: null, previousEntry: null }]; const first = plies[0].row; built.push({ ply: 0, moveLabel: 'Start', fen: first.fen_before, uci: '', san: '', turn: turnFromFen(first.fen_before), staticEvaluation: first.E_before, nextEntry: plies[0], previousEntry: null }); plies.forEach((entry, i) => { const row = entry.row; const nextEntry = plies[i + 1] || null; built.push({ ply: Number(row.ply), moveLabel: `${row.ply}. ${row.side} ${row.san}`, fen: row.fen_after, uci: row.uci, san: row.san, turn: turnFromFen(row.fen_after), staticEvaluation: row.E_after, predictionError: row.prediction_error, nextEntry, previousEntry: entry }); }); return built; }
+    function buildStates(raw) { const plies = raw.plies || []; if (Array.isArray(raw.viewer_states) && raw.viewer_states.length) return raw.viewer_states.map((saved, i) => stateFromSaved(saved, i, plies)); return buildLegacyStates(raw); }
+    async function fetchJson(url) { const response = await fetch(url, { cache: 'no-store' }); if (!response.ok) throw new Error(`${response.status} ${response.statusText}`); return response.json(); }
+    async function loadGames(preserve = false) { const current = preserve ? els.gameSelect.value : loadedId; const data = await fetchJson('/api/games'); summaries = data.games || []; els.gameSelect.innerHTML = ''; summaries.forEach((summary) => { const option = document.createElement('option'); option.value = summary.id; option.textContent = `${summary.label} · ${summary.result || 'unknown'} · ${summary.plies || 0} plies`; if (!summary.has_viewer_states) option.textContent += ' · regenerate'; if (summary.error) option.textContent += ' · failed'; els.gameSelect.appendChild(option); }); const target = summaries.some(g => g.id === current) ? current : (summaries[0]?.id || ''); if (target) { els.gameSelect.value = target; if (target !== loadedId || !game) await loadGame(target); } els.status.textContent = `${summaries.length} files`; }
+    async function loadGame(id) { loadedId = id; els.status.textContent = 'Loading game...'; const summary = summaries.find(g => g.id === id); if (summary?.error) { els.comparisonPanel.innerHTML = `<div class="notice">${summary.error}</div>`; return; } renderPanelLoading('Loading game data...'); const raw = await fetchJson(`/api/games/${encodeURIComponent(id)}`); game = { ...raw, id, label: summary?.label || id, source_file: summary?.source_file || `${id}.json` }; states = buildStates(game); index = 0; els.source.textContent = game.source_file; els.result.textContent = `Result ${game.result || '*'}`; els.plyCount.textContent = `${Math.max(states.length - 1, 0)} plies`; els.slider.max = Math.max(states.length - 1, 0); els.status.textContent = Array.isArray(game.viewer_states) && game.viewer_states.length ? 'Live' : 'Needs regeneration'; setIndex(0); }
+    function renderPanelLoading(message = 'Loading comparison panels...') { els.comparisonPanel.innerHTML = `<div class="loading">${message}</div>`; }
+    function panelMap(panel) { return new Map((panel?.moves || []).map(move => [move.uci, move])); }
+    function rankMap(panel) { return new Map((panel?.moves || []).map((move, i) => [move.uci, move.advantage_rank || i + 1])); }
+    function comparisonOrder(panels) { const seen = new Set(); const order = []; [...(panels.order || []), ...(panels.white_panel?.moves || []).map(m => m.uci), ...(panels.black_panel?.moves || []).map(m => m.uci)].forEach(uci => { if (uci && !seen.has(uci)) { seen.add(uci); order.push(uci); } }); return order; }
+    function styleSummary(style) { return Object.entries(style || {}).filter(([k]) => k !== 'safety').map(([k, v]) => `${k} ${Number(v).toFixed(2)}`).join(' · '); }
+    function comparisonRows(panels, order, played) { const white = panelMap(panels.white_panel); const black = panelMap(panels.black_panel); const whiteRanks = rankMap(panels.white_panel); const blackRanks = rankMap(panels.black_panel); const whiteBest = (panels.white_panel?.moves || []).find(move => Number(move.advantage_rank) === 1)?.uci || panels.white_panel?.moves?.[0]?.uci; const blackBest = (panels.black_panel?.moves || []).find(move => Number(move.advantage_rank) === 1)?.uci || panels.black_panel?.moves?.[0]?.uci; const playedRow = panels.nextEntry?.row || {}; const rowKey = {delta_q: 'delta_Q', delta_w: 'delta_W', delta_a: 'delta_A'}; const thermo = (move, key, side) => move[key] ?? (move.uci === played && playedRow.side === side ? playedRow[rowKey[key]] : undefined); return order.map(uci => { const w = white.get(uci) || {}; const b = black.get(uci) || {}; const shared = white.get(uci) || black.get(uci) || {}; const wq = thermo(w, 'delta_q', 'white'); const ww = thermo(w, 'delta_w', 'white'); const wa = thermo(w, 'delta_a', 'white'); const bq = thermo(b, 'delta_q', 'black'); const bw = thermo(b, 'delta_w', 'black'); const ba = thermo(b, 'delta_a', 'black'); const cls = [uci === played ? 'played' : '', uci === whiteBest ? 'white-best' : '', uci === blackBest ? 'black-best' : ''].filter(Boolean).join(' '); return `<tr class="${cls}"><td>${whiteRanks.get(uci) || ''}</td><td>${fmt(w.probability, 4)}</td><td class="${signedClass(w.delta_u)}">${fmt(w.delta_u)}</td><td class="${signedClass(wq)}">${fmt(wq)}</td><td class="${signedClass(ww)}">${fmt(ww)}</td><td class="${signedClass(wa)}">${fmt(wa)}</td><td class="shared-col shared-start shared-move">${w.san || b.san || ''}</td><td class="shared-col shared-end ${signedClass(shared.static_after)}">${fmt(shared.static_after)}</td><td>${blackRanks.get(uci) || ''}</td><td>${fmt(b.probability, 4)}</td><td class="${signedClass(b.delta_u)}">${fmt(b.delta_u)}</td><td class="${signedClass(bq)}">${fmt(bq)}</td><td class="${signedClass(bw)}">${fmt(bw)}</td><td class="${signedClass(ba)}">${fmt(ba)}</td></tr>`; }).join(''); }
+    function measureMetrics(state) { return `<div class="metrics"><div class="metric"><div class="label">White adaptive U(B)</div><div class="value ${signedClass(state.white_panel.expected_value)}">${fmt(state.white_panel.expected_value)}</div></div><div class="metric"><div class="label">White S(B)</div><div class="value">${fmt(state.white_panel.entropy)}</div></div><div class="metric"><div class="label">White N_eff</div><div class="value">${fmt(state.white_panel.effective_moves)}</div></div><div class="metric"><div class="label">White K</div><div class="value">${fmt(state.white_panel.expanded_count, 0)}</div></div><div class="metric"><div class="label">Black adaptive U(B)</div><div class="value ${signedClass(state.black_panel.expected_value)}">${fmt(state.black_panel.expected_value)}</div></div><div class="metric"><div class="label">Black S(B)</div><div class="value">${fmt(state.black_panel.entropy)}</div></div><div class="metric"><div class="label">Black N_eff</div><div class="value">${fmt(state.black_panel.effective_moves)}</div></div><div class="metric"><div class="label">Black K</div><div class="value">${fmt(state.black_panel.expanded_count, 0)}</div></div></div>`; }
+    function renderThermodynamics(state) { const row = state.previousEntry?.row || null; const card = (label, key) => `<div class="thermo-card"><div class="label">${label}</div><div class="value ${signedClass(row?.[key])}">${fmt(row?.[key])}</div></div>`; const detail = (label, value, digits = 3) => `<div><div class="label">${label}</div><div class="value">${typeof value === 'string' ? value : fmt(value, digits)}</div></div>`; els.thermoPanel.innerHTML = `<div class="panel-head"><div class="panel-title">Adaptive Transition Accounting</div><div class="style">${row ? `Ply ${row.ply}: ${row.side} ${row.san} · residual ${fmt(row.decomposition_error, 8)}` : 'Select a played ply to inspect its transition.'}</div></div><div class="thermo-cards">${card('ΔU','delta_U')}${card('ΔQ','delta_Q')}${card('ΔW','delta_W')}${card('ΔA','delta_A')}</div><div class="thermo-detail">${detail('N_eff before / after', row ? `${fmt(row.N_eff_before)} / ${fmt(row.N_eff_after)}` : null)}${detail('Depth before / after', row ? `${fmt(row.adaptive_depth_before,0)} / ${fmt(row.adaptive_depth_after,0)}` : null)}${detail('Common support', row?.common_support_size, 0)}${detail('Common mass old / new', row ? `${fmt(row.common_mass_old)} / ${fmt(row.common_mass_new)}` : null)}</div>`; }
+    function renderComparison(state) { if (!state.white_panel || !state.black_panel) { els.comparisonPanel.innerHTML = '<div class="notice">This match JSON does not contain saved viewer panels. Regenerate the match with the current simulation code to view it without runtime calculations.</div>'; return; } const played = state.nextEntry?.row?.uci || ''; const order = comparisonOrder(state); const rows = comparisonRows(state, order, played); const depth = state.white_panel.search_depth ?? game.config?.depth ?? 1; const adaptiveC = state.white_panel.adaptive_c ?? game.config?.adaptive_c; const objective = state.turn === 'black' ? 'smaller' : 'larger'; els.comparisonPanel.innerHTML = `<div class="panel-head"><div class="panel-title">White / Black Style Measures</div><div class="style"><strong>Search:</strong> depth ${depth} · c ${fmt(adaptiveC)}<br><strong>White:</strong> ${styleSummary(game.white_style)}<br><strong>Black:</strong> ${styleSummary(game.black_style)}</div></div>${measureMetrics(state)}<div class="table-note">${state.turn === 'black' ? 'Black' : 'White'} to move: each panel independently ranks ${objective} deltaU as better for the mover. Light-grey outline: White observer #1. Black outline: Black observer #1. Light-blue fill: move actually played. Rows follow the White ranking so the shared move and E(Bm) remain aligned.</div><div class="table-wrap"><table class="comparison-table"><thead><tr><th class="group-head" colspan="6">White Observer</th><th class="group-head shared-col shared-start shared-end" colspan="2">Shared Move</th><th class="group-head" colspan="6">Black Observer</th></tr><tr><th>#</th><th>p(B)</th><th>deltaU</th><th>deltaQ</th><th>deltaW</th><th>deltaA</th><th class="shared-col shared-start shared-move">move</th><th class="shared-col shared-end">E(Bm)</th><th>#</th><th>p(B)</th><th>deltaU</th><th>deltaQ</th><th>deltaW</th><th>deltaA</th></tr></thead><tbody>${rows || '<tr><td colspan="14">No legal moves</td></tr>'}</tbody></table></div>`; }
+    function renderMoveList() { els.moveList.innerHTML = states.map((state, i) => `<span class="move-chip ${i === index ? 'active' : ''}" data-index="${i}">${i === 0 ? 'Start' : `${state.ply}. ${state.san}`}</span>`).join(' '); els.moveList.querySelectorAll('.move-chip').forEach(chip => chip.addEventListener('click', () => setIndex(Number(chip.dataset.index)))); }
+    function setIndex(nextIndex) { if (!states.length) return; index = Math.max(0, Math.min(states.length - 1, nextIndex)); const state = states[index]; els.slider.value = index; els.fen.textContent = state.fen; els.positionLabel.textContent = state.moveLabel; els.turn.textContent = state.turn || 'unknown'; els.staticV.textContent = fmt(state.staticEvaluation); els.staticV.className = `value ${signedClass(state.staticEvaluation)}`; renderEvalBar(state.staticEvaluation); renderBoard(state); renderMoveList(); renderThermodynamics(state); renderComparison(state); }
+    els.gameSelect.addEventListener('change', event => loadGame(event.target.value)); els.refresh.addEventListener('click', () => loadGames(true)); els.slider.addEventListener('input', event => setIndex(Number(event.target.value))); els.first.addEventListener('click', () => setIndex(0)); els.prev.addEventListener('click', () => setIndex(index - 1)); els.next.addEventListener('click', () => setIndex(index + 1)); els.last.addEventListener('click', () => setIndex(states.length - 1)); window.addEventListener('keydown', event => { if (event.key === 'ArrowLeft') setIndex(index - 1); if (event.key === 'ArrowRight') setIndex(index + 1); if (event.key === 'Home') setIndex(0); if (event.key === 'End') setIndex(states.length - 1); });
+    loadGames().catch(error => { els.status.textContent = 'Error'; els.comparisonPanel.innerHTML = `<div class="notice">${error.message}</div>`; }); setInterval(() => loadGames(true).catch(() => {}), 10000);
+  </script>
+</body>
+</html>
+"""
+
+
+@dataclass(frozen=True)
+class LiveViewerConfig:
+    results_dir: Path = Path("data/results")
+    host: str = "127.0.0.1"
+    port: int = 8765
+    open_browser: bool = False
+
+
+def _read_match_summary(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return {
+            "id": path.stem,
+            "label": path.stem.replace("_", " "),
+            "source_file": str(path),
+            "result": data.get("result", "*"),
+            "terminal_reason": data.get("terminal_reason", ""),
+            "final_fen": data.get("final_fen", ""),
+            "plies": len(data.get("plies", [])),
+            "has_viewer_states": bool(data.get("viewer_states")),
+            "modified": path.stat().st_mtime,
+            "size": path.stat().st_size,
+        }
+    except Exception as exc:
+        return {
+            "id": path.stem,
+            "label": f"{path.stem} (failed to load)",
+            "source_file": str(path),
+            "result": "*",
+            "plies": 0,
+            "has_viewer_states": False,
+            "modified": path.stat().st_mtime if path.exists() else 0,
+            "size": path.stat().st_size if path.exists() else 0,
+            "error": str(exc),
+        }
+
+
+def game_summaries(results_dir: Path) -> list[dict[str, Any]]:
+    return [_read_match_summary(path) for path in sorted(results_dir.glob("*.json"))]
+
+
+def _game_path(results_dir: Path, game_id: str) -> Path | None:
+    candidate = results_dir / f"{game_id}.json"
+    if candidate.exists() and candidate.is_file() and candidate.parent.resolve() == results_dir.resolve():
+        return candidate
+    for path in results_dir.glob("*.json"):
+        if path.stem == game_id:
+            return path
+    return None
+
+
+class _LiveViewerHandler(BaseHTTPRequestHandler):
+    server: "LiveViewerServer"
+
+    def log_message(self, format: str, *args: object) -> None:
+        print(f"{self.address_string()} - {format % args}")
+
+    def _send_bytes(self, data: bytes, content_type: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_json(self, data: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
+        self._send_bytes(json.dumps(data).encode("utf-8"), "application/json; charset=utf-8", status)
+
+    def _send_error_json(self, status: HTTPStatus, message: str) -> None:
+        self._send_json({"error": message}, status)
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        route = posixpath.normpath(parsed.path)
+        if route in ("/", "/index.html"):
+            self._send_bytes(LIVE_VIEWER_HTML.encode("utf-8"), "text/html; charset=utf-8")
+            return
+        if route == "/api/games":
+            self._send_json(
+                {
+                    "results_dir": str(self.server.config.results_dir),
+                    "games": game_summaries(self.server.config.results_dir),
+                }
+            )
+            return
+        if route.startswith("/api/games/"):
+            game_id = unquote(route.removeprefix("/api/games/"))
+            path = _game_path(self.server.config.results_dir, game_id)
+            if path is None:
+                self._send_error_json(HTTPStatus.NOT_FOUND, f"No game named {game_id!r}")
+                return
+            self._send_bytes(path.read_bytes(), "application/json; charset=utf-8")
+            return
+        if route == "/favicon.ico":
+            self._send_bytes(b"", "image/x-icon")
+            return
+        self._send_error_json(HTTPStatus.NOT_FOUND, "Not found")
+
+
+class LiveViewerServer(ThreadingHTTPServer):
+    def __init__(self, config: LiveViewerConfig):
+        self.config = config
+        super().__init__((config.host, config.port), _LiveViewerHandler)
+
+
+def serve_match_viewer(config: LiveViewerConfig) -> None:
+    config.results_dir.mkdir(parents=True, exist_ok=True)
+    server = LiveViewerServer(config)
+    url = f"http://{config.host}:{server.server_address[1]}/"
+    print(f"Live viewer: {url}")
+    print(f"Results dir: {config.results_dir}")
+    print("Press Ctrl+C to stop.")
+    if config.open_browser:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nViewer stopped.")
+    finally:
+        server.server_close()
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Serve a live viewer for saved match JSON files.")
+    parser.add_argument("--results-dir", default="data/results")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--open", action="store_true", help="Open the viewer in a browser.")
+    args = parser.parse_args(argv)
+    serve_match_viewer(
+        LiveViewerConfig(
+            results_dir=Path(args.results_dir),
+            host=args.host,
+            port=args.port,
+            open_browser=args.open,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
