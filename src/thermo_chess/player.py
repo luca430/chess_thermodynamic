@@ -9,7 +9,7 @@ import chess
 
 from .evaluation import StaticEvaluator
 from .measure import MoveLandscape, Style
-from .search import AdaptiveDepthThresholds, AdaptiveExpectedValue, PositionKey
+from .search import AdaptiveDepthThresholds, AdaptiveExpectedValue, PositionKey, SearchMode
 
 
 @dataclass(frozen=True)
@@ -22,6 +22,10 @@ class CandidateScore:
     value: float
     delta_u: float
     selected_for_deeper_analysis: bool
+    response_neff: float | None = None
+    response_k: int | None = None
+    search_mode: SearchMode = "accurate"
+    cdepth: int = 0
 
     def as_dict(self) -> Dict[str, object]:
         return {
@@ -30,8 +34,14 @@ class CandidateScore:
             "probability": self.probability,
             "static_after": self.static_after,
             "selection_value": self.value,
+            "branch_value": self.value,
+            "candidate_delta_u": self.delta_u,
             "delta_u": self.delta_u,
             "selected_for_deeper_analysis": self.selected_for_deeper_analysis,
+            "response_neff": self.response_neff,
+            "response_k": self.response_k,
+            "search_mode": self.search_mode,
+            "cdepth": self.cdepth,
         }
 
 
@@ -45,7 +55,7 @@ class PositionAnalysis:
     selected_depth: int
     expanded_count: int
     selected_uci: tuple[str, ...]
-    diagnostics: Dict[str, float | int]
+    diagnostics: Dict[str, float | int | str]
 
 
 @dataclass(frozen=True)
@@ -67,11 +77,13 @@ class ThermoPlayer:
     color: chess.Color
     style: Style
     beta: float = 4.0
-    depth: int = 4
+    cdepth: int = 1
     adaptive_c: float = 0.3
     depth_thresholds: AdaptiveDepthThresholds = field(
         default_factory=AdaptiveDepthThresholds
     )
+    search_mode: SearchMode = "accurate"
+    depth: int | None = None
     _search: AdaptiveExpectedValue | None = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -81,10 +93,15 @@ class ThermoPlayer:
     )
 
     def __post_init__(self) -> None:
-        if self.depth < 0:
-            raise ValueError("depth must be at least 0")
+        if self.depth is not None:
+            self.cdepth = self.depth
+        self.depth = self.cdepth
+        if self.cdepth < 0:
+            raise ValueError("cdepth must be at least 0")
         if self.adaptive_c <= 0.0:
             raise ValueError("adaptive_c must be greater than 0")
+        if self.search_mode not in {"accurate", "cheap"}:
+            raise ValueError("search_mode must be 'accurate' or 'cheap'")
 
     def search(self, evaluator: StaticEvaluator) -> AdaptiveExpectedValue:
         if self._search is None or self._evaluator_id != id(evaluator):
@@ -92,9 +109,10 @@ class ThermoPlayer:
                 self.style,
                 self.beta,
                 evaluator,
-                depth=self.depth,
+                cdepth=self.cdepth,
                 adaptive_c=self.adaptive_c,
                 depth_thresholds=self.depth_thresholds,
+                search_mode=self.search_mode,
             )
             self._evaluator_id = id(evaluator)
             self._analysis_cache.clear()
@@ -115,13 +133,12 @@ class ThermoPlayer:
         current_value = search.expected_value(board)
         selection = search.node_selection(board)
         selected_uci = selection.selected_uci if selection else ()
-        selected = set(selected_uci)
+        branch_by_uci = {branch.uci: branch for branch in selection.branches} if selection else {}
 
         candidates = []
         for record in landscape.records:
-            after = board.copy(stack=False)
-            after.push(record.move)
-            value = search.expected_value(after)
+            branch = branch_by_uci.get(record.uci)
+            value = branch.adaptive_branch_value if branch else record.static_after
             candidates.append(
                 CandidateScore(
                     move=record.move,
@@ -131,7 +148,11 @@ class ThermoPlayer:
                     static_after=record.static_after,
                     value=value,
                     delta_u=value - current_value,
-                    selected_for_deeper_analysis=record.uci in selected,
+                    selected_for_deeper_analysis=branch.was_deepened if branch else False,
+                    response_neff=branch.response_neff if branch else None,
+                    response_k=branch.response_k if branch else None,
+                    search_mode=self.search_mode,
+                    cdepth=self.cdepth,
                 )
             )
 
@@ -176,6 +197,6 @@ class ThermoPlayer:
             current_value=analysis.current_value,
             delta_u=best.delta_u,
             current_landscape=analysis.landscape,
-            reply_landscape=self.landscape(after, evaluator),
+            reply_landscape=self.landscape(after, evaluator) if not after.is_game_over(claim_draw=True) else None,
             analysis=analysis,
         )

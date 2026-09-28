@@ -10,7 +10,7 @@ It is not a conventional chess engine. In particular, it does not use minimax, a
 - [Mathematical framework](#mathematical-framework)
 - [Exact potential feature formulas](#exact-potential-feature-formulas)
 - [Exact board-evaluation formulas](#exact-board-evaluation-formulas)
-- [Adaptive selective-depth search](#adaptive-selective-depth-search)
+- [Adaptive cycle search](#adaptive-cycle-search)
 - [Move choice and deltaU](#move-choice-and-deltau)
 - [Heat, work, and accessibility](#heat-work-and-accessibility)
 - [Default model parameters](#default-model-parameters)
@@ -388,14 +388,33 @@ terms as defined above, the three phase features are exactly
 ```
 
 ```math
-\boxed{F_C(m,B)=F_{\mathrm{castle}}+F_{\mathrm{castle\_preserve}}
-+F_{\mathrm{king\_safety}},}
+\boxed{F_C(m,B)=F_{\mathrm{castle}}+F_{\mathrm{king\_safety}},}
 ```
 
 ```math
 \boxed{F_A(m,B)=F_{\mathrm{activity}}+F_{\mathrm{king\_pressure}}
 +F_{\mathrm{king\_restriction}}+F_{\mathrm{check}}.}
 ```
+
+Castling-right preservation is weighted separately from the generic phase
+potential. The raw feature remains $F_{\mathrm{castle\_preserve}}$, but its
+effective contribution is
+
+```math
+w_{\mathrm{castle\_rights}}(g)=1-g,
+```
+
+```math
+\boxed{\Phi_{\mathrm{castle\_preserve}}
+=\lambda_{\mathrm{CP}}(1-g)(1+\sigma w_C(g))
+F_{\mathrm{castle\_preserve}}.}
+```
+
+This makes wasted castling rights expensive in the opening and early
+middlegame, with an additional consolidation-phase boost for high-solidness
+players. The multiplier fades as $g$ approaches `1`. Since
+$F_{\mathrm{castle\_preserve}}=0$ for actual castling, using the castling
+right is not penalized.
 
 For `solidness` $\sigma\in[0,1]$, the unscaled phase contribution and final
 potential are
@@ -406,14 +425,19 @@ potential are
 ```
 
 ```math
-\boxed{\Phi_{\mathrm{total}}=\Phi_{\mathrm{base}}
-+\sigma\Phi_{\mathrm{phase}}.}
+\boxed{\Phi_{\mathrm{total}}=\Phi_{\mathrm{base}}^*
++\sigma\Phi_{\mathrm{phase}},
+\qquad
+\Phi_{\mathrm{base}}^*=\Phi_{\mathrm{base\ without\ CP}}
++\Phi_{\mathrm{castle\_preserve}}.}
 ```
 
 At `solidness=0`, the phase mechanism contributes nothing and the potential is
-exactly the base potential. Candidate diagnostics save $g$, all three phase
-weights and features, the castling features, `base_potential`, unscaled
-`phase_potential`, and `total_potential`.
+exactly this adjusted non-phase base.
+Candidate diagnostics save $g$, all three phase weights and features,
+`castle_preserve_raw`, `castle_preserve_phase_weight`,
+`castle_preserve_effective_weight`, `castle_preserve_contribution`,
+`base_potential`, unscaled `phase_potential`, and `total_potential`.
 
 ### Boltzmann move distribution
 
@@ -500,7 +524,13 @@ Notice that the mobility and center differences are normalized by `30` and `6` b
 
 If the side to move is checkmated, `E(B)` receives the appropriate signed checkmate value. Stalemate, insufficient material, the automatic 75-move rule, and fivefold repetition evaluate to zero. At a search terminal or depth-zero node, the search returns `E(B)` directly and never applies a softmax to an empty move set.
 
-### Exact recursive expectation
+### Exact Cycle Recursive Expectation
+
+The configured recursive depth is `cdepth`, where one unit is a complete interaction cycle:
+
+```text
+player move -> opponent response
+```
 
 The depth-zero value is
 
@@ -508,17 +538,32 @@ The depth-zero value is
 U_\lambda^{(0)}(B)=E(B).
 ```
 
-An exact depth-$d$ expectation would be
+For `cdepth = d > 0`, the focal observer first computes probabilities for all legal own moves and assigns each move a cycle-aware branch value `O_m`. The adaptive value is
 
 ```math
 U_\lambda^{(d)}(B)
 =
-\sum_{m\in\mathcal M(B)}
-p_\lambda(m\mid B)
-U_\lambda^{(d-1)}(B_m).
+\sum_m p_\lambda(m\mid B)O_m^{(d)}(B).
 ```
 
-This is not minimax. Every branch contributes according to its probability. Expanding it exactly becomes expensive because the legal-move tree grows rapidly.
+For `cdepth = 1` in the default accurate mode, every legal own move receives an explicit expectation over all legal opponent replies:
+
+```math
+O_m^{(1)}(B)
+=
+\sum_r q_\lambda(r\mid B_m)E(B_{m,r}),
+```
+
+so
+
+```math
+U_\lambda^{(1)}(B)
+=
+\sum_m p_\lambda(m\mid B)
+\sum_r q_\lambda(r\mid B_m)E(B_{m,r}).
+```
+
+This is not minimax. Every branch contributes according to its probability, and White/Black still choose moves by maximizing/minimizing the resulting branch values.
 
 ### Entropy and effective number of moves
 
@@ -536,15 +581,15 @@ and
 N_{\mathrm{eff}}(B)=e^{S_\lambda(B)}.
 ```
 
-$N_{\mathrm{eff}}$ is the number of equally likely moves that would have the same entropy. A concentrated distribution has $N_{\mathrm{eff}}$ near `1`; a broad distribution has a larger value.
+`N_eff` is the number of equally likely moves that would have the same entropy. A concentrated distribution has `N_eff` near `1`; a broad distribution has a larger value.
 
-## Adaptive Selective-Depth Search
+## Adaptive Cycle Search
 
-The implementation uses entropy for both breadth and local depth.
+The implementation uses entropy for both adaptive breadth and the local cycle-depth cap.
 
 ### Adaptive breadth
 
-The number of recursively deepened branches is
+At the focal player's board, the number of own moves selected for refinement is
 
 ```math
 K(B)
@@ -555,22 +600,28 @@ K(B)
 \right).
 ```
 
+For each selected own move, the opponent-response distribution has its own independently computed
+
+```math
+K'_m
+=
+\min\left(
+|\mathcal R(B_m)|,
+\max\left(1,\left\lceil cN_{\mathrm{eff}}(B_m)\right\rceil\right)
+\right).
+```
+
 The default is
 
 ```text
 c = 0.3
 ```
 
-All legal moves are first scored cheaply with $E(B_m)$. The best $K(B)$ moves for the side to move are selected for recursion:
+Top-`K` and top-`K'` selection is based on move probability. It selects which branches receive extra computation; it never changes or renormalizes the probability distribution.
 
-- White to move: largest shallow values first;
-- Black to move: smallest shallow values first.
+### Entropy-selected local cdepth
 
-Branch selection is deterministic. It is separate from $p_\lambda(m\mid B)$ and does not modify the probabilities.
-
-### Entropy-selected local depth
-
-The default local depth cap is
+The local cycle-depth cap is still chosen from `N_eff`:
 
 ```math
 d_{\mathrm{eff}}(B)=
@@ -582,7 +633,7 @@ d_{\mathrm{eff}}(B)=
 \end{cases}
 ```
 
-For remaining global depth $r$, the node uses
+For remaining cycle budget `r`, the node uses
 
 ```math
 d_{\mathrm{local}}(B,r)
@@ -590,34 +641,42 @@ d_{\mathrm{local}}(B,r)
 \min\left(r,d_{\mathrm{eff}}(B)\right).
 ```
 
-A selected child receives remaining depth $d_{\mathrm{local}}-1$. Therefore a child may shorten the search but can never restore or increase depth already consumed from the global budget.
+A recursive call consumes one unit only after a complete own-move/opponent-response cycle, so selected response branches continue with `d_local - 1`.
 
-The configurable maximum depth defaults to `4`. The three effective-move thresholds default to `4`, `8`, and `15`; they are centralized in `MatchConfig` and currently configurable through Python rather than CLI flags.
+### Search modes
 
-### Preserving probability mass
-
-Let $\mathcal S(B)$ be the selected top-$K$ set. The adaptive approximation is
+`search_mode = accurate` is the default. In accurate mode, non-recursed probability mass is still evaluated at the response board:
 
 ```math
-\widetilde U_\lambda^{(r)}(B)
+O_m^{(d)}
 =
-\sum_{m\in\mathcal S(B)}
-p_\lambda(m\mid B)
-\widetilde U_\lambda^{(d_{\mathrm{local}}-1)}(B_m)
-+
-\sum_{m\notin\mathcal S(B)}
-p_\lambda(m\mid B)E(B_m).
+\sum_r q_{r\mid m}V_{m,r}^{(d)},
 ```
 
-Non-selected moves are not discarded. Their original probability mass remains in the expectation through the static fallback. Probabilities are never renormalized over $\mathcal S(B)$.
+where selected response branches recurse to `U^{(d-1)}(B_{m,r})` when `d > 1`, and omitted branches use `E(B_{m,r})`. Even non-top-`K` own moves receive the full shallow response expectation.
 
-At configured depth `1`, selected children immediately reach depth zero, so the result reduces to the full one-ply expectation
+`search_mode = cheap` avoids evaluating all omitted continuations. Non-top-`K` own moves use `E(B_m)`. For selected own moves, selected replies are evaluated explicitly and the omitted reply mass contributes
 
 ```math
-\widetilde U^{(1)}(B)
-=
-\sum_m p(m\mid B)E(B_m).
+q_{\mathrm{tail}}E(B_m).
 ```
+
+Both modes preserve the original probability mass. Neither top-`K` nor top-`K'` is renormalized.
+
+### Terminal positions
+
+If a candidate move directly produces a terminal board, its branch value is `E(B_m)`. If a response reaches a terminal board, the response value is `E(B_{m,r})`. For thermodynamic bookkeeping only, a terminal same-player state is represented as an absorbing pseudo-branch `__terminal__` with probability `1`.
+
+### Caching
+
+Each observer search caches:
+
+- static evaluations by complete position state;
+- move landscapes, including features, probabilities, entropy, and `N_eff`;
+- adaptive expected values by position and remaining `cdepth`;
+- selected branch metadata, including `K`, response `K'`, branch values, and selected local `cdepth`.
+
+Caches belong to a fixed style, beta, `cdepth`, and search mode, so values from different observers cannot mix.
 
 ### Observer convention
 
@@ -629,41 +688,45 @@ Each observer search caches:
 
 - static evaluations by complete position state;
 - move landscapes, including features, probabilities, entropy, and $N_{\mathrm{eff}}$;
-- adaptive expected values by position and remaining depth;
+- adaptive expected values by position and remaining `cdepth`;
 - selected branch metadata, including `K` and selected local depth.
 
 Caches belong to a fixed style and beta, so values from different observers cannot mix.
 
 ## Move Choice and deltaU
 
-For every legal candidate $m$ from current board $B$, the player evaluates
+For every legal candidate `m` from current board `B`, the player uses the cycle-aware branch value
 
 ```math
-\widetilde U_\lambda^{(D)}(B_m),
+O_m^{(d)}(B).
 ```
 
-where $D$ is the configured maximum depth. The current-board value $\widetilde U_\lambda^{(D)}(B)$ is computed once per decision.
-
-The formal advantage is
+The current-board value is
 
 ```math
-\Delta U_\lambda^{(D)}(m;B)
+U_\lambda^{(d)}(B)
 =
-\widetilde U_\lambda^{(D)}(B_m)
--
-\widetilde U_\lambda^{(D)}(B).
+\sum_m p_\lambda(m\mid B)O_m^{(d)}(B).
 ```
 
-Fields named `advantage`, `delta_u`, `U_current`, and `U_after_move` follow this definition.
+The candidate diagnostic is
+
+```math
+\Delta U_{\mathrm{candidate}}(m;B)
+=
+O_m^{(d)}(B)-U_\lambda^{(d)}(B).
+```
+
+Fields named `candidate_delta_u`, `delta_u`, `U_current`, and `U_after_move` follow this candidate definition. `U_after_move` is the selected candidate's branch value, not an adjacent-ply thermodynamic state.
 
 Final move selection is:
 
 ```math
-m_W^*=\arg\max_m \widetilde U_{\lambda_W}^{(D)}(B_m),
+m_W^*=\arg\max_m O_m^{(d)}(B),
 ```
 
 ```math
-m_B^*=\arg\min_m \widetilde U_{\lambda_B}^{(D)}(B_m).
+m_B^*=\arg\min_m O_m^{(d)}(B).
 ```
 
 The viewer ranks each observer's estimate of the side-to-move's best action:
@@ -690,10 +753,16 @@ This compares the realized static board after the reply with the observer's earl
 
 ## Heat, Work, and Accessibility
 
-The transition accounting reuses the exact branch values already produced by
-the moving player's adaptive evaluator. For each legal move $m$, the stored
-observable $O_m(B)$ is the recursively evaluated child value when the branch
-was deepened, or the existing static fallback $E(B_m)$ otherwise. Consequently,
+The transition accounting compares the same observer on consecutive turns by
+that same player, not adjacent plies. For White, a transition compares one
+White-to-move position with the next White-to-move position two plies later;
+Black is handled analogously. The first turn for each player has no previous
+same-player state and therefore no thermodynamic delta.
+
+For each same-player state, the accounting reuses the exact cycle-aware branch
+values already produced by that player's adaptive evaluator. For each legal
+move $m$, the stored observable $O_m(B)$ is the same branch value used for
+move choice. Consequently,
 
 ```math
 \widetilde U(B)=\sum_m p_mO_m
@@ -703,7 +772,7 @@ is the same adaptive value used by the player, not a separate diagnostic
 search. Each saved branch records its UCI identity, probability,
 `adaptive_branch_value`, `was_deepened`, and `depth_used`.
 
-For the common support $\mathcal L_\cap$ of consecutive positions, heat and
+For the common support $\mathcal L_\cap$ of two same-player positions, heat and
 work use the finite midpoint formulas
 
 ```math
@@ -724,10 +793,10 @@ Moves that appear or disappear contribute
 ```
 
 Thus $\Delta U=\Delta Q+\Delta W+\Delta A$ to floating-point tolerance.
-At a terminal position or configured depth zero, adaptive evaluation directly
-returns the static fallback without a legal branch sum. That fallback is saved
-as `boundary_accessibility` and included in $\Delta A$, preserving the same
-identity without inventing a legal move or running another search.
+At configured `cdepth = 0`, adaptive evaluation directly returns the static
+fallback. At terminal same-player states, thermodynamic bookkeeping uses an
+absorbing pseudo-branch `__terminal__` with probability `1`, so the identity is
+preserved without adding a pseudo-move to ordinary chess move generation.
 
 ## Default Model Parameters
 
@@ -741,7 +810,8 @@ identity without inventing a legal move or running another search.
 | Black beta | `4.0` |
 | White strategy | `material_conservative` |
 | Black strategy | `activity_aggressive` |
-| Maximum adaptive depth | `4` |
+| Cycle depth (`cdepth`) | `1` |
+| Search mode | `accurate` |
 | Adaptive breadth `c` | `0.3` |
 | Match name | `thermo_match` |
 | Stop on actual threefold repetition | Yes |
@@ -765,7 +835,7 @@ The command-line simulator provides four fixed presets. The first two remain the
 | `king_safety` | `0.8` | `0.35` | `0.8` | `1.1` |
 | `center` | `0.2` | `1.2` | `1.4` | `1.8` |
 | `promotion` | `0.8` | `0.8` | `1.0` | `0.8` |
-| `castle_preserve` | `0.8` | `0.35` | `0.25` | `0.7` |
+| `castle_preserve` | `2.8` | `1.2` | `1.0` | `2.6` |
 | `castle_deny` | `0.3` | `0.45` | `0.7` | `0.4` |
 | `castle` | `1.0` | `0.55` | `0.4` | `0.9` |
 | `development` | `0.8` | `0.5` | `0.4` | `0.9` |
@@ -818,7 +888,7 @@ Files with the same match name are overwritten. Use a distinct `--name` to prese
 
 ```bash
 conda run -n chess env PYTHONPATH=src python scripts/run_match.py \
-  --name adaptive_depth4_c03 \
+  --name adaptive_cdepth1_c03 \
   --max-plies 120 \
   --seed 23 \
   --beta-white 5.5 \
@@ -827,7 +897,8 @@ conda run -n chess env PYTHONPATH=src python scripts/run_match.py \
   --black-strategy positional_controller \
   --solidness-white 0.3 \
   --solidness-black 0.85 \
-  --depth 4 \
+  --cdepth 1 \
+  --search-mode accurate \
   --adaptive-c 0.3
 ```
 
@@ -843,7 +914,9 @@ conda run -n chess env PYTHONPATH=src python scripts/run_match.py \
 | `--black-strategy NAME` | `activity_aggressive` | Black preset. Uses the same four choices. |
 | `--solidness-white X` | Preset value | Override White's solidness $\sigma$. Must be between `0` and `1`. |
 | `--solidness-black X` | Preset value | Override Black's solidness $\sigma$. Must be between `0` and `1`. |
-| `--depth N` | `4` | Maximum adaptive depth. Must be `N >= 0`. At `0`, candidate scores reduce to static evaluations. |
+| `--cdepth N` | `1` | Cycle depth. One unit is own move plus opponent response. At `0`, values reduce to static `E(B)`. |
+| `--depth N` | None | Deprecated alias for `--cdepth`. |
+| `--search-mode MODE` | `accurate` | Either `accurate` or `cheap`; controls how omitted non-recursive response mass is represented. |
 | `--adaptive-c X` | `0.3` | Breadth fraction in $K=\lceil cN_{\mathrm{eff}}\rceil$. Must be positive. `K` is still clipped to legal moves and at least one. |
 | `--name TEXT` | `thermo_match` | Base filename for CSV, JSON, and PGN outputs. |
 | `--ignore-threefold` | Off | Continue through actual threefold repetition instead of stopping there. |
@@ -852,7 +925,7 @@ conda run -n chess env PYTHONPATH=src python scripts/run_match.py \
 
 Normal stopping conditions are checkmate, stalemate, actual threefold repetition, or `--max-plies`. With both `--ignore-threefold` and `--allow-draw-claims`, the simulation also consults `board.is_game_over(claim_draw=True)` for other claimable or automatic draw endings.
 
-Depth `4` can still be expensive in low-entropy positions because those positions are explicitly allowed to retain deeper search. The simulator also precomputes both observers' viewer panels at every saved position.
+`cdepth > 1` can still be expensive in low-entropy positions because those positions are explicitly allowed to retain deeper search. The simulator also precomputes both observers' viewer panels at every saved position.
 
 ## Viewer
 
@@ -895,13 +968,12 @@ The viewer performs no chess or expected-value calculations. New JSON files shou
 For each position the viewer shows:
 
 - board, FEN, side to move, move history, and static `E(B)`;
-- configured maximum depth and `c`;
-- adaptive `U(B)`, entropy, $N_{\mathrm{eff}}$, and `K` for both observers;
-- independent White and Black ranks, probabilities, and `deltaU`;
-- shared move and $E(B_m)$ columns aligned across both observers.
-- transition cards for $\Delta U$, $\Delta Q$, $\Delta W$, and $\Delta A$;
-- before/after effective move counts and adaptive depths, common support data,
-  and a signed plot of all four transition quantities versus ply.
+- configured `cdepth`, search mode, and `c`;
+- adaptive `U(B)`, entropy, $N_{\mathrm{eff}}$, `K`, response `K'`, and branch values for both observers;
+- independent White and Black ranks, probabilities, and candidate `deltaU`;
+- shared move and $E(B_m)$ columns aligned across both observers;
+- completed same-player cycle cards for cycle $\Delta U$, $\Delta Q$, $\Delta W$, and $\Delta A$;
+- old/new effective move counts, old/new `K`, common support data, and common probability mass.
 
 ## Saved Data
 
@@ -913,17 +985,17 @@ The CSV contains one row per played ply. Important fields include:
 |---|---|
 | `E_before`, `E_after` | Universal static evaluations before and after the move. |
 | `U_current` | Moving observer's adaptive value of the current board. |
-| `U_after_move` | Moving observer's adaptive value after the chosen candidate. |
-| `delta_u` | `U_after_move - U_current`. |
-| `U_before`, `U_after`, `delta_U` | Moving observer's adaptive transition values. |
-| `delta_Q`, `delta_W`, `delta_A` | Heat, work, and accessibility contributions. |
+| `U_after_move` | Selected candidate branch value `O_m`. |
+| `delta_u`, `candidate_delta_u` | Candidate branch value minus current adaptive value. |
+| `U_before`, `U_after`, `delta_U`, `cycle_delta_U` | Completed same-player cycle values, aligned to the later decision state. Null for the first state of each player. |
+| `delta_Q`, `delta_W`, `delta_A` | Heat/work/accessibility decomposition of the completed same-player cycle. Null until that player has a previous decision state. |
 | `decomposition_error` | `delta_U - (delta_Q + delta_W + delta_A)`. |
-| `N_eff_before`, `N_eff_after` | Effective move counts on both sides of the transition. |
-| `adaptive_depth_before`, `adaptive_depth_after` | Selected root depths on both sides. |
+| `N_eff_before`, `N_eff_after` | Effective move counts for the current state and, when present, the completed same-player cycle. |
+| `adaptive_cdepth`, `adaptive_depth_before`, `adaptive_depth_after` | Selected local cycle-depth diagnostics. Legacy names are retained for compatibility. |
 | support and mass fields | Old, new, common, old-only, and new-only support diagnostics. |
 | `entropy_current` | Root move-distribution entropy. |
 | `N_eff` | Root effective number of moves. |
-| `selected_depth` | Entropy-selected local depth after applying the global cap. |
+| `selected_depth` | Entropy-selected local `cdepth` after applying the global cap. |
 | `K_expanded` | Number of root branches selected for deeper recursion. |
 | `nodes_evaluated` | Adaptive value nodes computed for the saved analysis. |
 | `static_evaluations` | Uncached static evaluations. |
@@ -943,8 +1015,9 @@ The JSON is the complete result and contains:
 - `white_style`, `black_style`: serialized style coefficients;
 - `evaluation_weights`: serialized static feature coefficients;
 - result, terminal reason, final FEN, and repetition metadata;
-- `plies`: row data, landscapes, candidate scores, and exact adaptive branch observations before and after each transition;
-- `viewer_states`: ready-to-render panels for every board position.
+- `plies`: row data, landscapes, candidate scores, and exact adaptive branch observations before and after each played move;
+- `thermodynamic_transitions`: same-player heat/work/accessibility records aligned to the later turn;
+- `viewer_states`: ready-to-render panels for every board position, including the completed same-player cycle transition visible at that state when available.
 
 Candidate diagnostics include whether each move belonged to the root top-$K$ set. `viewer_states` duplicate some summary values intentionally so browser navigation requires no model computation.
 
@@ -997,7 +1070,7 @@ Benchmark options:
 | `--beta X` | `4.0` | Probability-distribution beta used for every benchmark depth. |
 | `--adaptive-c X` | `0.3` | Adaptive breadth parameter used for every benchmark depth. |
 
-The script measures adaptive depths `1` through `4` and compares them with a full depth-2 reference on the selected position. It does not change or regenerate match files.
+The script is a legacy benchmark for adaptive depth aliases and does not change or regenerate match files.
 
 ## Python Configuration
 
@@ -1039,7 +1112,8 @@ config = MatchConfig(
     black_strategy="activity_aggressive",
     white_solidness=0.75,
     black_solidness=0.35,
-    depth=4,
+    cdepth=1,
+    search_mode="accurate",
     adaptive_c=0.3,
     depth4_max_neff=4.0,
     depth3_max_neff=8.0,
@@ -1061,9 +1135,9 @@ When `white_style` or `black_style` is passed directly, that custom object overr
 
 Validation rules:
 
-- `depth >= 0`;
+- `cdepth >= 0`;
 - `adaptive_c > 0`;
-- depth thresholds must be positive and strictly increasing.
+- adaptive cdepth thresholds must be positive and strictly increasing.
 - `0 <= solidness <= 1`.
 
 ## Project Structure
@@ -1083,7 +1157,7 @@ scripts/
   run_match.py             simulation CLI
   view_match.py            viewer CLI
   analyze_match.py         saved-landscape inspection CLI
-  benchmark_adaptive.py    optional depth benchmark
+  benchmark_adaptive.py    optional cdepth benchmark
 
 data/games/          generated PGN files
 data/results/        generated CSV and JSON files
@@ -1093,13 +1167,13 @@ match_viewer.html   legacy static viewer artifact
 
 ## Performance and Limitations
 
-- Adaptive search reduces tree growth but does not make high depth free. Low-entropy nodes are deliberately allowed to search more deeply.
+- Adaptive search reduces tree growth but does not make high `cdepth` free. Low-entropy nodes are deliberately allowed to search more deeply.
 - Every legal root candidate receives an adaptive value before final move selection. A complete decision is therefore more expensive than one call to `U(B)`.
 - Saving viewer-ready panels evaluates both observers at every match position. This increases simulation time but makes later browsing fast.
 - The model is designed for interpretability and experimentation, not competitive playing strength.
 - Static evaluation and move-style features are intentionally compact and hand-designed.
 - The local exchange-exposure feature is a shallow capture-sequence calculation, not a general tactical engine.
-- Search is currently single-process and CPU-bound.
+- Search is CPU-bound. Viewer panel generation can use process workers, but high `cdepth` can still be expensive.
 - JSON files can become large because they contain complete viewer states and candidate diagnostics.
 
 The main scientific interpretation is:

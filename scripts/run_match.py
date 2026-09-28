@@ -67,7 +67,9 @@ def main() -> None:
         default=None,
         help="Override Black's preset solidness sigma in [0, 1].",
     )
-    parser.add_argument("--depth", type=nonnegative_int, default=4)
+    parser.add_argument("--cdepth", type=nonnegative_int, default=1, help="Cycle depth: one unit is own move plus opponent response.")
+    parser.add_argument("--depth", type=nonnegative_int, default=None, help="Deprecated alias for --cdepth.")
+    parser.add_argument("--search-mode", choices=("accurate", "cheap"), default="accurate")
     parser.add_argument("--adaptive-c", type=positive_float, default=0.3)
     parser.add_argument("--viewer-workers", type=positive_int, default=2, help="Worker processes for White/Black viewer panels; use 1 for sequential generation.")
     parser.add_argument("--name", default="thermo_match")
@@ -85,7 +87,8 @@ def main() -> None:
             black_strategy=args.black_strategy,
             white_solidness=args.solidness_white,
             black_solidness=args.solidness_black,
-            depth=args.depth,
+            cdepth=args.depth if args.depth is not None else args.cdepth,
+            search_mode=args.search_mode,
             adaptive_c=args.adaptive_c,
             viewer_workers=args.viewer_workers,
             match_name=args.name,

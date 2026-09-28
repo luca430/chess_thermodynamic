@@ -355,7 +355,7 @@ def move_features(
     development_feature = (
         side_development(after, color) - before_development + max(0.0, activity)
     )
-    phase_castle_feature = castle + castle_preserve + king
+    phase_castle_feature = castle + king
     phase_attack_feature = activity + pressure + float(king_restriction) + (
         1.0 if after.is_check() else 0.0
     )

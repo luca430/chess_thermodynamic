@@ -12,7 +12,6 @@ import chess
 from .evaluation import EvaluationWeights, StaticEvaluator
 from .measure import Style, move_distribution
 from .search import AdaptiveExpectedValue
-from .thermodynamics import decompose_transition
 
 
 PIECE_GLYPHS = {
@@ -82,10 +81,11 @@ def _landscape_payload(
     beta: float,
     evaluator: StaticEvaluator,
     player_color: chess.Color,
-    depth: int = 4,
+    cdepth: int = 1,
     adaptive_c: float = 0.3,
+    search_mode: str = "accurate",
 ) -> Dict[str, Any]:
-    search = AdaptiveExpectedValue(style, beta, evaluator, depth=depth, adaptive_c=adaptive_c)
+    search = AdaptiveExpectedValue(style, beta, evaluator, cdepth=cdepth, adaptive_c=adaptive_c, search_mode=search_mode)
     landscape = search.landscape(board)
     records_by_probability = sorted(
         landscape.records,
@@ -95,30 +95,25 @@ def _landscape_payload(
     probability_rank = {record.uci: rank for rank, record in enumerate(records_by_probability, start=1)}
 
     current_u = search.expected_value(board)
-    old_branches = search.branch_observations(board)
+    selection = search.node_selection(board)
+    branches = {branch.uci: branch for branch in selection.branches} if selection else {}
     moves = []
     for record in landscape.records:
-        after = board.copy(stack=False)
-        after.push(record.move)
-        reply_expected = search.expected_value(after)
-        decomposition = decompose_transition(
-            old_branches,
-            search.branch_observations(after),
-            u_before=current_u,
-            u_after=reply_expected,
-        )
-        delta_u = decomposition.delta_u
+        branch = branches.get(record.uci)
+        reply_expected = branch.adaptive_branch_value if branch else record.static_after
+        delta_u = reply_expected - current_u
         moves.append(
             {
                 **record.as_dict(),
                 "probability_rank": probability_rank[record.uci],
                 "reply_expected_value": reply_expected,
                 "display_reply_expected": reply_expected,
+                "candidate_delta_u": delta_u,
                 "delta_u": delta_u,
-                "delta_q": decomposition.delta_q,
-                "delta_w": decomposition.delta_w,
-                "delta_a": decomposition.delta_a,
-                "decomposition_error": decomposition.decomposition_error,
+                "branch_value": reply_expected,
+                "selected_for_deeper_analysis": branch.was_deepened if branch else False,
+                "response_neff": branch.response_neff if branch else None,
+                "response_k": branch.response_k if branch else None,
                 "player_advantage": delta_u,
             }
         )
@@ -143,6 +138,8 @@ def _landscape_payload(
         "effective_moves": landscape.effective_moves,
         "best_advantage_move": best,
         "sort_direction": "max" if board.turn == chess.WHITE else "min",
+        "cdepth": cdepth,
+        "search_mode": search_mode,
         "moves": moves,
     }
 
@@ -188,7 +185,8 @@ def build_game_payload(match_json: Path) -> Dict[str, Any]:
     black_style = _style_from_dict(source.get("black_style", {}))
     beta_white = float(config.get("beta_white", 4.0))
     beta_black = float(config.get("beta_black", 4.0))
-    depth = int(config.get("depth", 4))
+    cdepth = int(config.get("cdepth", config.get("depth", 1)))
+    search_mode = str(config.get("search_mode", "accurate"))
     adaptive_c = float(config.get("adaptive_c", 0.3))
     plies = source.get("plies", [])
     initial_fen = plies[0]["row"]["fen_before"] if plies else chess.STARTING_FEN
@@ -235,8 +233,8 @@ def build_game_payload(match_json: Path) -> Dict[str, Any]:
                 else "*",
                 "board": _board_matrix(spec["fen"]),
                 "static_evaluation": evaluator.evaluate(board),
-                "white_panel": _landscape_payload(board, white_style, beta_white, evaluator, chess.WHITE, depth, adaptive_c),
-                "black_panel": _landscape_payload(board, black_style, beta_black, evaluator, chess.BLACK, depth, adaptive_c),
+                "white_panel": _landscape_payload(board, white_style, beta_white, evaluator, chess.WHITE, cdepth, adaptive_c, search_mode),
+                "black_panel": _landscape_payload(board, black_style, beta_black, evaluator, chess.BLACK, cdepth, adaptive_c, search_mode),
             }
         )
 
@@ -365,7 +363,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     function renderBoard(state) { const highlights = lastSquares(state); els.board.innerHTML = ''; state.board.flat().forEach((sq, i) => { const div = document.createElement('div'); const rank = Math.floor(i / 8); const file = i % 8; div.className = `sq ${(rank + file) % 2 === 0 ? 'light' : 'dark'}`; if (highlights.has(sq.square)) div.classList.add(sq.square === state.uci?.slice(0, 2) ? 'last-from' : 'last-to'); div.innerHTML = `<span>${sq.piece}</span>`; if (file === 0 || rank === 7) { const coord = document.createElement('span'); coord.className = 'coord'; coord.textContent = rank === 7 ? sq.square[0] : sq.square[1]; div.appendChild(coord); } els.board.appendChild(div); }); }
     function renderEvalBar(eValue) { const scale = 20; const white = Number(eValue); const black = -white; const pct = Math.min(Math.abs(white) / scale, 1) * 50; els.whiteELabel.textContent = `White E ${fmt(white)}`; els.blackELabel.textContent = `Black E ${fmt(black)}`; els.whiteEFill.style.width = white > 0 ? `${pct}%` : '0%'; els.blackEFill.style.width = white < 0 ? `${pct}%` : '0%'; }
     function feature(move, name) { return move.features && move.features[name] !== undefined ? move.features[name] : 0; }
-    function renderPanel(target, title, style, panel, state) { const best = panel.best_advantage_move; const played = state.uci; const styleText = Object.entries(style).map(([k, v]) => `${k} ${Number(v).toFixed(2)}`).join(' · '); const rows = panel.moves.map(move => { const cls = [move.uci === played ? 'played' : '', best && move.uci === best.uci ? 'best' : ''].filter(Boolean).join(' '); return `<tr class="${cls}"><td>${move.advantage_rank}</td><td>${move.san}</td><td>${fmt(move.probability, 4)}</td><td class="${signedClass(move.display_reply_expected)}">${fmt(move.display_reply_expected)}</td><td class="${signedClass(move.delta_u)}">${fmt(move.delta_u)}</td><td class="${signedClass(move.delta_q)}">${fmt(move.delta_q)}</td><td class="${signedClass(move.delta_w)}">${fmt(move.delta_w)}</td><td class="${signedClass(move.delta_a)}">${fmt(move.delta_a)}</td><td class="${signedClass(feature(move, 'material'))}">${fmt(feature(move, 'material'))}</td><td class="${signedClass(feature(move, 'preservation'))}">${fmt(feature(move, 'preservation'))}</td><td class="${signedClass(feature(move, 'king_restriction'))}">${fmt(feature(move, 'king_restriction'))}</td><td>${fmt(feature(move, 'check'), 0)}</td><td>${fmt(feature(move, 'mate'), 0)}</td></tr>`; }).join(''); target.innerHTML = `<div class="panel-head"><div class="panel-title">${title}</div><div class="style">${styleText}</div></div><div class="metrics"><div class="metric"><div class="label">U(B)</div><div class="value ${signedClass(panel.display_expected_value)}">${fmt(panel.display_expected_value)}</div></div><div class="metric"><div class="label">Entropy</div><div class="value">${fmt(panel.entropy)}</div></div><div class="metric"><div class="label">N_eff</div><div class="value">${fmt(panel.effective_moves)}</div></div></div><div class="best">${panel.sort_direction === 'max' ? 'Max deltaU move:' : 'Min deltaU move:'} <strong>${best ? best.san : 'none'}</strong>${best ? ` · deltaU=${fmt(best.delta_u)} · U(Bm)=${fmt(best.display_reply_expected)}` : ''}</div><div class="table-note">${panel.sort_direction === 'max' ? 'Moves are sorted by descending deltaU.' : 'Moves are sorted by ascending deltaU.'} White maximizes deltaU; Black minimizes deltaU. U(B), U(Bm), and deltaU are White-positive.</div><div class="table-wrap"><table><thead><tr><th>#</th><th>move</th><th>p(B)</th><th>U(Bm)</th><th>deltaU</th><th>deltaQ</th><th>deltaW</th><th>deltaA</th><th>mat</th><th>pres</th><th>king</th><th>chk</th><th>mate</th></tr></thead><tbody>${rows || '<tr><td colspan="13">No legal moves</td></tr>'}</tbody></table></div>`; }
+    function renderPanel(target, title, style, panel, state) { const best = panel.best_advantage_move; const played = state.uci; const styleText = Object.entries(style).map(([k, v]) => `${k} ${Number(v).toFixed(2)}`).join(' · '); const rows = panel.moves.map(move => { const cls = [move.uci === played ? 'played' : '', best && move.uci === best.uci ? 'best' : ''].filter(Boolean).join(' '); return `<tr class="${cls}"><td>${move.advantage_rank}</td><td>${move.san}</td><td>${fmt(move.probability, 4)}</td><td class="${signedClass(move.display_reply_expected)}">${fmt(move.display_reply_expected)}</td><td class="${signedClass(move.delta_u)}">${fmt(move.delta_u)}</td><td class="${signedClass(feature(move, 'material'))}">${fmt(feature(move, 'material'))}</td><td class="${signedClass(feature(move, 'preservation'))}">${fmt(feature(move, 'preservation'))}</td><td class="${signedClass(feature(move, 'king_restriction'))}">${fmt(feature(move, 'king_restriction'))}</td><td>${fmt(feature(move, 'check'), 0)}</td><td>${fmt(feature(move, 'mate'), 0)}</td></tr>`; }).join(''); target.innerHTML = `<div class="panel-head"><div class="panel-title">${title}</div><div class="style">${styleText}</div></div><div class="metrics"><div class="metric"><div class="label">U(B)</div><div class="value ${signedClass(panel.display_expected_value)}">${fmt(panel.display_expected_value)}</div></div><div class="metric"><div class="label">Entropy</div><div class="value">${fmt(panel.entropy)}</div></div><div class="metric"><div class="label">N_eff</div><div class="value">${fmt(panel.effective_moves)}</div></div></div><div class="best">${panel.sort_direction === 'max' ? 'Max deltaU move:' : 'Min deltaU move:'} <strong>${best ? best.san : 'none'}</strong>${best ? ` · deltaU=${fmt(best.delta_u)} · U(Bm)=${fmt(best.display_reply_expected)}` : ''}</div><div class="table-note">${panel.sort_direction === 'max' ? 'Moves are sorted by descending deltaU.' : 'Moves are sorted by ascending deltaU.'} White maximizes deltaU; Black minimizes deltaU. U(B), U(Bm), and deltaU are White-positive.</div><div class="table-wrap"><table><thead><tr><th>#</th><th>move</th><th>p(B)</th><th>U(Bm)</th><th>deltaU</th><th>mat</th><th>pres</th><th>king</th><th>chk</th><th>mate</th></tr></thead><tbody>${rows || '<tr><td colspan="10">No legal moves</td></tr>'}</tbody></table></div>`; }
     function renderMoveList() { els.moveList.innerHTML = states.map((state, i) => `<span class="move-chip ${i === index ? 'active' : ''}" data-index="${i}">${i === 0 ? 'Start' : `${state.ply}. ${state.san}`}</span>`).join(' '); els.moveList.querySelectorAll('.move-chip').forEach(chip => chip.addEventListener('click', () => setIndex(Number(chip.dataset.index)))); }
     function setIndex(nextIndex) { if (!states.length) return; index = Math.max(0, Math.min(states.length - 1, nextIndex)); const state = states[index]; els.slider.value = index; els.fen.textContent = state.fen; els.positionLabel.textContent = state.move_label; els.turn.textContent = state.is_game_over ? `game over ${state.result}` : state.turn; els.staticV.textContent = fmt(state.static_evaluation); els.staticV.className = `value ${signedClass(state.static_evaluation)}`; renderEvalBar(state.static_evaluation); renderBoard(state); renderPanel(els.whitePanel, 'White Style Measure', game.white_style, state.white_panel, state); renderPanel(els.blackPanel, 'Black Style Measure', game.black_style, state.black_panel, state); renderMoveList(); }
     function setGame(gameIndex) { game = platform.games[gameIndex]; if (!game || game.error || !game.states.length) { els.main.innerHTML = `<div class="notice">No loadable games were embedded from ${platform.results_dir}.</div>`; return; } states = game.states; index = 0; els.source.textContent = game.source_file; els.result.textContent = `Result ${game.result}`; els.plyCount.textContent = `${states.length - 1} plies`; els.slider.max = states.length - 1; setIndex(0); }

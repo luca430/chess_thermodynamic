@@ -131,19 +131,35 @@ def test_adaptive_breadth_rule(
     assert adaptive_breadth(effective_moves, adaptive_c, legal_moves) == expected
 
 
-def test_adaptive_depth_one_matches_full_one_ply_expectation() -> None:
+def test_cdepth_zero_is_static_evaluation() -> None:
+    board = chess.Board()
+    evaluator = StaticEvaluator()
+    search = AdaptiveExpectedValue(Style(), 1.0, evaluator, cdepth=0)
+    assert search.expected_value(board) == pytest.approx(evaluator.evaluate(board))
+
+
+def test_cdepth_one_accurate_matches_full_move_response_expectation() -> None:
     board = chess.Board()
     evaluator = StaticEvaluator()
     style = Style()
     landscape = move_distribution(board, style, 1.5, evaluator)
-    search = AdaptiveExpectedValue(style, 1.5, evaluator, depth=1, adaptive_c=0.1)
-    assert search.expected_value(board) == pytest.approx(landscape.expected_value)
+    search = AdaptiveExpectedValue(style, 1.5, evaluator, cdepth=1, adaptive_c=0.1)
+    explicit = 0.0
+    for record in landscape.records:
+        after = board.copy(stack=False)
+        after.push(record.move)
+        reply_landscape = move_distribution(after, style, 1.5, evaluator)
+        reply_expected = sum(
+            reply.probability * reply.static_after for reply in reply_landscape.records
+        )
+        explicit += record.probability * reply_expected
+    assert search.expected_value(board) == pytest.approx(explicit)
 
 
-def test_adaptive_expectation_preserves_unexpanded_probability_mass() -> None:
+def test_accurate_mode_preserves_unexpanded_probability_mass() -> None:
     board = chess.Board("4k3/8/8/8/8/8/4R3/4K3 w - - 0 1")
     evaluator = StaticEvaluator()
-    search = AdaptiveExpectedValue(_quiet_style(), 1.0, evaluator, depth=2, adaptive_c=0.1)
+    search = AdaptiveExpectedValue(_quiet_style(), 1.0, evaluator, cdepth=1, adaptive_c=0.1)
     actual = search.expected_value(board)
     landscape = search.landscape(board)
     selection = search.node_selection(board)
@@ -154,19 +170,113 @@ def test_adaptive_expectation_preserves_unexpanded_probability_mass() -> None:
     explicit = 0.0
     fallback_mass = 0.0
     for record in landscape.records:
-        if record.uci in selected:
-            child = board.copy(stack=False)
-            child.push(record.move)
-            branch_value = search.expected_value(
-                child, depth=selection.selected_depth - 1
-            )
-        else:
-            branch_value = record.static_after
+        after = board.copy(stack=False)
+        after.push(record.move)
+        reply_landscape = move_distribution(after, _quiet_style(), 1.0, evaluator)
+        branch_value = sum(reply.probability * reply.static_after for reply in reply_landscape.records)
+        if record.uci not in selected:
             fallback_mass += record.probability
         explicit += record.probability * branch_value
 
     assert fallback_mass > 0.0
     assert actual == pytest.approx(explicit)
+
+
+
+
+def test_top_k_uses_own_move_probability_order() -> None:
+    board = chess.Board()
+    evaluator = StaticEvaluator()
+    style = Style(center=3.0, development=1.0)
+    search = AdaptiveExpectedValue(style, 2.0, evaluator, cdepth=1, adaptive_c=0.2)
+    search.expected_value(board)
+    landscape = search.landscape(board)
+    selection = search.node_selection(board)
+    assert selection is not None
+    expected_k = adaptive_breadth(landscape.effective_moves, 0.2, len(landscape.records))
+    expected = tuple(
+        record.uci
+        for record in sorted(landscape.records, key=lambda item: item.probability, reverse=True)[:expected_k]
+    )
+    assert selection.selected_uci == expected
+
+
+def test_response_k_is_independent_and_probability_ordered() -> None:
+    board = chess.Board()
+    evaluator = StaticEvaluator()
+    style = Style(center=3.0, development=1.0)
+    search = AdaptiveExpectedValue(style, 2.0, evaluator, cdepth=1, adaptive_c=0.2)
+    search.expected_value(board)
+    selection = search.node_selection(board)
+    assert selection is not None
+    selected_branch = next(branch for branch in selection.branches if branch.was_deepened)
+    after = board.copy(stack=False)
+    after.push(selected_branch.move)
+    reply_landscape = search.landscape(after)
+    expected_k = adaptive_breadth(reply_landscape.effective_moves, 0.2, len(reply_landscape.records))
+    expected = {
+        record.uci
+        for record in sorted(reply_landscape.records, key=lambda item: item.probability, reverse=True)[:expected_k]
+    }
+    observed = {
+        reply.uci
+        for reply in selected_branch.response_branches
+        if reply.selected_for_refinement
+    }
+    assert selected_branch.response_k == expected_k
+    assert observed == expected
+
+
+def test_accurate_mode_does_not_renormalize_or_drop_omitted_replies() -> None:
+    board = chess.Board()
+    evaluator = StaticEvaluator()
+    style = Style(center=3.0, development=1.0)
+    search = AdaptiveExpectedValue(style, 2.0, evaluator, cdepth=1, adaptive_c=0.05)
+    search.expected_value(board)
+    selection = search.node_selection(board)
+    assert selection is not None
+    branch = next(branch for branch in selection.branches if branch.was_deepened)
+    assert branch.response_k is not None
+    assert branch.response_k < len(branch.response_branches)
+    assert sum(reply.probability for reply in branch.response_branches) == pytest.approx(1.0)
+    assert any(not reply.selected_for_refinement for reply in branch.response_branches)
+
+
+def test_cheap_mode_uses_parent_fallback_for_unselected_mass() -> None:
+    board = chess.Board()
+    evaluator = StaticEvaluator()
+    style = Style(center=3.0, development=1.0)
+    search = AdaptiveExpectedValue(style, 2.0, evaluator, cdepth=1, adaptive_c=0.05, search_mode="cheap")
+    search.expected_value(board)
+    landscape = search.landscape(board)
+    selection = search.node_selection(board)
+    assert selection is not None
+    selected = set(selection.selected_uci)
+    nonselected_record = next(record for record in landscape.records if record.uci not in selected)
+    nonselected_branch = next(branch for branch in selection.branches if branch.uci == nonselected_record.uci)
+    assert nonselected_branch.adaptive_branch_value == pytest.approx(nonselected_record.static_after)
+
+    selected_record = next(record for record in landscape.records if record.uci in selected)
+    selected_branch = next(branch for branch in selection.branches if branch.uci == selected_record.uci)
+    selected_mass = sum(reply.probability for reply in selected_branch.response_branches)
+    assert selected_mass < 1.0
+    expected = sum(
+        reply.probability * reply.response_value for reply in selected_branch.response_branches
+    ) + (1.0 - selected_mass) * selected_record.static_after
+    assert selected_branch.adaptive_branch_value == pytest.approx(expected)
+
+
+def test_cdepth_two_recurses_only_after_complete_cycle() -> None:
+    board = chess.Board()
+    evaluator = StaticEvaluator()
+    search = AdaptiveExpectedValue(Style(center=3.0), 2.0, evaluator, cdepth=2, adaptive_c=0.05)
+    search.expected_value(board)
+    selection = search.node_selection(board)
+    assert selection is not None
+    branch = next(branch for branch in selection.branches if branch.was_deepened)
+    assert branch.depth_used == 2
+    assert any(reply.depth_used == 1 for reply in branch.response_branches)
+    assert all(reply.depth_used in (0, 1) for reply in branch.response_branches)
 
 
 def test_depths_two_through_four_are_probability_weighted() -> None:
@@ -205,7 +315,9 @@ def test_adaptive_configuration_validation() -> None:
         MatchConfig(white_solidness=-0.1)
     with pytest.raises(ValueError):
         MatchConfig(black_solidness=1.1)
-    assert MatchConfig().depth == 4
+    assert MatchConfig().cdepth == 1
+    assert MatchConfig().depth == 1
+    assert MatchConfig().search_mode == "accurate"
     assert MatchConfig().adaptive_c == pytest.approx(0.3)
 
 
@@ -385,6 +497,102 @@ def test_castling_features_use_mover_perspective_for_both_colors() -> None:
     black = chess.Board("r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1")
     assert move_features(white, chess.Move.from_uci("h1h2"))["castle_preserve"] == -1.0
     assert move_features(black, chess.Move.from_uci("h8h7"))["castle_preserve"] == -1.0
+
+
+def _move_record(board: chess.Board, style: Style, uci: str) -> dict[str, object]:
+    landscape = move_distribution(board, style, beta=1.0, evaluator=StaticEvaluator())
+    for record in landscape.records:
+        if record.uci == uci:
+            return record.as_dict()
+    raise AssertionError(f"move {uci} not found")
+
+
+def test_early_king_move_has_large_castling_preservation_contribution() -> None:
+    board = chess.Board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQK1NR w KQkq - 0 1")
+    record = _move_record(board, Style(castle_preserve=2.0), "e1f1")
+    features = record["features"]
+    assert features["castle_preserve_raw"] == -2.0
+    assert features["castle_preserve_phase_weight"] > 0.9
+    assert features["castle_preserve_effective_weight"] > 1.8
+    assert features["castle_preserve_contribution"] < -3.6
+
+
+def test_original_rook_move_has_castling_preservation_contribution() -> None:
+    board = chess.Board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPP1/RNBQKBNR w KQkq - 0 1")
+    record = _move_record(board, Style(castle_preserve=2.0), "h1h2")
+    features = record["features"]
+    assert features["castle_preserve_raw"] == -1.0
+    assert features["castle_preserve_contribution"] == pytest.approx(-2.0)
+
+
+def test_castling_has_no_castling_preservation_contribution() -> None:
+    board = chess.Board("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1")
+    record = _move_record(board, Style(castle_preserve=2.0), "e1g1")
+    features = record["features"]
+    assert features["castle_preserve_raw"] == 0.0
+    assert features["castle_preserve_contribution"] == pytest.approx(0.0)
+
+
+def test_castling_preservation_fades_with_game_phase() -> None:
+    style = Style(castle_preserve=2.0, solidness=0.5)
+    early_weights = phase_weights(0.1)
+    late_weights = phase_weights(0.9)
+    early = {
+        "castle_preserve": -1.0,
+        "game_phase": 0.1,
+        "castle_phase_weight": early_weights[1],
+    }
+    late = {
+        "castle_preserve": -1.0,
+        "game_phase": 0.9,
+        "castle_phase_weight": late_weights[1],
+    }
+    early_record = _move_record(
+        chess.Board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPP1/RNBQKBNR w KQkq - 0 1"),
+        Style(castle_preserve=2.0),
+        "h1h2",
+    )
+    assert early_record["features"]["castle_preserve_phase_weight"] == pytest.approx(
+        1.0 - early_record["features"]["game_phase"]
+    )
+    early_contribution = potential_components(style, early)[0]
+    late_contribution = potential_components(style, late)[0]
+    assert early_contribution < late_contribution
+    assert abs(early_contribution) > abs(late_contribution)
+
+
+def test_solidness_strengthens_early_castling_preservation() -> None:
+    weights = phase_weights(0.25)
+    features = {
+        "castle_preserve": -1.0,
+        "game_phase": 0.25,
+        "castle_phase_weight": weights[1],
+    }
+    flexible = Style(castle_preserve=2.0, solidness=0.0)
+    solid = Style(castle_preserve=2.0, solidness=1.0)
+    assert potential_components(solid, features)[0] < potential_components(flexible, features)[0]
+
+
+def test_all_builtin_strategies_preserve_castling_rights_meaningfully() -> None:
+    for name in STRATEGY_NAMES:
+        assert strategy_style(name).castle_preserve >= 1.0
+
+
+def test_tactical_gain_can_outweigh_castling_preservation_penalty() -> None:
+    style = Style(castle_preserve=3.0, mate=80.0)
+    tactical_king_move = {
+        "castle_preserve": -2.0,
+        "game_phase": 0.0,
+        "castle_phase_weight": 0.0,
+        "mate": 1.0,
+    }
+    quiet_move = {
+        "castle_preserve": 0.0,
+        "game_phase": 0.0,
+        "castle_phase_weight": 0.0,
+        "mate": 0.0,
+    }
+    assert potential(style, tactical_king_move) > potential(style, quiet_move)
 
 
 def test_game_phase_is_bounded_and_increases_with_development() -> None:
@@ -570,13 +778,14 @@ def test_terminal_static_fallback_is_boundary_accessibility() -> None:
     assert result.delta_q == 0.0
     assert result.delta_w == 0.0
     assert result.delta_a == pytest.approx(terminal_u)
-    assert result.boundary_accessibility == pytest.approx(terminal_u)
+    assert result.new_support_size == 1
+    assert result.boundary_accessibility == pytest.approx(0.0)
     assert result.decomposition_error == pytest.approx(0.0)
 
 
 def test_simulation_saves_viewer_ready_panels(tmp_path: Path) -> None:
     config = MatchConfig(
-        max_plies=2,
+        max_plies=4,
         seed=1,
         depth=1,
         results_dir=tmp_path / "results",
@@ -593,7 +802,9 @@ def test_simulation_saves_viewer_ready_panels(tmp_path: Path) -> None:
     data = json.loads(Path(result["json"]).read_text(encoding="utf-8"))
 
     states = data["viewer_states"]
+    assert data["config"]["cdepth"] == 1
     assert data["config"]["depth"] == 1
+    assert data["config"]["search_mode"] == "accurate"
     assert data["config"]["adaptive_c"] == pytest.approx(0.3)
     assert data["white_style"]["solidness"] == pytest.approx(0.2)
     assert data["black_style"]["solidness"] == pytest.approx(0.9)
@@ -602,21 +813,11 @@ def test_simulation_saves_viewer_ready_panels(tmp_path: Path) -> None:
     assert states[0]["order"] == [move["uci"] for move in states[0]["white_panel"]["moves"]]
 
     first_move = states[0]["white_panel"]["moves"][0]
-    assert {
-        "san",
-        "uci",
-        "probability",
-        "static_after",
-        "delta_u",
-        "delta_q",
-        "delta_w",
-        "delta_a",
-        "decomposition_error",
-    } <= first_move.keys()
-    assert first_move["delta_u"] == pytest.approx(
-        first_move["delta_q"] + first_move["delta_w"] + first_move["delta_a"]
-    )
-    assert first_move["decomposition_error"] == pytest.approx(0.0, abs=1e-10)
+    assert {"san", "uci", "probability", "static_after", "delta_u"} <= first_move.keys()
+    assert "delta_q" not in first_move
+    assert "delta_w" not in first_move
+    assert "delta_a" not in first_move
+    assert "decomposition_error" not in first_move
     assert "reply_landscape" not in first_move
     assert states[0]["black_panel"]["moves"]
     assert states[0]["white_panel"]["search_depth"] == 1
@@ -635,21 +836,48 @@ def test_simulation_saves_viewer_ready_panels(tmp_path: Path) -> None:
     )
     assert first_row["selected_depth"] == 1
     assert first_row["K_expanded"] >= 1
-    assert first_row["delta_U"] == pytest.approx(
-        first_row["delta_Q"] + first_row["delta_W"] + first_row["delta_A"]
-    )
-    assert first_row["decomposition_error"] == pytest.approx(0.0, abs=1e-10)
+    assert first_row["delta_U"] is None
+    assert first_row["delta_Q"] is None
+    assert first_row["delta_W"] is None
+    assert first_row["delta_A"] is None
     assert first_row["N_eff_before"] == pytest.approx(first_row["N_eff"])
-    assert first_row["old_support_size"] == len(
-        data["plies"][0]["adaptive_branches_before"]
+
+    transitions = data["thermodynamic_transitions"]
+    assert transitions
+    first_transition = transitions[0]
+    assert first_transition["side"] == "white"
+    assert first_transition["old_ply"] == 1
+    assert first_transition["new_ply"] == 3
+    assert first_transition["delta_U"] == pytest.approx(
+        first_transition["delta_Q"]
+        + first_transition["delta_W"]
+        + first_transition["delta_A"]
     )
-    assert first_row["new_support_size"] == len(
-        data["plies"][0]["adaptive_branches_after"]
+    assert first_transition["decomposition_error"] == pytest.approx(0.0, abs=1e-10)
+    assert first_transition["common_support_size"] > 0
+    assert first_transition["cdepth"] == 1
+    assert first_transition["search_mode"] == "accurate"
+    assert first_transition["K_old"] >= 1
+    assert first_transition["K_new"] >= 1
+    assert transitions[1]["side"] == "black"
+    assert transitions[1]["old_ply"] == 2
+    assert transitions[1]["new_ply"] == 4
+    assert states[0].get("thermodynamic_transition") is None
+    assert states[1].get("thermodynamic_transition") is None
+    assert states[2]["thermodynamic_transition"]["side"] == "white"
+    assert states[3]["thermodynamic_transition"]["side"] == "black"
+
+    transition_row = data["plies"][2]["row"]
+    assert transition_row["old_support_size"] == len(
+        data["plies"][2]["adaptive_branches_before"]
+    )
+    assert transition_row["new_support_size"] == len(
+        data["plies"][2]["adaptive_branches_after"]
     )
     assert sum(
         branch["probability"] * branch["adaptive_branch_value"]
-        for branch in data["plies"][0]["adaptive_branches_before"]
-    ) == pytest.approx(first_row["U_before"])
+        for branch in data["plies"][2]["adaptive_branches_before"]
+    ) == pytest.approx(transition_row["U_before"])
 
     white_panel_deltas = [move["delta_u"] for move in states[0]["white_panel"]["moves"]]
     assert white_panel_deltas == sorted(white_panel_deltas, reverse=True)

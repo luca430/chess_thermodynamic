@@ -110,14 +110,43 @@ class MoveLandscape:
         }
 
 
+def castle_preserve_diagnostics(style: Style, features: Dict[str, float]) -> Dict[str, float]:
+    raw = features.get("castle_preserve", 0.0)
+    phase = min(1.0, max(0.0, features.get("game_phase", 0.0)))
+    rights_weight = 1.0 - phase
+    castle_phase_weight = features.get("castle_phase_weight", 0.0)
+    effective_weight = (
+        style.castle_preserve
+        * rights_weight
+        * (1.0 + style.solidness * castle_phase_weight)
+    )
+    return {
+        "castle_preserve_raw": raw,
+        "castle_preserve_phase_weight": rights_weight,
+        "castle_preserve_effective_weight": effective_weight,
+        "castle_preserve_contribution": effective_weight * raw,
+    }
+
+
 def potential_components(style: Style, features: Dict[str, float]) -> tuple[float, float, float]:
     weights = style.as_dict()
-    phase_parameters = {"development", "phase_castle", "phase_attack", "solidness"}
+    special_parameters = {
+        "development",
+        "phase_castle",
+        "phase_attack",
+        "solidness",
+        "castle_preserve",
+        "castle_preserve_raw",
+        "castle_preserve_phase_weight",
+        "castle_preserve_effective_weight",
+        "castle_preserve_contribution",
+    }
+    castle_terms = castle_preserve_diagnostics(style, features)
     base = sum(
         weights.get(name, 0.0) * value
         for name, value in features.items()
-        if name not in phase_parameters
-    )
+        if name not in special_parameters
+    ) + castle_terms["castle_preserve_contribution"]
     phase = (
         style.development
         * features.get("development_phase_weight", 0.0)
@@ -177,6 +206,7 @@ def move_distribution(
     for move, features, (base_phi, phase_phi, phi), probability in zip(
         legal_moves, features_by_move, components, probabilities
     ):
+        features = {**features, **castle_preserve_diagnostics(style, features)}
         san = board.san(move)
         after = board.copy(stack=False)
         after.push(move)
