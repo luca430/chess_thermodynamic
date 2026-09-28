@@ -23,6 +23,15 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def optional_workers(value: str) -> int | None:
+    if value == "auto":
+        return None
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1 or auto")
+    return parsed
+
+
 def positive_float(value: str) -> float:
     parsed = float(value)
     if parsed <= 0.0:
@@ -71,7 +80,9 @@ def main() -> None:
     parser.add_argument("--depth", type=nonnegative_int, default=None, help="Deprecated alias for --cdepth.")
     parser.add_argument("--search-mode", choices=("accurate", "cheap"), default="accurate")
     parser.add_argument("--adaptive-c", type=positive_float, default=0.3)
-    parser.add_argument("--viewer-workers", type=positive_int, default=2, help="Worker processes for White/Black viewer panels; use 1 for sequential generation.")
+    parser.add_argument("--viewer-workers", type=positive_int, default=1, help="Deprecated for normal saved-data viewer generation; retained for compatibility.")
+    parser.add_argument("--search-workers", type=optional_workers, default=1, help="Process workers for root own-move branches; use 1 for serial or auto for CPU count.")
+    parser.add_argument("--parallel-min-branches", type=positive_int, default=8, help="Minimum root branch count before search worker parallelism activates.")
     parser.add_argument("--name", default="thermo_match")
     parser.add_argument("--ignore-threefold", action="store_true", help="Continue through threefold repetition until mate/stalemate or max-plies.")
     parser.add_argument("--allow-draw-claims", action="store_true", help="Stop on other claimable/automatic draw rules as well.")
@@ -91,6 +102,8 @@ def main() -> None:
             search_mode=args.search_mode,
             adaptive_c=args.adaptive_c,
             viewer_workers=args.viewer_workers,
+            search_workers=args.search_workers,
+            parallel_min_branches=args.parallel_min_branches,
             match_name=args.name,
             stop_only_on_mate_or_stalemate=not args.allow_draw_claims,
             stop_on_threefold_repetition=not args.ignore_threefold,

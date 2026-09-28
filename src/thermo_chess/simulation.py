@@ -5,7 +5,6 @@ from __future__ import annotations
 import csv
 import json
 import random
-from concurrent.futures import Executor, ProcessPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List
@@ -16,7 +15,7 @@ import chess.pgn
 from .evaluation import EvaluationWeights, StaticEvaluator
 from .measure import Style
 from .player import ThermoPlayer
-from .search import AdaptiveDepthThresholds, SearchMode
+from .search import AdaptiveDepthThresholds, SearchMode, SearchResult
 from .thermodynamics import decompose_transition
 
 
@@ -50,7 +49,10 @@ class MatchConfig:
     match_name: str = "thermo_match"
     stop_only_on_mate_or_stalemate: bool = False
     stop_on_threefold_repetition: bool = True
-    viewer_workers: int = 2
+    viewer_workers: int = 1
+    search_workers: int | None = 1
+    parallel_min_branches: int = 8
+    profile: bool = False
 
     def __post_init__(self) -> None:
         if self.depth is not None:
@@ -64,6 +66,10 @@ class MatchConfig:
             raise ValueError("adaptive_c must be greater than 0")
         if self.viewer_workers < 1:
             raise ValueError("viewer_workers must be at least 1")
+        if self.search_workers is not None and self.search_workers < 1:
+            raise ValueError("search_workers must be at least 1")
+        if self.parallel_min_branches < 1:
+            raise ValueError("parallel_min_branches must be at least 1")
         if self.white_strategy not in STRATEGY_NAMES:
             raise ValueError(f"unknown white strategy: {self.white_strategy}")
         if self.black_strategy not in STRATEGY_NAMES:
@@ -230,161 +236,65 @@ def _prediction_error_for_previous(
     previous["prediction_error"] = realized - float(expected)
 
 
-def _candidate_scores_for_choice(
-    player: ThermoPlayer, board: chess.Board, evaluator: StaticEvaluator
-) -> List[Dict[str, object]]:
-    analysis = player.analyze(board, evaluator)
-    scores: List[Dict[str, object]] = []
-    maximize = player.color == chess.WHITE
-    for candidate in analysis.candidates:
-        after = board.copy(stack=False)
-        after.push(candidate.move)
-        reply = player.landscape(after, evaluator)
-        scores.append(
-            {
-                **candidate.as_dict(),
-                "reply_entropy": reply.entropy,
-                "reply_effective_moves": reply.effective_moves,
-            }
-        )
+def _candidate_scores_from_result(result: SearchResult, maximize: bool) -> List[Dict[str, object]]:
+    scores = [move.as_dict() for move in result.moves]
     return sorted(scores, key=lambda item: item["selection_value"], reverse=maximize)
 
 
-def _viewer_panel(
-    player: ThermoPlayer,
-    board: chess.Board,
-    evaluator: StaticEvaluator,
-) -> Dict[str, object]:
-    analysis = player.analyze(board, evaluator)
-    landscape = analysis.landscape
-    records = {record.uci: record for record in landscape.records}
-    moves = []
-    for candidate in analysis.candidates:
-        record = records[candidate.uci]
-        moves.append(
-            {
-                **record.as_dict(),
-                "reply_expected_value": candidate.value,
-                "delta_u": candidate.delta_u,
-                "selected_for_deeper_analysis": candidate.selected_for_deeper_analysis,
-            }
-        )
+def _viewer_panel_from_result(result: SearchResult, board_turn: chess.Color) -> Dict[str, object]:
+    return result.as_viewer_panel(board_turn)
 
-    if board.turn == chess.WHITE:
-        moves.sort(
-            key=lambda item: (item["delta_u"], item["probability"], item["reply_expected_value"]),
-            reverse=True,
-        )
-        sort_direction = "descending"
-    else:
-        moves.sort(
-            key=lambda item: (item["delta_u"], -item["probability"], item["reply_expected_value"]),
-        )
-        sort_direction = "ascending"
 
-    for rank, move in enumerate(moves, start=1):
-        move["advantage_rank"] = rank
-
+def _empty_counterfactual_panel(side: str) -> Dict[str, object]:
     return {
-        "expected_value": analysis.current_value,
-        "entropy": landscape.entropy,
-        "effective_moves": landscape.effective_moves,
-        "selected_depth": analysis.selected_depth,
-        "expanded_count": analysis.expanded_count,
-        "cdepth": player.cdepth,
-        "search_depth": player.cdepth,
-        "search_mode": player.search_mode,
-        "adaptive_c": player.adaptive_c,
-        "diagnostics": analysis.diagnostics,
-        "sort_direction": sort_direction,
-        "moves": moves,
+        "actual_decision": False,
+        "counterfactual": True,
+        "counterfactual_available": False,
+        "side": side,
+        "expected_value": None,
+        "entropy": None,
+        "effective_moves": None,
+        "selected_depth": None,
+        "expanded_count": None,
+        "moves": [],
+        "sort_direction": "none",
     }
-
-
-def _viewer_panel_worker(args: tuple[Any, ...]) -> Dict[str, object]:
-    (
-        fen,
-        name,
-        color,
-        style,
-        beta,
-        cdepth,
-        adaptive_c,
-        depth_thresholds,
-        search_mode,
-        eval_weights,
-    ) = args
-    player = ThermoPlayer(
-        name,
-        color,
-        style,
-        beta,
-        cdepth,
-        adaptive_c,
-        depth_thresholds,
-        search_mode,
-    )
-    return _viewer_panel(player, chess.Board(fen), StaticEvaluator(eval_weights))
-
-
-def _viewer_panel_args(
-    player: ThermoPlayer,
-    board: chess.Board,
-    evaluator: StaticEvaluator,
-) -> tuple[Any, ...]:
-    return (
-        board.fen(),
-        player.name,
-        player.color,
-        player.style,
-        player.beta,
-        player.cdepth,
-        player.adaptive_c,
-        player.depth_thresholds,
-        player.search_mode,
-        evaluator.weights,
-    )
-
 
 def _thermodynamic_transition_record(
     player: ThermoPlayer,
-    old_state: Dict[str, object],
+    old_result: SearchResult,
     new_ply: int,
-    new_branches: tuple,
-    new_value: float,
-    new_effective_moves: float,
-    new_selected_depth: int,
-    new_expanded_count: int,
+    new_result: SearchResult,
 ) -> Dict[str, object]:
     decomposition = decompose_transition(
-        old_state["branches"],
-        new_branches,
-        u_before=float(old_state["value"]),
-        u_after=new_value,
+        old_result.branch_observations(),
+        new_result.branch_observations(),
+        u_before=old_result.U,
+        u_after=new_result.U,
     )
     return {
         "player": player.name,
         "side": _side_name(player.color),
-        "old_ply": old_state["ply"],
+        "old_ply": old_result.diagnostics.get("ply", None),
         "new_ply": new_ply,
-        "fen_old": old_state["fen"],
-        "fen_new": old_state.get("fen_new", ""),
+        "fen_old": old_result.board_fen,
+        "fen_new": new_result.board_fen,
         "U_old": decomposition.u_before,
         "U_new": decomposition.u_after,
         "delta_U": decomposition.delta_u,
         "delta_Q": decomposition.delta_q,
         "delta_W": decomposition.delta_w,
         "delta_A": decomposition.delta_a,
-        "N_eff_old": old_state["effective_moves"],
-        "N_eff_new": new_effective_moves,
+        "N_eff_old": old_result.N_eff,
+        "N_eff_new": new_result.N_eff,
         "cdepth": player.cdepth,
         "search_mode": player.search_mode,
-        "K_old": old_state["expanded_count"],
-        "K_new": new_expanded_count,
-        "adaptive_cdepth_old": old_state["selected_depth"],
-        "adaptive_cdepth_new": new_selected_depth,
-        "adaptive_depth_old": old_state["selected_depth"],
-        "adaptive_depth_new": new_selected_depth,
+        "K_old": old_result.K,
+        "K_new": new_result.K,
+        "adaptive_cdepth_old": old_result.selected_depth,
+        "adaptive_cdepth_new": new_result.selected_depth,
+        "adaptive_depth_old": old_result.selected_depth,
+        "adaptive_depth_new": new_result.selected_depth,
         "old_support_size": decomposition.old_support_size,
         "new_support_size": decomposition.new_support_size,
         "common_support_size": decomposition.common_support_size,
@@ -395,7 +305,6 @@ def _thermodynamic_transition_record(
         "decomposition_error": decomposition.decomposition_error,
     }
 
-
 def _viewer_state(
     board: chess.Board,
     index: int,
@@ -403,37 +312,20 @@ def _viewer_state(
     san: str,
     uci: str,
     previous_row: Dict[str, object] | None,
-    white: ThermoPlayer,
-    black: ThermoPlayer,
     evaluator: StaticEvaluator,
-    viewer_executor: Executor | None = None,
-    local_panel_color: chess.Color | None = None,
+    actual_result: SearchResult | None = None,
 ) -> Dict[str, object]:
-    if viewer_executor is None:
-        white_panel = _viewer_panel(white, board, evaluator)
-        black_panel = _viewer_panel(black, board, evaluator)
-    elif local_panel_color == chess.WHITE:
-        black_future = viewer_executor.submit(
-            _viewer_panel_worker, _viewer_panel_args(black, board, evaluator)
-        )
-        white_panel = _viewer_panel(white, board, evaluator)
-        black_panel = black_future.result()
-    elif local_panel_color == chess.BLACK:
-        white_future = viewer_executor.submit(
-            _viewer_panel_worker, _viewer_panel_args(white, board, evaluator)
-        )
-        black_panel = _viewer_panel(black, board, evaluator)
-        white_panel = white_future.result()
-    else:
-        white_future = viewer_executor.submit(
-            _viewer_panel_worker, _viewer_panel_args(white, board, evaluator)
-        )
-        black_future = viewer_executor.submit(
-            _viewer_panel_worker, _viewer_panel_args(black, board, evaluator)
-        )
-        white_panel = white_future.result()
-        black_panel = black_future.result()
     is_game_over = board.is_game_over(claim_draw=True)
+    white_panel = _empty_counterfactual_panel("white")
+    black_panel = _empty_counterfactual_panel("black")
+    order: List[str] = []
+    if actual_result is not None:
+        panel = _viewer_panel_from_result(actual_result, board.turn)
+        order = [move["uci"] for move in panel["moves"]]
+        if actual_result.side == "white":
+            white_panel = panel
+        else:
+            black_panel = panel
     return {
         "index": index,
         "ply": index,
@@ -446,11 +338,12 @@ def _viewer_state(
         "prediction_error": previous_row.get("prediction_error") if previous_row else None,
         "is_game_over": is_game_over,
         "result": board.result(claim_draw=True) if is_game_over else "*",
+        "actual_search_result": actual_result.as_dict() if actual_result is not None else None,
+        "actual_side": actual_result.side if actual_result is not None else None,
         "white_panel": white_panel,
         "black_panel": black_panel,
-        "order": [move["uci"] for move in white_panel["moves"]],
+        "order": order,
     }
-
 
 def simulate_match(
     white_style: Style | None = None,
@@ -485,6 +378,8 @@ def simulate_match(
         config.adaptive_c,
         depth_thresholds,
         config.search_mode,
+        config.search_workers,
+        config.parallel_min_branches,
     )
     black = ThermoPlayer(
         "Black custom" if black_style is not None else f"Black {config.black_strategy.replace('_', ' ')}",
@@ -495,6 +390,8 @@ def simulate_match(
         config.adaptive_c,
         depth_thresholds,
         config.search_mode,
+        config.search_workers,
+        config.parallel_min_branches,
     )
     players = {chess.WHITE: white, chess.BLACK: black}
 
@@ -511,24 +408,8 @@ def simulate_match(
     nested: List[Dict[str, object]] = []
     thermodynamic_transitions: List[Dict[str, object]] = []
     last_thermo_state: Dict[chess.Color, Dict[str, object]] = {}
-    viewer_executor: Executor | None = (
-        ProcessPoolExecutor(max_workers=config.viewer_workers)
-        if config.viewer_workers > 1
-        else None
-    )
     viewer_states: List[Dict[str, object]] = [
-        _viewer_state(
-            board,
-            0,
-            "Start",
-            "",
-            "",
-            None,
-            white,
-            black,
-            evaluator,
-            viewer_executor,
-        )
+        _viewer_state(board, 0, "Start", "", "", None, evaluator)
     ]
 
     reached_ply_limit = True
@@ -547,36 +428,47 @@ def simulate_match(
         fen_before = board.fen()
         static_before = evaluator.evaluate(board)
         current_analysis = player.analyze(board, evaluator)
+        search_result = current_analysis.search_result
+        result_diag = {**search_result.diagnostics, "ply": ply}
+        search_result = SearchResult(
+            board_fen=search_result.board_fen,
+            player=search_result.player,
+            side=search_result.side,
+            cdepth=search_result.cdepth,
+            search_mode=search_result.search_mode,
+            beta=search_result.beta,
+            adaptive_c=search_result.adaptive_c,
+            U=search_result.U,
+            entropy=search_result.entropy,
+            N_eff=search_result.N_eff,
+            K=search_result.K,
+            selected_depth=search_result.selected_depth,
+            selected_uci=search_result.selected_uci,
+            moves=search_result.moves,
+            diagnostics=result_diag,
+        )
+        current_analysis = player.analyze(board, evaluator)
         current_landscape = current_analysis.landscape
-        old_branches = player.search(evaluator).branch_observations(board)
         thermo_transition = None
         previous_thermo = last_thermo_state.get(player.color)
         if previous_thermo is not None:
-            thermo_transition = _thermodynamic_transition_record(
-                player,
-                previous_thermo,
-                ply,
-                old_branches,
-                current_analysis.current_value,
-                current_analysis.effective_moves,
-                current_analysis.selected_depth,
-                current_analysis.expanded_count,
-            )
-            thermo_transition["fen_new"] = fen_before
+            thermo_transition = _thermodynamic_transition_record(player, previous_thermo, ply, search_result)
             thermodynamic_transitions.append(thermo_transition)
         if viewer_states:
+            viewer_states[-1] = _viewer_state(
+                board,
+                viewer_states[-1]["index"],
+                viewer_states[-1]["move_label"],
+                viewer_states[-1]["san"],
+                viewer_states[-1]["uci"],
+                rows[-1] if rows else None,
+                evaluator,
+                search_result,
+            )
             viewer_states[-1]["thermodynamic_transition"] = thermo_transition
-        last_thermo_state[player.color] = {
-            "ply": ply,
-            "fen": fen_before,
-            "branches": old_branches,
-            "value": current_analysis.current_value,
-            "effective_moves": current_analysis.effective_moves,
-            "selected_depth": current_analysis.selected_depth,
-            "expanded_count": current_analysis.expanded_count,
-        }
-        choice = player.choose(board, evaluator)
-        candidate_scores = _candidate_scores_for_choice(player, board, evaluator)
+        last_thermo_state[player.color] = search_result
+        choice = player.choose_from_result(search_result)
+        candidate_scores = _candidate_scores_from_result(search_result, player.color == chess.WHITE)
         if choice.move is None:
             break
 
@@ -590,8 +482,8 @@ def simulate_match(
         cycle_delta_w = thermo_transition.get("delta_W") if thermo_transition else None
         cycle_delta_a = thermo_transition.get("delta_A") if thermo_transition else None
         cycle_error = thermo_transition.get("decomposition_error") if thermo_transition else None
-        cycle_old_branches = previous_thermo["branches"] if previous_thermo else ()
-        cycle_new_branches = old_branches if previous_thermo else ()
+        cycle_old_branches = previous_thermo.branch_observations() if previous_thermo else ()
+        cycle_new_branches = search_result.branch_observations() if previous_thermo else ()
 
         if _is_mate_or_stalemate(board) or (
             config.stop_on_threefold_repetition and board.is_repetition(3)
@@ -617,11 +509,11 @@ def simulate_match(
             "search_depth": config.cdepth,
             "search_mode": config.search_mode,
             "adaptive_c": config.adaptive_c,
-            "U_current": current_analysis.current_value,
+            "U_current": search_result.U,
             "U_after_move": choice.value,
             "candidate_delta_u": choice.delta_u,
             "delta_u": choice.delta_u,
-            "U_player_current": current_analysis.current_value,
+            "U_player_current": search_result.U,
             "U_before": thermo_transition.get("U_old") if thermo_transition else None,
             "U_after": thermo_transition.get("U_new") if thermo_transition else None,
             "cycle_delta_U": cycle_delta_u,
@@ -630,18 +522,18 @@ def simulate_match(
             "delta_W": cycle_delta_w,
             "delta_A": cycle_delta_a,
             "decomposition_error": cycle_error,
-            "entropy_current": current_landscape.entropy,
-            "N_eff": current_analysis.effective_moves,
-            "N_eff_before": current_analysis.effective_moves,
+            "entropy_current": search_result.entropy,
+            "N_eff": search_result.N_eff,
+            "N_eff_before": search_result.N_eff,
             "N_eff_after": thermo_transition.get("N_eff_new") if thermo_transition else None,
-            "effective_moves_current": current_landscape.effective_moves,
-            "selected_depth": current_analysis.selected_depth,
-            "adaptive_cdepth": current_analysis.selected_depth,
-            "adaptive_depth_before": current_analysis.selected_depth,
+            "effective_moves_current": search_result.N_eff,
+            "selected_depth": search_result.selected_depth,
+            "adaptive_cdepth": search_result.selected_depth,
+            "adaptive_depth_before": search_result.selected_depth,
             "adaptive_depth_after": None,
-            "K_expanded": current_analysis.expanded_count,
+            "K_expanded": search_result.K,
             "K_old": thermo_transition.get("K_old") if thermo_transition else None,
-            "K_new": current_analysis.expanded_count if thermo_transition else None,
+            "K_new": search_result.K if thermo_transition else None,
             "old_support_size": thermo_transition.get("old_support_size") if thermo_transition else None,
             "new_support_size": thermo_transition.get("new_support_size") if thermo_transition else None,
             "common_support_size": thermo_transition.get("common_support_size") if thermo_transition else None,
@@ -652,21 +544,19 @@ def simulate_match(
             "old_only_probability_mass": thermo_transition.get("old_only_mass") if thermo_transition else None,
             "new_only_probability_mass": thermo_transition.get("new_only_mass") if thermo_transition else None,
             "boundary_accessibility": None,
-            "nodes_evaluated": current_analysis.diagnostics["nodes_evaluated"],
-            "static_evaluations": current_analysis.diagnostics["static_evaluations"],
-            "recursive_nodes": current_analysis.diagnostics["recursive_nodes"],
-            "maximum_depth_reached": current_analysis.diagnostics["maximum_depth_reached"],
-            "average_K": current_analysis.diagnostics["average_k"],
-            "cache_hits": current_analysis.diagnostics["cache_hits"],
-            "search_elapsed_time": current_analysis.diagnostics["elapsed_time"],
+            "nodes_evaluated": search_result.diagnostics["nodes_evaluated"],
+            "static_evaluations": search_result.diagnostics["static_evaluations"],
+            "recursive_nodes": search_result.diagnostics["recursive_nodes"],
+            "maximum_depth_reached": search_result.diagnostics["maximum_depth_reached"],
+            "average_K": search_result.diagnostics["average_k"],
+            "cache_hits": search_result.diagnostics["cache_hits"],
+            "search_elapsed_time": search_result.diagnostics["elapsed_time"],
             "selected_move": choice.uci,
             "selected_for_deeper_analysis": choice.uci
-            in current_analysis.selected_uci,
+            in search_result.selected_uci,
             "selected_reply_expected_value": choice.value,
             "predicted_reply_expected_value": choice.value,
-            "predicted_reply_entropy": choice.reply_landscape.entropy
-            if choice.reply_landscape
-            else None,
+            "predicted_reply_entropy": None,
             "reply_realized_value": None,
             "prediction_error": None,
             "repetition_count": repetition_count,
@@ -682,7 +572,8 @@ def simulate_match(
             {
                 "ply": ply,
                 "row": row,
-                "current_landscape": current_landscape.as_dict(),
+                "current_landscape": {"fen": search_result.board_fen, "entropy": search_result.entropy, "effective_moves": search_result.N_eff, "expected_value": search_result.U, "moves": [move.as_dict() for move in search_result.moves]},
+                "search_result": search_result.as_dict(),
                 "candidate_move_scores": candidate_scores,
                 "adaptive_branches_before": [
                     branch.as_dict() for branch in cycle_old_branches
@@ -690,9 +581,7 @@ def simulate_match(
                 "adaptive_branches_after": [
                     branch.as_dict() for branch in cycle_new_branches
                 ],
-                "predicted_reply_landscape": choice.reply_landscape.as_dict()
-                if choice.reply_landscape
-                else None,
+                "predicted_reply_landscape": None,
             }
         )
         viewer_states.append(
@@ -703,21 +592,13 @@ def simulate_match(
                 choice.san,
                 choice.uci,
                 row,
-                white,
-                black,
                 evaluator,
-                viewer_executor,
-                player.color,
             )
         )
         if _is_mate_or_stalemate(board) or (
             config.stop_on_threefold_repetition and board.is_repetition(3)
         ):
             break
-
-    if viewer_executor is not None:
-        viewer_executor.shutdown()
-        viewer_executor = None
 
     csv_path = config.results_dir / f"{config.match_name}.csv"
     json_path = config.results_dir / f"{config.match_name}.json"

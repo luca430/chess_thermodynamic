@@ -667,31 +667,23 @@ Both modes preserve the original probability mass. Neither top-`K` nor top-`K'` 
 
 If a candidate move directly produces a terminal board, its branch value is `E(B_m)`. If a response reaches a terminal board, the response value is `E(B_{m,r})`. For thermodynamic bookkeeping only, a terminal same-player state is represented as an absorbing pseudo-branch `__terminal__` with probability `1`.
 
-### Caching
+### Caching and Stored Results
 
 Each observer search caches:
 
 - static evaluations by complete position state;
 - move landscapes, including features, probabilities, entropy, and `N_eff`;
 - adaptive expected values by position and remaining `cdepth`;
-- selected branch metadata, including `K`, response `K'`, branch values, and selected local `cdepth`.
+- selected branch metadata, including `K`, response `K'`, branch values, and selected local `cdepth`;
+- the serializable `SearchResult` for an evaluated decision state.
 
-Caches belong to a fixed style, beta, `cdepth`, and search mode, so values from different observers cannot mix.
+`SearchResult` is the single source of truth for an actual decision. It stores `U`, entropy, `N_eff`, `K`, selected depth, every move probability, every branch value `O_m`, candidate `delta_u`, and response diagnostics that were actually computed. Move choice, CSV/JSON logging, thermodynamic cycles, and the normal viewer all consume this stored result instead of rerunning search.
+
+Caches belong to a fixed style, beta, `cdepth`, and search mode, so values from different observers cannot mix. Process workers use process-local caches; those caches are not shared with the parent process, but each worker reuses its own cache while evaluating its assigned branch.
 
 ### Observer convention
 
 One adaptive search object belongs to one observer. Its style $\lambda$ and $\beta$ are used at every node, including nodes where the opponent is to move. Move features remain mover-relative. This distinction lets White and Black produce different expectations for the same board without changing the universal evaluator.
-
-### Caching
-
-Each observer search caches:
-
-- static evaluations by complete position state;
-- move landscapes, including features, probabilities, entropy, and $N_{\mathrm{eff}}$;
-- adaptive expected values by position and remaining `cdepth`;
-- selected branch metadata, including `K` and selected local depth.
-
-Caches belong to a fixed style and beta, so values from different observers cannot mix.
 
 ## Move Choice and deltaU
 
@@ -709,15 +701,54 @@ U_\lambda^{(d)}(B)
 \sum_m p_\lambda(m\mid B)O_m^{(d)}(B).
 ```
 
-The candidate diagnostic is
+The candidate thermodynamic diagnostic is the predicted change in the same player's next decision landscape. For candidate `m`, the model first computes the subjective opponent-response distribution
+
+```math
+q(r\mid B_m)=p_\lambda(r\mid B_m).
+```
+
+For this candidate diagnostic only, responses are ranked by this probability, not by static evaluation or chess strength. The response breadth is adaptive:
+
+```math
+K_{\mathrm{response}}
+=
+\min\left(
+N_{\mathrm{legal\ replies}},
+\max\left(1,\left\lceil c\exp(S_{\mathrm{reply}})\right\rceil\right)
+\right),
+```
+
+where `c` is the configured adaptive breadth coefficient and `S_reply` is the entropy of `q`. Let `R_K(m)` be those top-`K_response` replies. The candidate metric conditions on that plausible-reply set and renormalizes locally:
+
+```math
+\widetilde q(r\mid B_m)
+=
+\frac{q(r\mid B_m)}{\sum_{s\in R_K(m)}q(s\mid B_m)}.
+```
+
+The stored predicted next value and candidate change are
+
+```math
+\operatorname{expected\_next\_U}(m)
+=
+\sum_{r\in R_K(m)}\widetilde q(r\mid B_m)U_\lambda^{(d)}(B_{m,r}),
+```
 
 ```math
 \Delta U_{\mathrm{candidate}}(m;B)
 =
-O_m^{(d)}(B)-U_\lambda^{(d)}(B).
+\operatorname{expected\_next\_U}(m)-U_\lambda^{(d)}(B).
 ```
 
-Fields named `candidate_delta_u`, `delta_u`, `U_current`, and `U_after_move` follow this candidate definition. `U_after_move` is the selected candidate's branch value, not an adjacent-ply thermodynamic state.
+Each selected response-specific transition compares `B` with `B_mr`, where the same player is again to move, and is decomposed with the finite midpoint formulas. The candidate row stores the conditional top-`K` average:
+
+```math
+\Delta U_m\approx\Delta Q_m+\Delta W_m+\Delta A_m.
+```
+
+This top-`K` renormalization is deliberately local to candidate thermodynamic diagnostics. Ordinary `accurate` and `cheap` adaptive search still use their existing omitted-probability-mass rules and do not discard or renormalize mass in this way.
+
+Fields named `candidate_delta_u`, `delta_u`, `candidate_delta_q`, `candidate_delta_w`, `candidate_delta_a`, `expected_next_U`, `U_current`, and `U_after_move` follow this conditional predicted-candidate definition. `response_K` is the selected reply count, and each stored response probability is the renormalized `\widetilde q`. `branch_value` remains the internal `O_m` term used in `U(B)=sum p_m O_m`.
 
 Final move selection is:
 
@@ -918,6 +949,8 @@ conda run -n chess env PYTHONPATH=src python scripts/run_match.py \
 | `--depth N` | None | Deprecated alias for `--cdepth`. |
 | `--search-mode MODE` | `accurate` | Either `accurate` or `cheap`; controls how omitted non-recursive response mass is represented. |
 | `--adaptive-c X` | `0.3` | Breadth fraction in $K=\lceil cN_{\mathrm{eff}}\rceil$. Must be positive. `K` is still clipped to legal moves and at least one. |
+| `--search-workers N` | `1` | Process workers for independent root own-move branches. Use `1` for fully serial search or `auto` for CPU-based worker count. |
+| `--parallel-min-branches N` | `8` | Minimum root branch count before worker parallelism activates. |
 | `--name TEXT` | `thermo_match` | Base filename for CSV, JSON, and PGN outputs. |
 | `--ignore-threefold` | Off | Continue through actual threefold repetition instead of stopping there. |
 | `--allow-draw-claims` | Off | Requests broader draw-claim stopping. In the current control flow it takes effect for non-mate/stalemate draw handling when used with `--ignore-threefold`. |
@@ -969,10 +1002,10 @@ For each position the viewer shows:
 
 - board, FEN, side to move, move history, and static `E(B)`;
 - configured `cdepth`, search mode, and `c`;
-- adaptive `U(B)`, entropy, $N_{\mathrm{eff}}$, `K`, response `K'`, and branch values for both observers;
-- independent White and Black ranks, probabilities, and candidate `deltaU`;
+- adaptive `U(B)`, entropy, $N_{\mathrm{eff}}$, `K`, response `K'`, and branch values for the actual decision side;
+- actual-side ranks, probabilities, conditional top-`K` expected next `U`, candidate `deltaU`, and candidate `deltaQ/deltaW/deltaA`; the opposite counterfactual side is marked unavailable unless generated separately;
 - shared move and $E(B_m)$ columns aligned across both observers;
-- completed same-player cycle cards for cycle $\Delta U$, $\Delta Q$, $\Delta W$, and $\Delta A$;
+- completed same-player cycle cards for realized game-level cycle $\Delta U$, $\Delta Q$, $\Delta W$, and $\Delta A$;
 - old/new effective move counts, old/new `K`, common support data, and common probability mass.
 
 ## Saved Data
@@ -985,8 +1018,8 @@ The CSV contains one row per played ply. Important fields include:
 |---|---|
 | `E_before`, `E_after` | Universal static evaluations before and after the move. |
 | `U_current` | Moving observer's adaptive value of the current board. |
-| `U_after_move` | Selected candidate branch value `O_m`. |
-| `delta_u`, `candidate_delta_u` | Candidate branch value minus current adaptive value. |
+| `U_after_move` | Selected candidate's conditional predicted next value `expected_next_U`. |
+| `delta_u`, `candidate_delta_u` | Conditional top-`K` predicted next value minus current adaptive value. |
 | `U_before`, `U_after`, `delta_U`, `cycle_delta_U` | Completed same-player cycle values, aligned to the later decision state. Null for the first state of each player. |
 | `delta_Q`, `delta_W`, `delta_A` | Heat/work/accessibility decomposition of the completed same-player cycle. Null until that player has a previous decision state. |
 | `decomposition_error` | `delta_U - (delta_Q + delta_W + delta_A)`. |
@@ -1015,11 +1048,11 @@ The JSON is the complete result and contains:
 - `white_style`, `black_style`: serialized style coefficients;
 - `evaluation_weights`: serialized static feature coefficients;
 - result, terminal reason, final FEN, and repetition metadata;
-- `plies`: row data, landscapes, candidate scores, and exact adaptive branch observations before and after each played move;
+- `plies`: row data, candidate scores, the actual decision `search_result`, and exact adaptive branch observations for completed same-player cycles;
 - `thermodynamic_transitions`: same-player heat/work/accessibility records aligned to the later turn;
 - `viewer_states`: ready-to-render panels for every board position, including the completed same-player cycle transition visible at that state when available.
 
-Candidate diagnostics include whether each move belonged to the root top-$K$ set. `viewer_states` duplicate some summary values intentionally so browser navigation requires no model computation.
+Candidate diagnostics include whether each move belonged to the root top-$K$ set, plus the candidate-response entropy, `response_N_eff`, conditional `response_K`, and the renormalized top-`K` response records used for `expected_next_U` and candidate `deltaQ/deltaW/deltaA`. `viewer_states` duplicate stored search-result summary values intentionally so browser navigation requires no model computation.
 
 ### PGN
 
