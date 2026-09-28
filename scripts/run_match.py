@@ -16,6 +16,13 @@ def nonnegative_int(value: str) -> int:
     return parsed
 
 
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
 def positive_float(value: str) -> float:
     parsed = float(value)
     if parsed <= 0.0:
@@ -62,6 +69,7 @@ def main() -> None:
     )
     parser.add_argument("--depth", type=nonnegative_int, default=4)
     parser.add_argument("--adaptive-c", type=positive_float, default=0.3)
+    parser.add_argument("--viewer-workers", type=positive_int, default=2, help="Worker processes for White/Black viewer panels; use 1 for sequential generation.")
     parser.add_argument("--name", default="thermo_match")
     parser.add_argument("--ignore-threefold", action="store_true", help="Continue through threefold repetition until mate/stalemate or max-plies.")
     parser.add_argument("--allow-draw-claims", action="store_true", help="Stop on other claimable/automatic draw rules as well.")
@@ -79,6 +87,7 @@ def main() -> None:
             black_solidness=args.solidness_black,
             depth=args.depth,
             adaptive_c=args.adaptive_c,
+            viewer_workers=args.viewer_workers,
             match_name=args.name,
             stop_only_on_mate_or_stalemate=not args.allow_draw_claims,
             stop_on_threefold_repetition=not args.ignore_threefold,

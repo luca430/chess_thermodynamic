@@ -2,3 +2,7 @@
 __pycache__
 data/games/*
 data/results/*
+
+!data/games/mat_cons_6_vs_pos_cont_6.pgn
+!data/results/mat_cons_6_vs_pos_cont_6.csv
+!data/results/mat_cons_6_vs_pos_cont_6.json

@@ -5,9 +5,10 @@ from __future__ import annotations
 import csv
 import json
 import random
+from concurrent.futures import Executor, ProcessPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import chess
 import chess.pgn
@@ -47,12 +48,15 @@ class MatchConfig:
     match_name: str = "thermo_match"
     stop_only_on_mate_or_stalemate: bool = False
     stop_on_threefold_repetition: bool = True
+    viewer_workers: int = 2
 
     def __post_init__(self) -> None:
         if self.depth < 0:
             raise ValueError("depth must be at least 0")
         if self.adaptive_c <= 0.0:
             raise ValueError("adaptive_c must be greater than 0")
+        if self.viewer_workers < 1:
+            raise ValueError("viewer_workers must be at least 1")
         if self.white_strategy not in STRATEGY_NAMES:
             raise ValueError(f"unknown white strategy: {self.white_strategy}")
         if self.black_strategy not in STRATEGY_NAMES:
@@ -302,6 +306,48 @@ def _viewer_panel(
     }
 
 
+def _viewer_panel_worker(args: tuple[Any, ...]) -> Dict[str, object]:
+    (
+        fen,
+        name,
+        color,
+        style,
+        beta,
+        depth,
+        adaptive_c,
+        depth_thresholds,
+        eval_weights,
+    ) = args
+    player = ThermoPlayer(
+        name,
+        color,
+        style,
+        beta,
+        depth,
+        adaptive_c,
+        depth_thresholds,
+    )
+    return _viewer_panel(player, chess.Board(fen), StaticEvaluator(eval_weights))
+
+
+def _viewer_panel_args(
+    player: ThermoPlayer,
+    board: chess.Board,
+    evaluator: StaticEvaluator,
+) -> tuple[Any, ...]:
+    return (
+        board.fen(),
+        player.name,
+        player.color,
+        player.style,
+        player.beta,
+        player.depth,
+        player.adaptive_c,
+        player.depth_thresholds,
+        evaluator.weights,
+    )
+
+
 def _viewer_state(
     board: chess.Board,
     index: int,
@@ -312,9 +358,33 @@ def _viewer_state(
     white: ThermoPlayer,
     black: ThermoPlayer,
     evaluator: StaticEvaluator,
+    viewer_executor: Executor | None = None,
+    local_panel_color: chess.Color | None = None,
 ) -> Dict[str, object]:
-    white_panel = _viewer_panel(white, board, evaluator)
-    black_panel = _viewer_panel(black, board, evaluator)
+    if viewer_executor is None:
+        white_panel = _viewer_panel(white, board, evaluator)
+        black_panel = _viewer_panel(black, board, evaluator)
+    elif local_panel_color == chess.WHITE:
+        black_future = viewer_executor.submit(
+            _viewer_panel_worker, _viewer_panel_args(black, board, evaluator)
+        )
+        white_panel = _viewer_panel(white, board, evaluator)
+        black_panel = black_future.result()
+    elif local_panel_color == chess.BLACK:
+        white_future = viewer_executor.submit(
+            _viewer_panel_worker, _viewer_panel_args(white, board, evaluator)
+        )
+        black_panel = _viewer_panel(black, board, evaluator)
+        white_panel = white_future.result()
+    else:
+        white_future = viewer_executor.submit(
+            _viewer_panel_worker, _viewer_panel_args(white, board, evaluator)
+        )
+        black_future = viewer_executor.submit(
+            _viewer_panel_worker, _viewer_panel_args(black, board, evaluator)
+        )
+        white_panel = white_future.result()
+        black_panel = black_future.result()
     is_game_over = board.is_game_over(claim_draw=True)
     return {
         "index": index,
@@ -389,8 +459,24 @@ def simulate_match(
     node = game
     rows: List[Dict[str, object]] = []
     nested: List[Dict[str, object]] = []
+    viewer_executor: Executor | None = (
+        ProcessPoolExecutor(max_workers=config.viewer_workers)
+        if config.viewer_workers > 1
+        else None
+    )
     viewer_states: List[Dict[str, object]] = [
-        _viewer_state(board, 0, "Start", "", "", None, white, black, evaluator)
+        _viewer_state(
+            board,
+            0,
+            "Start",
+            "",
+            "",
+            None,
+            white,
+            black,
+            evaluator,
+            viewer_executor,
+        )
     ]
 
     reached_ply_limit = True
@@ -535,12 +621,18 @@ def simulate_match(
                 white,
                 black,
                 evaluator,
+                viewer_executor,
+                player.color,
             )
         )
         if _is_mate_or_stalemate(board) or (
             config.stop_on_threefold_repetition and board.is_repetition(3)
         ):
             break
+
+    if viewer_executor is not None:
+        viewer_executor.shutdown()
+        viewer_executor = None
 
     csv_path = config.results_dir / f"{config.match_name}.csv"
     json_path = config.results_dir / f"{config.match_name}.json"
