@@ -33,11 +33,11 @@ The model separates three ideas:
 
 The sign convention is global:
 
-$$
+```math
 E(B)>0 \quad\text{favors White},
 \qquad
 E(B)<0 \quad\text{favors Black}.
-$$
+```
 
 The same convention applies to adaptive expected values and `delta_u`. A positive value never changes meaning when the observer changes.
 
@@ -59,11 +59,11 @@ Let:
 
 For every legal move, the project computes features $F_k(m,B)$ from the perspective of the side actually making the move:
 
-$$
+```math
 \Phi_{\mathrm{total}}(m,B)
 =
 \Phi_{\mathrm{base}}(m,B)+\sigma\Phi_{\mathrm{phase}}(m,B).
-$$
+```
 
 This mover-relative convention is important. For example, winning material is a positive move feature whether White or Black makes the capture. When an observer evaluates opponent moves deeper in the tree, the observer's same $\lambda$ is retained, while `move_features(board, move)` still describes the side that actually moves at that node.
 
@@ -93,10 +93,10 @@ The formulas below use the following helper quantities. Let $B$ be a board
 position, $c\in\{\mathrm{White},\mathrm{Black}\}$ a color, $\bar c$ its
 opponent, and $t$ a piece type. Define
 
-$$
+```math
 n_t(B,c)=\text{the number of pieces of type }t\text{ and color }c
 \text{ present on board }B.
-$$
+```
 
 Here $t$ ranges over pawn, knight, bishop, rook, queen, and king. For example,
 $n_{\mathrm{rook}}(B,\mathrm{White})=2$ when White has both rooks. Let $v(t)$
@@ -105,21 +105,21 @@ included in the sum but contributes no material value.
 
 Material owned by one color is
 
-$$
+```math
 M(B,c)=\sum_{t\in\{P,N,B,R,Q,K\}} v(t)\,n_t(B,c),
-$$
+```
 
 and mover-relative material balance is
 
-$$
+```math
 M_{\mathrm{rel}}(B,c)=M(B,c)-M(B,\bar c).
-$$
+```
 
 `legal_mobility(B, c)` copies the board, sets the side to move to $c$, and counts legal moves. Denote this count by $L(B,c)$. It returns zero for checkmate, stalemate, or insufficient-material positions.
 
 The attacked-center score is
 
-$$
+```math
 C(B,c)
 =
 \sum_{s\in\{d4,e4,d5,e5\}}
@@ -127,15 +127,15 @@ C(B,c)
 +0.35
 \sum_{s\in\mathcal C_{\mathrm{ext}}}
 \mathbf 1[c\text{ attacks }s],
-$$
+```
 
 where
 
-$$
+```math
 \mathcal C_{\mathrm{ext}}
 =
 \{c3,d3,e3,f3,c4,f4,c5,f5,c6,d6,e6,f6\}.
-$$
+```
 
 This measures attacked squares, not piece occupancy.
 
@@ -147,11 +147,11 @@ For king square $k_c$, define
 
 The king-safety helper is
 
-$$
+```math
 K_{\mathrm{safe}}(B,c)
 =
 \frac{D(B,c)-1.5A(B,c)-0.25P(B,c)}{8}.
-$$
+```
 
 If color $c$ has no king, this helper returns `-1`.
 
@@ -159,7 +159,7 @@ If color $c$ has no king, this helper returns `-1`.
 
 For a square $s$ occupied by an opposing non-king piece, the exchange routine considers only legal captures onto that square. If $G(B,s,c)$ is the best profitable gain available to attacker $c$, then conceptually
 
-$$
+```math
 G(B,s,c)
 =
 \max\left(
@@ -167,18 +167,18 @@ G(B,s,c)
 \max_{m\in\mathcal X(B,s,c)}
 \left[v(\text{piece on }s)-G(B_m,s,\bar c)\right]
 \right),
-$$
+```
 
 where $\mathcal X(B,s,c)$ is the set of legal captures by $c$ onto $s$. The outer zero lets either side decline an unprofitable continuation.
 
 The total exposed material for side $c$ is
 
-$$
+```math
 X(B,c)
 =
 \sum_{s\text{ occupied by a non-king piece of }c}
 G(B,s,\bar c).
-$$
+```
 
 This is a local static-exchange-style calculation. It recursively follows captures on one square, but it is not a general board search.
 
@@ -189,7 +189,7 @@ Let $c$ be `board.turn` before move $m$, and let $B_m$ be the resulting board.
 The base move potential contains the original ten features plus three explicit
 castling features:
 
-$$
+```math
 \Phi_\lambda(m,B)
 =
 \lambda_{\mathrm{material}}F_{\mathrm{material}}
@@ -205,31 +205,31 @@ $$
 +\lambda_{\mathrm{castle\_preserve}}F_{\mathrm{castle\_preserve}}
 +\lambda_{\mathrm{castle\_deny}}F_{\mathrm{castle\_deny}}
 +\lambda_{\mathrm{castle}}F_{\mathrm{castle}}.
-$$
+```
 
 ### Material
 
 Material is the change in own-minus-opponent material from the mover's perspective:
 
-$$
+```math
 \boxed{
 F_{\mathrm{material}}(m,B)
 =
 M_{\mathrm{rel}}(B_m,c)-M_{\mathrm{rel}}(B,c).
 }
-$$
+```
 
 ### Preservation
 
 Preservation is exposed material before the move minus exposed material afterward:
 
-$$
+```math
 \boxed{
 F_{\mathrm{preservation}}(m,B)
 =
 X(B,c)-X(B_m,c).
 }
-$$
+```
 
 A positive value means the mover leaves less material profitably capturable after the move. Capturing enemy material is represented separately by `material`.
 
@@ -237,7 +237,7 @@ A positive value means the mover leaves less material profitably capturable afte
 
 Activity combines the mover's mobility change with half the negative opponent mobility change:
 
-$$
+```math
 \boxed{
 F_{\mathrm{activity}}(m,B)
 =
@@ -246,87 +246,87 @@ F_{\mathrm{activity}}(m,B)
 -0.5[L(B_m,\bar c)-L(B,\bar c)]
 }{30}.
 }
-$$
+```
 
 ### King Safety
 
 King safety is the change in the mover's king-safety helper:
 
-$$
+```math
 \boxed{
 F_{\mathrm{king\_safety}}(m,B)
 =
 K_{\mathrm{safe}}(B_m,c)-K_{\mathrm{safe}}(B,c).
 }
-$$
+```
 
 ### King Restriction
 
 Let $L_K(B,c)$ be the number of legal moves made by color $c$'s king. King restriction is the reduction in enemy king mobility:
 
-$$
+```math
 \boxed{
 F_{\mathrm{king\_restriction}}(m,B)
 =
 L_K(B,\bar c)-L_K(B_m,\bar c).
 }
-$$
+```
 
 ### King Pressure
 
 Let $Q(B,c)$ be the number of squares adjacent to the opponent king that are attacked by $c$. King pressure is its change:
 
-$$
+```math
 \boxed{
 F_{\mathrm{king\_pressure}}(m,B)
 =
 Q(B_m,c)-Q(B,c).
 }
-$$
+```
 
 ### Center Control
 
 Center control is the normalized change in attacked center score:
 
-$$
+```math
 \boxed{
 F_{\mathrm{center}}(m,B)
 =
 \frac{C(B_m,c)-C(B,c)}{6}.
 }
-$$
+```
 
 ### Check
 
-$$
+```math
 \boxed{
 F_{\mathrm{check}}(m,B)
 =
 \mathbf 1[B_m\text{ gives check}],
 }
-$$
+```
 
 ### Mate
 
-$$
+```math
 \boxed{
 F_{\mathrm{mate}}(m,B)
 =
 \mathbf 1[B_m\text{ is checkmate}].
 }
-$$
+```
 
 ### Promotion
 
 For a promotion to piece type $t$,
 
-$$
+```math
 \boxed{
 F_{\mathrm{promotion}}(m,B)
 =
 \frac{v(t)-v(\mathrm{pawn})}{8},
 }
-$$
+```
 
 and it is zero for a non-promotion. A queen promotion therefore contributes `1.0`, rook `0.5`, and bishop or knight `0.25` before multiplication by the style coefficient.
 
@@ -335,9 +335,9 @@ and it is zero for a non-promotion. A queen promotion therefore contributes `1.0
 Let $C_c(B)\in\{0,1,2\}$ count the kingside and queenside castling rights
 still held by color $c$. Each right has value one. Then
 
-$$
+```math
 \boxed{F_{\mathrm{castle\_preserve}}(m,B)=C_c(B_m)-C_c(B),}
-$$
+```
 
 except that this feature is set to zero when $m$ is itself castling. Thus an
 ordinary king move usually scores `-2`, moving an original rook usually scores
@@ -345,15 +345,15 @@ ordinary king move usually scores `-2`, moving an original rook usually scores
 
 For the opponent's rights,
 
-$$
+```math
 \boxed{F_{\mathrm{castle\_deny}}(m,B)=C_{\bar c}(B)-C_{\bar c}(B_m),}
-$$
+```
 
 and actual castling is represented by
 
-$$
+```math
 \boxed{F_{\mathrm{castle}}(m,B)=\mathbf 1[m\text{ is castling}].}
-$$
+```
 
 ### Development Phase
 
@@ -365,50 +365,50 @@ pawn squares (`d2/e2` or `d7/e7`), and $d_R(B,c)$ for the original rook and
 queen squares (`a1/d1/h1` or `a8/d8/h8`). A moved or captured original piece
 therefore advances this simple occupancy-based phase measure.
 
-$$
+```math
 d(B,c)=0.60d_N(B,c)+0.25d_P(B,c)+0.15d_R(B,c),
-$$
+```
 
-$$
+```math
 \boxed{g(B)=\operatorname{clamp}_{[0,1]}
 \left(\frac{d(B,\mathrm{White})+d(B,\mathrm{Black})}{2}\right).}
-$$
+```
 
 The phase weights are
 
-$$
+```math
 w_D(g)=1-g,\qquad w_C(g)=4g(1-g),\qquad w_A(g)=g.
-$$
+```
 
 Writing $F_{\mathrm{activity}}$, $F_{\mathrm{king\_safety}}$, and the other
 terms as defined above, the three phase features are exactly
 
-$$
+```math
 \boxed{F_D(m,B)=d(B_m,c)-d(B,c)+\max(0,F_{\mathrm{activity}}),}
-$$
+```
 
-$$
+```math
 \boxed{F_C(m,B)=F_{\mathrm{castle}}+F_{\mathrm{castle\_preserve}}
 +F_{\mathrm{king\_safety}},}
-$$
+```
 
-$$
+```math
 \boxed{F_A(m,B)=F_{\mathrm{activity}}+F_{\mathrm{king\_pressure}}
 +F_{\mathrm{king\_restriction}}+F_{\mathrm{check}}.}
-$$
+```
 
 For `solidness` $\sigma\in[0,1]$, the unscaled phase contribution and final
 potential are
 
-$$
+```math
 \Phi_{\mathrm{phase}}
 =\lambda_Dw_DF_D+\lambda_Cw_CF_C+\lambda_Aw_AF_A,
-$$
+```
 
-$$
+```math
 \boxed{\Phi_{\mathrm{total}}=\Phi_{\mathrm{base}}
 +\sigma\Phi_{\mathrm{phase}}.}
-$$
+```
 
 At `solidness=0`, the phase mechanism contributes nothing and the potential is
 exactly the base potential. Candidate diagnostics save $g$, all three phase
@@ -419,13 +419,13 @@ weights and features, the castling features, `base_potential`, unscaled
 
 The style potential induces a probability distribution:
 
-$$
+```math
 p_\lambda(m\mid B)
 =
 \frac{\exp\left(\beta\Phi_\lambda(m,B)\right)}
 {\sum_{m'\in\mathcal M(B)}
 \exp\left(\beta\Phi_\lambda(m',B)\right)}.
-$$
+```
 
 The implementation uses a numerically stable softmax by subtracting the largest scaled potential before exponentiation.
 
@@ -441,14 +441,14 @@ Interpretation of $\beta$:
 
 The shared evaluator is
 
-$$
+```math
 E(B)
 =
 \alpha_M\Delta M
 +\alpha_{\mathrm{mob}}\Delta\mathrm{Mobility}
 +\alpha_K\Delta K
 +\alpha_C\Delta C,
-$$
+```
 
 where all differences are White minus Black. The default weights are:
 
@@ -462,39 +462,39 @@ where all differences are White minus Black. The default weights are:
 
 The board features passed to this evaluator are computed exactly as follows:
 
-$$
+```math
 \Delta M(B)=M(B,\mathrm{White})-M(B,\mathrm{Black}),
-$$
+```
 
-$$
+```math
 \Delta\mathrm{Mobility}(B)
 =
 \frac{L(B,\mathrm{White})-L(B,\mathrm{Black})}{30},
-$$
+```
 
-$$
+```math
 \Delta K(B)
 =
 K_{\mathrm{safe}}(B,\mathrm{White})
 -K_{\mathrm{safe}}(B,\mathrm{Black}),
-$$
+```
 
-$$
+```math
 \Delta C(B)
 =
 \frac{C(B,\mathrm{White})-C(B,\mathrm{Black})}{6}.
-$$
+```
 
 With default weights, a nonterminal board is therefore evaluated as
 
-$$
+```math
 E(B)
 =
 \Delta M(B)
 +0.25\,\Delta\mathrm{Mobility}(B)
 +0.6\,\Delta K(B)
 +0.35\,\Delta C(B).
-$$
+```
 
 Notice that the mobility and center differences are normalized by `30` and `6` before their evaluator weights are applied. The static evaluator does not directly use preservation, activity, checks, king restriction, king pressure, or promotion; those belong to the observer-dependent move potential.
 
@@ -504,19 +504,19 @@ If the side to move is checkmated, `E(B)` receives the appropriate signed checkm
 
 The depth-zero value is
 
-$$
+```math
 U_\lambda^{(0)}(B)=E(B).
-$$
+```
 
 An exact depth-$d$ expectation would be
 
-$$
+```math
 U_\lambda^{(d)}(B)
 =
 \sum_{m\in\mathcal M(B)}
 p_\lambda(m\mid B)
 U_\lambda^{(d-1)}(B_m).
-$$
+```
 
 This is not minimax. Every branch contributes according to its probability. Expanding it exactly becomes expensive because the legal-move tree grows rapidly.
 
@@ -524,17 +524,17 @@ This is not minimax. Every branch contributes according to its probability. Expa
 
 For each nonterminal move distribution:
 
-$$
+```math
 S_\lambda(B)
 =
 -\sum_m p_\lambda(m\mid B)\log p_\lambda(m\mid B),
-$$
+```
 
 and
 
-$$
+```math
 N_{\mathrm{eff}}(B)=e^{S_\lambda(B)}.
-$$
+```
 
 $N_{\mathrm{eff}}$ is the number of equally likely moves that would have the same entropy. A concentrated distribution has $N_{\mathrm{eff}}$ near `1`; a broad distribution has a larger value.
 
@@ -546,14 +546,14 @@ The implementation uses entropy for both breadth and local depth.
 
 The number of recursively deepened branches is
 
-$$
+```math
 K(B)
 =
 \min\left(
 |\mathcal M(B)|,
 \max\left(1,\left\lceil cN_{\mathrm{eff}}(B)\right\rceil\right)
 \right).
-$$
+```
 
 The default is
 
@@ -572,7 +572,7 @@ Branch selection is deterministic. It is separate from $p_\lambda(m\mid B)$ and 
 
 The default local depth cap is
 
-$$
+```math
 d_{\mathrm{eff}}(B)=
 \begin{cases}
 4, & N_{\mathrm{eff}}(B)\le 4,\\
@@ -580,15 +580,15 @@ d_{\mathrm{eff}}(B)=
 2, & 8<N_{\mathrm{eff}}(B)\le 15,\\
 1, & N_{\mathrm{eff}}(B)>15.
 \end{cases}
-$$
+```
 
 For remaining global depth $r$, the node uses
 
-$$
+```math
 d_{\mathrm{local}}(B,r)
 =
 \min\left(r,d_{\mathrm{eff}}(B)\right).
-$$
+```
 
 A selected child receives remaining depth $d_{\mathrm{local}}-1$. Therefore a child may shorten the search but can never restore or increase depth already consumed from the global budget.
 
@@ -598,7 +598,7 @@ The configurable maximum depth defaults to `4`. The three effective-move thresho
 
 Let $\mathcal S(B)$ be the selected top-$K$ set. The adaptive approximation is
 
-$$
+```math
 \widetilde U_\lambda^{(r)}(B)
 =
 \sum_{m\in\mathcal S(B)}
@@ -607,17 +607,17 @@ p_\lambda(m\mid B)
 +
 \sum_{m\notin\mathcal S(B)}
 p_\lambda(m\mid B)E(B_m).
-$$
+```
 
 Non-selected moves are not discarded. Their original probability mass remains in the expectation through the static fallback. Probabilities are never renormalized over $\mathcal S(B)$.
 
 At configured depth `1`, selected children immediately reach depth zero, so the result reduces to the full one-ply expectation
 
-$$
+```math
 \widetilde U^{(1)}(B)
 =
 \sum_m p(m\mid B)E(B_m).
-$$
+```
 
 ### Observer convention
 
@@ -638,33 +638,33 @@ Caches belong to a fixed style and beta, so values from different observers cann
 
 For every legal candidate $m$ from current board $B$, the player evaluates
 
-$$
+```math
 \widetilde U_\lambda^{(D)}(B_m),
-$$
+```
 
 where $D$ is the configured maximum depth. The current-board value $\widetilde U_\lambda^{(D)}(B)$ is computed once per decision.
 
 The formal advantage is
 
-$$
+```math
 \Delta U_\lambda^{(D)}(m;B)
 =
 \widetilde U_\lambda^{(D)}(B_m)
 -
 \widetilde U_\lambda^{(D)}(B).
-$$
+```
 
 Fields named `advantage`, `delta_u`, `U_current`, and `U_after_move` follow this definition.
 
 Final move selection is:
 
-$$
+```math
 m_W^*=\arg\max_m \widetilde U_{\lambda_W}^{(D)}(B_m),
-$$
+```
 
-$$
+```math
 m_B^*=\arg\min_m \widetilde U_{\lambda_B}^{(D)}(B_m).
-$$
+```
 
 The viewer ranks each observer's estimate of the side-to-move's best action:
 
@@ -678,13 +678,13 @@ The shared table columns contain the move and $E(B_m)$. A light-grey outline mar
 
 After a player moves, the simulator stores that player's expected value for the resulting reply position. After the opponent replies, it records
 
-$$
+```math
 \epsilon
 =
 E(B_{m,r^*})
 -
 \widetilde U_\lambda^{(D)}(B_m).
-$$
+```
 
 This compares the realized static board after the reply with the observer's earlier probability-weighted prediction.
 
@@ -695,9 +695,9 @@ the moving player's adaptive evaluator. For each legal move $m$, the stored
 observable $O_m(B)$ is the recursively evaluated child value when the branch
 was deepened, or the existing static fallback $E(B_m)$ otherwise. Consequently,
 
-$$
+```math
 \widetilde U(B)=\sum_m p_mO_m
-$$
+```
 
 is the same adaptive value used by the player, not a separate diagnostic
 search. Each saved branch records its UCI identity, probability,
@@ -706,22 +706,22 @@ search. Each saved branch records its UCI identity, probability,
 For the common support $\mathcal L_\cap$ of consecutive positions, heat and
 work use the finite midpoint formulas
 
-$$
+```math
 \Delta Q=\sum_{m\in\mathcal L_\cap}
 \frac{O_m+O'_m}{2}(p'_m-p_m),
-$$
+```
 
-$$
+```math
 \Delta W=\sum_{m\in\mathcal L_\cap}
 \frac{p_m+p'_m}{2}(O'_m-O_m).
-$$
+```
 
 Moves that appear or disappear contribute
 
-$$
+```math
 \Delta A=\sum_{m\in\mathcal L_+}p'_mO'_m
 -\sum_{m\in\mathcal L_-}p_mO_m.
-$$
+```
 
 Thus $\Delta U=\Delta Q+\Delta W+\Delta A$ to floating-point tolerance.
 At a terminal position or configured depth zero, adaptive evaluation directly
@@ -1104,22 +1104,22 @@ match_viewer.html   legacy static viewer artifact
 
 The main scientific interpretation is:
 
-$$
+```math
 \text{low entropy}
 \Rightarrow
 \text{few effective moves}
 \Rightarrow
 \text{narrower and potentially deeper computation},
-$$
+```
 
 while
 
-$$
+```math
 \text{high entropy}
 \Rightarrow
 \text{many comparable moves}
 \Rightarrow
 \text{broader but locally shallower computation}.
-$$
+```
 
 The observer's own move measure therefore controls not only predicted behavior, but also how computational attention is allocated through the tree.
