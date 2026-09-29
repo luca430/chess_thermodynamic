@@ -547,7 +547,7 @@ U_\lambda^{(d)}(B)
 \sum_m p_\lambda(m\mid B)O_m^{(d)}(B).
 ```
 
-For `cdepth = 1` in the default accurate mode, every legal own move receives an explicit expectation over all legal opponent replies:
+For `cdepth = 1`, every legal own move receives an explicit expectation over all legal opponent replies:
 
 ```math
 O_m^{(1)}(B)
@@ -618,7 +618,7 @@ The default is
 c = 0.3
 ```
 
-Top-`K` and top-`K'` breadth is still determined by entropy, but the selected branches are ranked by immediate static board evaluation. Because `E(B)` is White-positive, White-to-move branches prefer larger `E(B_m)` and Black-to-move branches prefer smaller `E(B_m)`. This ranking only selects which branches receive extra computation; it never changes or renormalizes the probability distribution.
+Top-`K` and top-`K'` selection is based on move probability. It selects which branches receive extra computation; it never changes or renormalizes the probability distribution.
 
 ### Entropy-selected local cdepth
 
@@ -644,9 +644,9 @@ d_{\mathrm{local}}(B,r)
 
 A recursive call consumes one unit only after a complete own-move/opponent-response cycle, so selected response branches continue with `d_local - 1`.
 
-### Search modes
+### Response Evaluation
 
-`search_mode = accurate` is the default. In accurate mode, non-recursed probability mass is still evaluated at the response board:
+For every legal own move, non-recursed probability mass is evaluated at the response board:
 
 ```math
 O_m^{(d)}
@@ -654,15 +654,7 @@ O_m^{(d)}
 \sum_r q_{r\mid m}V_{m,r}^{(d)},
 ```
 
-where selected response branches recurse to `U^{(d-1)}(B_{m,r})` when `d > 1`, and omitted branches use `E(B_{m,r})`. Even non-top-`K` own moves receive the full shallow response expectation.
-
-`search_mode = cheap` avoids evaluating all omitted continuations. Non-top-`K` own moves use `E(B_m)`. For selected own moves, selected replies are evaluated explicitly and the omitted reply mass contributes
-
-```math
-q_{\mathrm{tail}}E(B_m).
-```
-
-Both modes preserve the original probability mass. Neither top-`K` nor top-`K'` is renormalized.
+where selected response branches recurse to `U^{(d-1)}(B_{m,r})` when `d > 1`, and non-recursed branches use `E(B_{m,r})`. Even non-top-`K` own moves receive the full shallow response expectation. The original probability mass is preserved; neither top-`K` nor top-`K'` is renormalized.
 
 ### Terminal positions
 
@@ -680,7 +672,7 @@ Each observer search caches:
 
 `SearchResult` is the single source of truth for an actual decision. It stores `U`, entropy, `N_eff`, `K`, selected depth, every move probability, every branch value `O_m`, candidate `delta_u`, and response diagnostics that were actually computed. Move choice, CSV/JSON logging, thermodynamic cycles, and the normal viewer all consume this stored result instead of rerunning search.
 
-Caches belong to a fixed style, beta, `cdepth`, and search mode, so values from different observers cannot mix. Process workers use process-local caches; those caches are not shared with the parent process, but each worker reuses its own cache while evaluating its assigned branch.
+Caches belong to a fixed style, beta, and `cdepth`, so values from different observers cannot mix. Process workers use process-local caches; those caches are not shared with the parent process, but each worker reuses its own cache while evaluating its assigned branch.
 
 ### Observer convention
 
@@ -702,13 +694,9 @@ U_\lambda^{(d)}(B)
 \sum_m p_\lambda(m\mid B)O_m^{(d)}(B).
 ```
 
-The candidate thermodynamic diagnostic is the predicted change in the same player's next decision landscape. For candidate `m`, the model first computes the subjective opponent-response distribution
+The candidate thermodynamic diagnostic is the predicted change in the same player's next decision landscape. For candidate `m`, the model first computes the subjective opponent-response distribution `q(r | B_m)`. This distribution uses the observer's fixed style from the responding side's feature perspective, with an added side-to-move objective term: White replies favor larger White-positive value, while Black replies favor smaller White-positive value.
 
-```math
-q(r\mid B_m)=p_\lambda(r\mid B_m).
-```
-
-For this candidate diagnostic, responses keep their subjective probabilities for weighting, but the refinement set is ranked by immediate static evaluation for the responding side. The response breadth is adaptive:
+Response probabilities weight the expectation, but the `K_response` replies selected for deeper recursive work are ranked by immediate static evaluation from the responding side's objective: White-to-move replies prefer larger `E(B_{m,r})`, and Black-to-move replies prefer smaller `E(B_{m,r})`. The response breadth is adaptive:
 
 ```math
 K_{\mathrm{response}}
@@ -719,7 +707,7 @@ N_{\mathrm{legal\ replies}},
 \right),
 ```
 
-where `c` is the configured adaptive breadth coefficient and `S_reply` is the entropy of `q`. Let `R_K(m)` be the `K_response` replies with best immediate static evaluation for the responding side. These replies are marked as refinement-eligible diagnostics, but candidate scoring keeps the full subjective response distribution and does not renormalize it.
+where `c` is the configured adaptive breadth coefficient and `S_reply` is the entropy of `q`. Let `R_K(m)` be those static-evaluation-ranked top-`K_response` replies. These replies are marked as refinement-eligible diagnostics, but candidate scoring keeps the full subjective response distribution and does not renormalize it.
 
 After a candidate move and response, one complete cycle has been consumed. The future state is therefore valued with one fewer cycle. At candidate remaining depth zero, the same player is to move again, so the future-state value is the one-ply subjective expectation
 
@@ -853,12 +841,13 @@ preserved without adding a pseudo-move to ordinary chess move generation.
 | White strategy | `material_conservative` |
 | Black strategy | `activity_aggressive` |
 | Cycle depth (`cdepth`) | `1` |
-| Search mode | `accurate` |
 | Adaptive breadth `c` | `0.3` |
 | Candidate thermo mode | `refined` |
-| Match name | `thermo_match` |
+| Match name | Generated from strategies, beta, solidness, and `cdepth` |
+| Stop on checkmate/stalemate | Yes |
+| Stop on insufficient material | Yes |
+| Stop on automatic fivefold/75-move draws | Yes |
 | Stop on actual threefold repetition | Yes |
-| Stop on mate or stalemate | Yes |
 
 `MatchConfig` itself defaults to `max_plies=120`; the `run_match.py` command-line launcher intentionally overrides that with `80`.
 
@@ -941,7 +930,6 @@ conda run -n chess env PYTHONPATH=src python scripts/run_match.py \
   --solidness-white 0.3 \
   --solidness-black 0.85 \
   --cdepth 1 \
-  --search-mode accurate \
   --adaptive-c 0.3
 ```
 
@@ -959,17 +947,16 @@ conda run -n chess env PYTHONPATH=src python scripts/run_match.py \
 | `--solidness-black X` | Preset value | Override Black's solidness $\sigma$. Must be between `0` and `1`. |
 | `--cdepth N` | `1` | Cycle depth. One unit is own move plus opponent response. At `0`, values reduce to static `E(B)`. |
 | `--depth N` | None | Deprecated alias for `--cdepth`. |
-| `--search-mode MODE` | `accurate` | Either `accurate` or `cheap`; controls how omitted non-recursive response mass is represented. |
 | `--adaptive-c X` | `0.3` | Breadth fraction in $K=\lceil cN_{\mathrm{eff}}\rceil$. Must be positive. `K` is still clipped to legal moves and at least one. |
 | `--search-workers N` | `1` | Process workers for independent root own-move branches. Use `1` for fully serial search or `auto` for CPU-based worker count. |
 | `--parallel-min-branches N` | `8` | Minimum root branch count before worker parallelism activates. |
 | `--candidate-thermo-mode MODE` | `refined` | Detailed Q/W/A diagnostics. Choices: `selected`, `refined`, `all`. |
-| `--name TEXT` | `thermo_match` | Base filename for CSV, JSON, and PGN outputs. |
+| `--name TEXT` | Generated | Base filename for CSV, JSON, and PGN outputs. By default it includes both strategy names, beta values, effective solidness values, and `cdepth`. |
 | `--ignore-threefold` | Off | Continue through actual threefold repetition instead of stopping there. |
-| `--allow-draw-claims` | Off | Requests broader draw-claim stopping. In the current control flow it takes effect for non-mate/stalemate draw handling when used with `--ignore-threefold`. |
+| `--allow-draw-claims` | Off | Also stop when a fifty-move or threefold-repetition draw can be claimed. Automatic draw rules still stop regardless of this flag. |
 | `-h`, `--help` | | Print command help. |
 
-Normal stopping conditions are checkmate, stalemate, actual threefold repetition, or `--max-plies`. With both `--ignore-threefold` and `--allow-draw-claims`, the simulation also consults `board.is_game_over(claim_draw=True)` for other claimable or automatic draw endings.
+Normal stopping conditions are checkmate, stalemate, insufficient material, automatic fivefold repetition, automatic 75-move draw, actual threefold repetition, or `--max-plies`. Use `--ignore-threefold` to continue through actual threefold repetition. Use `--allow-draw-claims` to also stop on claimable fifty-move and threefold-repetition draws; merely claimable draws are not treated as terminal by the search itself.
 
 `cdepth > 1` can still be expensive in low-entropy positions because those positions are explicitly allowed to retain deeper search. The simulator also precomputes both observers' viewer panels at every saved position.
 
@@ -1014,7 +1001,7 @@ The viewer performs no chess or expected-value calculations. New JSON files shou
 For each position the viewer shows:
 
 - board, FEN, side to move, move history, and static `E(B)`;
-- configured `cdepth`, search mode, and `c`;
+- configured `cdepth` and `c`;
 - adaptive `U(B)`, entropy, $N_{\mathrm{eff}}$, `K`, response `K'`, and branch values for the actual decision side;
 - actual-side ranks, probabilities, full-response expected next `U`, candidate `deltaU`, and candidate `deltaQ/deltaW/deltaA`; the opposite counterfactual side is marked unavailable unless generated separately;
 - shared move and $E(B_m)$ columns aligned across both observers;
@@ -1159,7 +1146,6 @@ config = MatchConfig(
     white_solidness=0.75,
     black_solidness=0.35,
     cdepth=1,
-    search_mode="accurate",
     adaptive_c=0.3,
     depth4_max_neff=4.0,
     depth3_max_neff=8.0,

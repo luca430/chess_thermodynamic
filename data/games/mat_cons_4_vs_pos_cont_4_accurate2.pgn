@@ -1,0 +1,9 @@
+[Event "Thermodynamic toy chess simulation"]
+[Site "?"]
+[Date "????.??.??"]
+[Round "?"]
+[White "White material conservative"]
+[Black "Black positional controller"]
+[Result "1-0"]
+
+1. Nf3 d5 2. e3 c6 3. Bd3 Qd6 4. Nc3 Kd8 5. a4 Bg4 6. h3 Bc8 7. b3 e5 8. Ba3 Qxa3 9. Rxa3 Bxa3 10. Nxe5 Nh6 11. Kf1 Be7 12. f4 Nd7 13. h4 Nxe5 14. fxe5 Bg4 15. Be2 f5 16. d4 Nf7 17. Bxg4 fxg4 18. Qxg4 h5 19. Qxg7 Rf8 20. Ke2 Nh8 21. Rf1 Rxf1 22. Kxf1 Bxh4 23. Qxh8+ Kc7 24. Qxa8 Bd8 25. Qxa7 Kc8 26. Ke2 Kc7 27. Qc5 Kc8 28. Nxd5 h4 29. Nf4 Kb8 30. Kd3 Ka8 31. Qf8 b6 32. Qxd8+ Kb7 33. Qxh4 c5 34. dxc5 bxc5 35. Qd8 c4+ 36. bxc4 Ka6 37. Qd6+ Ka7 38. c5 Ka8 39. g4 Ka7 40. c6 Ka6 41. Qd5 Ka7 42. c7 Ka6 43. c8=Q+ Ka7 44. Qcb7# 1-0

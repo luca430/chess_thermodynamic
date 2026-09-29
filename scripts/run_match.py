@@ -78,13 +78,12 @@ def main() -> None:
     )
     parser.add_argument("--cdepth", type=nonnegative_int, default=1, help="Cycle depth: one unit is own move plus opponent response.")
     parser.add_argument("--depth", type=nonnegative_int, default=None, help="Deprecated alias for --cdepth.")
-    parser.add_argument("--search-mode", choices=("accurate", "cheap"), default="accurate")
     parser.add_argument("--adaptive-c", type=positive_float, default=0.3)
     parser.add_argument("--viewer-workers", type=positive_int, default=1, help="Deprecated for normal saved-data viewer generation; retained for compatibility.")
     parser.add_argument("--search-workers", type=optional_workers, default=1, help="Process workers for root own-move branches; use 1 for serial or auto for CPU count.")
     parser.add_argument("--parallel-min-branches", type=positive_int, default=8, help="Minimum root branch count before search worker parallelism activates.")
     parser.add_argument("--candidate-thermo-mode", choices=("selected", "refined", "all"), default="refined", help="Which candidates receive detailed Q/W/A diagnostics (default: refined).")
-    parser.add_argument("--name", default="thermo_match")
+    parser.add_argument("--name", default=None, help="Base filename for outputs; generated from strategies, betas, solidness, and cdepth by default.")
     parser.add_argument("--ignore-threefold", action="store_true", help="Continue through threefold repetition until mate/stalemate or max-plies.")
     parser.add_argument("--allow-draw-claims", action="store_true", help="Stop on other claimable/automatic draw rules as well.")
     args = parser.parse_args()
@@ -100,7 +99,6 @@ def main() -> None:
             white_solidness=args.solidness_white,
             black_solidness=args.solidness_black,
             cdepth=args.depth if args.depth is not None else args.cdepth,
-            search_mode=args.search_mode,
             adaptive_c=args.adaptive_c,
             viewer_workers=args.viewer_workers,
             search_workers=args.search_workers,

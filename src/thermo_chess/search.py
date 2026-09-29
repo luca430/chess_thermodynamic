@@ -17,7 +17,7 @@ from .measure import MoveLandscape, MoveRecord, Style, move_distribution
 
 
 PositionKey = Tuple[str, bool, bool, bool]
-SearchMode = Literal["accurate", "cheap"]
+SearchMode = Literal["accurate"]
 CandidateThermoMode = Literal["selected", "refined", "all"]
 
 
@@ -94,8 +94,8 @@ def ranked_for_refinement(
 
 
 def _validate_search_mode(search_mode: str) -> SearchMode:
-    if search_mode not in {"accurate", "cheap"}:
-        raise ValueError("search_mode must be 'accurate' or 'cheap'")
+    if search_mode != "accurate":
+        raise ValueError("search_mode must be 'accurate'")
     return search_mode  # type: ignore[return-value]
 
 
@@ -606,6 +606,7 @@ class AdaptiveExpectedValue:
         self._static_cache: Dict[PositionKey, float] = {}
         self._context_cache: Dict[PositionKey, BoardFeatureContext] = {}
         self._landscape_cache: Dict[PositionKey, MoveLandscape] = {}
+        self._response_landscape_cache: Dict[PositionKey, MoveLandscape] = {}
         self._value_cache: Dict[Tuple[PositionKey, int], float] = {}
         self._selection_cache: Dict[Tuple[PositionKey, int], NodeSelection] = {}
         self._future_value_cache: Dict[Tuple[PositionKey, int], float] = {}
@@ -693,6 +694,26 @@ class AdaptiveExpectedValue:
         self._landscape_cache[position_key] = landscape
         return landscape
 
+    def response_landscape(
+        self, board: chess.Board, key: PositionKey | None = None
+    ) -> MoveLandscape:
+        position_key = key or self.position_key(board)
+        if position_key in self._response_landscape_cache:
+            self.diagnostics.cache_hits += 1
+            return self._response_landscape_cache[position_key]
+        context = self.board_context(board, position_key)
+        landscape = move_distribution(
+            board,
+            self.style,
+            self.beta,
+            self._cached_evaluator,
+            before_context=context,
+            context_provider=self.board_context,
+            value_objective_weight=1.0,
+        )
+        self._response_landscape_cache[position_key] = landscape
+        return landscape
+
     def node_selection(self, board: chess.Board, depth: int | None = None) -> NodeSelection | None:
         remaining = self.cdepth if depth is None else depth
         return self._selection_cache.get((self.position_key(board), remaining))
@@ -735,7 +756,7 @@ class AdaptiveExpectedValue:
             return self._future_value_cache[cache_key]
 
         self.diagnostics.nodes_evaluated += 1
-        if board.is_game_over(claim_draw=True):
+        if board.is_game_over(claim_draw=False):
             value = self.static_value(board)
             self._future_selection_cache[cache_key] = _terminal_observation(
                 value, remaining_cdepth, self.search_mode
@@ -830,7 +851,14 @@ class AdaptiveExpectedValue:
             if self.candidate_thermo_mode == "all":
                 detailed_uci = {record.uci for record in landscape.records}
             elif self.candidate_thermo_mode == "refined":
-                detailed_uci = set(selection.selected_uci) | {chosen_uci}
+                detailed_ranked = sorted(
+                    landscape.records,
+                    key=lambda record: fast_thermos[record.uci]["candidate_delta_u"],
+                    reverse=board.turn == chess.WHITE,
+                )
+                detailed_uci = {
+                    record.uci for record in detailed_ranked[: selection.expanded_count]
+                }
             else:
                 detailed_uci = {chosen_uci}
 
@@ -840,9 +868,23 @@ class AdaptiveExpectedValue:
                 branch_value = branch.adaptive_branch_value if branch else record.static_after
                 thermo = fast_thermos[record.uci]
                 if record.uci in detailed_uci:
-                    thermo = self._candidate_thermodynamics(
+                    detailed_thermo = self._candidate_thermodynamics(
                         board, record, branch, current_u, current_branches, detailed=True
                     )
+                    thermo = {**thermo, **detailed_thermo}
+                    thermo["expected_next_U"] = fast_thermos[record.uci]["expected_next_U"]
+                    thermo["candidate_delta_u"] = fast_thermos[record.uci]["candidate_delta_u"]
+                    delta_q = thermo["candidate_delta_q"]
+                    delta_w = thermo["candidate_delta_w"]
+                    delta_a = thermo["candidate_delta_a"]
+                    if delta_q is not None and delta_w is not None and delta_a is not None:
+                        residual = thermo["candidate_delta_u"] - (delta_q + delta_w + delta_a)
+                        thermo["candidate_delta_a"] = delta_a + residual
+                        thermo["thermo_decomposition_error"] = thermo["candidate_delta_u"] - (
+                            thermo["candidate_delta_q"]
+                            + thermo["candidate_delta_w"]
+                            + thermo["candidate_delta_a"]
+                        )
                 moves_list.append(
                     MoveEvaluation(
                         move=record.move,
@@ -908,7 +950,7 @@ class AdaptiveExpectedValue:
         branch_value = branch.adaptive_branch_value if branch else record.static_after
         after = board.copy(stack=False)
         after.push(record.move)
-        if after.is_game_over(claim_draw=True):
+        if after.is_game_over(claim_draw=False):
             delta = record.static_after - current_u
             return {
                 "expected_next_U": record.static_after,
@@ -923,13 +965,8 @@ class AdaptiveExpectedValue:
                 "responses": (),
             }
 
-        # Cheap mode and unrefined root candidates deliberately reuse the
-        # already-computed branch value. This keeps original probability mass in
-        # play while avoiding a fresh m -> r -> m' expansion for low-priority
-        # candidates.
         if (
-            (self.search_mode == "cheap" and not detailed)
-            or branch is None
+            branch is None
             or not branch.response_branches
             or (not detailed and not branch.was_deepened)
         ):
@@ -960,7 +997,7 @@ class AdaptiveExpectedValue:
         candidate_delta_a = 0.0
         for response in response_records:
             response_selected = response.uci in selected_uci
-            should_refine_response = response_selected and self.search_mode != "cheap"
+            should_refine_response = response_selected
             next_board = None
             if should_refine_response:
                 next_board = after.copy(stack=False)
@@ -1011,14 +1048,8 @@ class AdaptiveExpectedValue:
                     )
                 )
 
-        if self.search_mode == "cheap":
-            expected_next_u = branch_value
         candidate_delta_u = expected_next_u - current_u
         if detailed:
-            if self.search_mode == "cheap":
-                candidate_delta_a += candidate_delta_u - (
-                    candidate_delta_q + candidate_delta_w + candidate_delta_a
-                )
             error = candidate_delta_u - (candidate_delta_q + candidate_delta_w + candidate_delta_a)
             delta_q = candidate_delta_q
             delta_w = candidate_delta_w
@@ -1056,7 +1087,7 @@ class AdaptiveExpectedValue:
             value = self.static_value(board)
             self._value_cache[cache_key] = value
             return value
-        if board.is_game_over(claim_draw=True):
+        if board.is_game_over(claim_draw=False):
             value = self.static_value(board)
             self._selection_cache[cache_key] = _terminal_observation(value, cdepth, self.search_mode)
             self._value_cache[cache_key] = value
@@ -1173,12 +1204,10 @@ class AdaptiveExpectedValue:
 
         after = board.copy(stack=False)
         after.push(record.move)
-        if after.is_game_over(claim_draw=True):
+        if after.is_game_over(claim_draw=False):
             branch_value = self.static_value(after)
-        elif self.search_mode == "cheap" and not own_selected:
-            branch_value = record.static_after
         else:
-            reply_landscape = self.landscape(after)
+            reply_landscape = self.response_landscape(after)
             response_neff = reply_landscape.effective_moves
             response_k = adaptive_breadth(reply_landscape.effective_moves, self.adaptive_c, len(reply_landscape.records))
             reply_ranked = ranked_for_refinement(reply_landscape.records, after.turn)
@@ -1186,7 +1215,6 @@ class AdaptiveExpectedValue:
             self.diagnostics.response_expanded_total += response_k
             self.diagnostics.response_expanded_nodes += 1
             branch_value = 0.0
-            selected_mass = 0.0
             for reply in reply_landscape.records:
                 reply_selected = reply.uci in selected_replies
                 reply_value = reply.static_after
@@ -1195,12 +1223,8 @@ class AdaptiveExpectedValue:
                     child.push(reply.move)
                     self.diagnostics.recursive_nodes += 1
                     reply_value = self._expected_value(child, selected_depth - 1, level + 1)
-                elif self.search_mode == "cheap" and not reply_selected:
-                    continue
-                elif reply_selected or self.search_mode == "accurate":
+                else:
                     reply_value = reply.static_after
-                if self.search_mode == "cheap" and reply_selected:
-                    selected_mass += reply.probability
                 branch_value += reply.probability * reply_value
                 response_branches.append(
                     ResponseObservation(
@@ -1213,9 +1237,6 @@ class AdaptiveExpectedValue:
                         static_value=reply.static_after,
                     )
                 )
-            if self.search_mode == "cheap":
-                branch_value += max(0.0, 1.0 - selected_mass) * record.static_after
-
         return AdaptiveBranchObservation(
             move=record.move,
             uci=record.uci,

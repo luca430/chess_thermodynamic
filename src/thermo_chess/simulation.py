@@ -46,7 +46,7 @@ class MatchConfig:
     depth2_max_neff: float = 15.0
     results_dir: Path = Path("data/results")
     games_dir: Path = Path("data/games")
-    match_name: str = "thermo_match"
+    match_name: str | None = None
     stop_only_on_mate_or_stalemate: bool = False
     stop_on_threefold_repetition: bool = True
     viewer_workers: int = 1
@@ -61,8 +61,8 @@ class MatchConfig:
         self.depth = self.cdepth
         if self.cdepth < 0:
             raise ValueError("cdepth must be at least 0")
-        if self.search_mode not in {"accurate", "cheap"}:
-            raise ValueError("search_mode must be 'accurate' or 'cheap'")
+        if self.search_mode != "accurate":
+            raise ValueError("search_mode must be 'accurate'")
         if self.adaptive_c <= 0.0:
             raise ValueError("adaptive_c must be greater than 0")
         if self.viewer_workers < 1:
@@ -83,6 +83,8 @@ class MatchConfig:
         ):
             if value is not None and not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be between 0 and 1")
+        if self.match_name is None:
+            self.match_name = default_match_name(self)
         AdaptiveDepthThresholds(
             self.depth4_max_neff,
             self.depth3_max_neff,
@@ -191,20 +193,63 @@ def strategy_style(name: str) -> Style:
         raise ValueError(f"unknown strategy: {name}") from exc
 
 
+def _filename_number(value: float | int) -> str:
+    text = f"{value:g}"
+    return text.replace("-", "m").replace(".", "p")
 
-def _is_mate_or_stalemate(board: chess.Board) -> bool:
-    return board.is_checkmate() or board.is_stalemate()
+
+def default_match_name(config: MatchConfig) -> str:
+    white_solidness = (
+        config.white_solidness
+        if config.white_solidness is not None
+        else strategy_style(config.white_strategy).solidness
+    )
+    black_solidness = (
+        config.black_solidness
+        if config.black_solidness is not None
+        else strategy_style(config.black_strategy).solidness
+    )
+    white = (
+        f"{config.white_strategy}_b{_filename_number(config.beta_white)}"
+        f"_s{_filename_number(white_solidness)}"
+    )
+    black = (
+        f"{config.black_strategy}_b{_filename_number(config.beta_black)}"
+        f"_s{_filename_number(black_solidness)}"
+    )
+    return f"{white}_vs_{black}_cdepth{config.cdepth}"
+
+
+
+def _termination_reason(board: chess.Board, config: MatchConfig) -> str | None:
+    if board.is_checkmate():
+        return "checkmate"
+    if board.is_stalemate():
+        return "stalemate"
+    if board.is_insufficient_material():
+        return "insufficient_material"
+    if board.is_seventyfive_moves():
+        return "seventyfive_move_rule"
+    if board.is_fivefold_repetition():
+        return "fivefold_repetition"
+    if config.stop_on_threefold_repetition and board.is_repetition(3):
+        return "threefold_repetition"
+    if not config.stop_only_on_mate_or_stalemate:
+        if board.can_claim_fifty_moves():
+            return "fifty_move_rule"
+        if config.stop_on_threefold_repetition and board.can_claim_threefold_repetition():
+            return "threefold_repetition_claim"
+    return None
 
 
 def _terminal_result(
-    board: chess.Board, reached_ply_limit: bool, stop_on_threefold_repetition: bool
+    board: chess.Board, reached_ply_limit: bool, config: MatchConfig
 ) -> tuple[str, str]:
-    if board.is_checkmate():
-        return board.result(claim_draw=False), "checkmate"
-    if board.is_stalemate():
-        return "1/2-1/2", "stalemate"
-    if stop_on_threefold_repetition and board.is_repetition(3):
-        return "1/2-1/2", "threefold_repetition"
+    reason = _termination_reason(board, config)
+    if reason is not None:
+        if reason == "checkmate":
+            return board.result(claim_draw=False), reason
+        return "1/2-1/2", reason
     if reached_ply_limit:
         return "*", "max_plies"
     return "*", "not_terminal"
@@ -318,7 +363,7 @@ def _viewer_state(
     evaluator: StaticEvaluator,
     actual_result: SearchResult | None = None,
 ) -> Dict[str, object]:
-    is_game_over = board.is_game_over(claim_draw=True)
+    is_game_over = board.is_game_over(claim_draw=False)
     white_panel = _empty_counterfactual_panel("white")
     black_panel = _empty_counterfactual_panel("black")
     order: List[str] = []
@@ -340,7 +385,7 @@ def _viewer_state(
         "static_evaluation": evaluator.evaluate(board),
         "prediction_error": previous_row.get("prediction_error") if previous_row else None,
         "is_game_over": is_game_over,
-        "result": board.result(claim_draw=True) if is_game_over else "*",
+        "result": board.result(claim_draw=False) if is_game_over else "*",
         "actual_search_result": actual_result.as_dict() if actual_result is not None else None,
         "actual_side": actual_result.side if actual_result is not None else None,
         "white_panel": white_panel,
@@ -419,15 +464,9 @@ def simulate_match(
 
     reached_ply_limit = True
     for ply in range(1, config.max_plies + 1):
-        if _is_mate_or_stalemate(board) or (
-            config.stop_on_threefold_repetition and board.is_repetition(3)
-        ):
+        if _termination_reason(board, config) is not None:
             reached_ply_limit = False
             break
-        if not config.stop_only_on_mate_or_stalemate and not config.stop_on_threefold_repetition:
-            if board.is_game_over(claim_draw=True):
-                reached_ply_limit = False
-                break
 
         player = players[board.turn]
         fen_before = board.fen()
@@ -489,9 +528,7 @@ def simulate_match(
         cycle_old_branches = previous_thermo.branch_observations() if previous_thermo else ()
         cycle_new_branches = search_result.branch_observations() if previous_thermo else ()
 
-        if _is_mate_or_stalemate(board) or (
-            config.stop_on_threefold_repetition and board.is_repetition(3)
-        ):
+        if _termination_reason(board, config) is not None:
             reached_ply_limit = False
 
         _prediction_error_for_previous(rows, board, evaluator)
@@ -568,6 +605,9 @@ def simulate_match(
             "is_threefold_repetition": board.is_repetition(3),
             "can_claim_threefold_repetition": board.can_claim_threefold_repetition(),
             "is_fivefold_repetition": board.is_fivefold_repetition(),
+            "is_seventyfive_moves": board.is_seventyfive_moves(),
+            "can_claim_fifty_moves": board.can_claim_fifty_moves(),
+            "is_insufficient_material": board.is_insufficient_material(),
             "is_checkmate": board.is_checkmate(),
             "is_stalemate": board.is_stalemate(),
         }
@@ -599,9 +639,7 @@ def simulate_match(
                 evaluator,
             )
         )
-        if _is_mate_or_stalemate(board) or (
-            config.stop_on_threefold_repetition and board.is_repetition(3)
-        ):
+        if _termination_reason(board, config) is not None:
             break
 
     csv_path = config.results_dir / f"{config.match_name}.csv"
@@ -615,9 +653,7 @@ def simulate_match(
             writer.writeheader()
             writer.writerows(rows)
 
-    result, terminal_reason = _terminal_result(
-        board, reached_ply_limit, config.stop_on_threefold_repetition
-    )
+    result, terminal_reason = _terminal_result(board, reached_ply_limit, config)
 
     payload = {
         "config": {
@@ -634,6 +670,9 @@ def simulate_match(
         "final_repetition_count": _repetition_count(board),
         "final_can_claim_threefold_repetition": board.can_claim_threefold_repetition(),
         "final_is_fivefold_repetition": board.is_fivefold_repetition(),
+        "final_is_seventyfive_moves": board.is_seventyfive_moves(),
+        "final_can_claim_fifty_moves": board.can_claim_fifty_moves(),
+        "final_is_insufficient_material": board.is_insufficient_material(),
         "viewer_states": viewer_states,
         "thermodynamic_transitions": thermodynamic_transitions,
         "plies": nested,

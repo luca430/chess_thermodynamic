@@ -21,7 +21,15 @@ from thermo_chess.search import (
     depth_from_effective_moves,
     local_search_depth,
 )
-from thermo_chess.simulation import STRATEGY_NAMES, MatchConfig, simulate_match, strategy_style
+from thermo_chess.simulation import (
+    STRATEGY_NAMES,
+    MatchConfig,
+    _terminal_result,
+    _termination_reason,
+    default_match_name,
+    simulate_match,
+    strategy_style,
+)
 from thermo_chess.thermodynamics import adaptive_observable, decompose_transition
 
 
@@ -199,6 +207,85 @@ def test_search_workers_one_is_serial() -> None:
     assert result.diagnostics["parallel_branches"] == 0
 
 
+def test_value_objective_weight_favors_side_to_move_goal() -> None:
+    evaluator = StaticEvaluator()
+    zero_style = Style(
+        material=0.0,
+        preservation=0.0,
+        king_restriction=0.0,
+        king_pressure=0.0,
+        check=0.0,
+        mate=0.0,
+        activity=0.0,
+        king_safety=0.0,
+        center=0.0,
+        promotion=0.0,
+    )
+
+    black_board = chess.Board()
+    black_board.push_san("e4")
+    black_landscape = move_distribution(
+        black_board, zero_style, 1.0, evaluator, value_objective_weight=1.0
+    )
+    black_low = min(black_landscape.records, key=lambda record: record.static_after)
+    black_high = max(black_landscape.records, key=lambda record: record.static_after)
+    assert black_low.probability > black_high.probability
+
+    white_board = chess.Board()
+    white_landscape = move_distribution(
+        white_board, zero_style, 1.0, evaluator, value_objective_weight=1.0
+    )
+    white_low = min(white_landscape.records, key=lambda record: record.static_after)
+    white_high = max(white_landscape.records, key=lambda record: record.static_after)
+    assert white_high.probability > white_low.probability
+
+
+def test_terminal_result_reports_standard_chess_draw_rules() -> None:
+    config = MatchConfig()
+    stalemate = chess.Board("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1")
+    insufficient = chess.Board("8/8/8/8/8/8/6k1/6K1 w - - 0 1")
+    seventyfive = chess.Board("7k/8/8/8/8/8/8/6KQ w - - 150 76")
+
+    assert _terminal_result(stalemate, False, config) == ("1/2-1/2", "stalemate")
+    assert _terminal_result(insufficient, False, config) == (
+        "1/2-1/2",
+        "insufficient_material",
+    )
+    assert _terminal_result(seventyfive, False, config) == (
+        "1/2-1/2",
+        "seventyfive_move_rule",
+    )
+
+
+def test_claimable_draw_position_keeps_search_k_positive_when_not_terminal() -> None:
+    board = chess.Board()
+    for san in (
+        "e4 Nf6 e5 Ne4 Nc3 Nxc3 dxc3 e6 Qd4 Nc6 Qe4 Bc5 "
+        "Bd2 Kf8 Bd3 Be7 Nf3 g5 h3 a6 b4 b5 Rb1 h5 "
+        "g3 Bb7 a3 Bc8 Ra1 Bb7 Rb1 Bc8 Ra1 Bb7"
+    ).split():
+        board.push_san(san)
+
+    assert board.legal_moves.count() > 0
+    assert board.is_game_over(claim_draw=False) is False
+    assert board.is_game_over(claim_draw=True) is True
+    assert _termination_reason(
+        board,
+        MatchConfig(stop_only_on_mate_or_stalemate=True),
+    ) is None
+    assert _termination_reason(
+        board,
+        MatchConfig(stop_only_on_mate_or_stalemate=False),
+    ) == "threefold_repetition_claim"
+
+    search = AdaptiveExpectedValue(Style(), 1.0, StaticEvaluator(), cdepth=1)
+    search.expected_value(board)
+    selection = search.node_selection(board)
+
+    assert selection is not None
+    assert selection.expanded_count >= 1
+
+
 def test_cdepth_zero_is_static_evaluation() -> None:
     board = chess.Board()
     evaluator = StaticEvaluator()
@@ -216,7 +303,9 @@ def test_cdepth_one_accurate_matches_full_move_response_expectation() -> None:
     for record in landscape.records:
         after = board.copy(stack=False)
         after.push(record.move)
-        reply_landscape = move_distribution(after, style, 1.5, evaluator)
+        reply_landscape = move_distribution(
+            after, style, 1.5, evaluator, value_objective_weight=1.0
+        )
         reply_expected = sum(
             reply.probability * reply.static_after for reply in reply_landscape.records
         )
@@ -240,7 +329,9 @@ def test_accurate_mode_preserves_unexpanded_probability_mass() -> None:
     for record in landscape.records:
         after = board.copy(stack=False)
         after.push(record.move)
-        reply_landscape = move_distribution(after, _quiet_style(), 1.0, evaluator)
+        reply_landscape = move_distribution(
+            after, _quiet_style(), 1.0, evaluator, value_objective_weight=1.0
+        )
         branch_value = sum(reply.probability * reply.static_after for reply in reply_landscape.records)
         if record.uci not in selected:
             fallback_mass += record.probability
@@ -280,7 +371,7 @@ def test_response_k_is_independent_and_static_evaluation_ordered() -> None:
     selected_branch = next(branch for branch in selection.branches if branch.was_deepened)
     after = board.copy(stack=False)
     after.push(selected_branch.move)
-    reply_landscape = search.landscape(after)
+    reply_landscape = search.response_landscape(after)
     expected_k = adaptive_breadth(reply_landscape.effective_moves, 0.2, len(reply_landscape.records))
     expected = {
         record.uci
@@ -329,7 +420,7 @@ def test_candidate_thermodynamics_averages_all_replies_after_consuming_cycle() -
     )
     after = board.copy(stack=False)
     after.push(candidate.move)
-    reply_landscape = search.landscape(after)
+    reply_landscape = search.response_landscape(after)
     expected_k = adaptive_breadth(
         reply_landscape.effective_moves,
         0.05,
@@ -402,24 +493,52 @@ def test_selected_candidate_thermo_mode_only_enriches_chosen_move() -> None:
     assert all(move.candidate_delta_q is None for move in nonchosen)
 
 
-def test_refined_candidate_thermo_mode_enriches_root_top_k_moves() -> None:
+def test_candidate_thermo_mode_does_not_change_move_decision() -> None:
     board = chess.Board()
+    board.push_san("e4")
+    evaluator = StaticEvaluator()
+    choices = []
+
+    for mode in ("selected", "refined", "all"):
+        player = ThermoPlayer(
+            "black",
+            chess.BLACK,
+            strategy_style("positional_controller"),
+            beta=6.0,
+            cdepth=1,
+            adaptive_c=0.3,
+            candidate_thermo_mode=mode,
+        )
+        choices.append(player.choose(board, evaluator).uci)
+
+    assert choices == ["g8f6", "g8f6", "g8f6"]
+
+
+def test_refined_candidate_thermo_mode_enriches_delta_u_top_k_moves() -> None:
+    board = chess.Board(
+        "r3k2r/p1pb1p1p/3pp3/2b1P2p/7P/2PB1NP1/P1PB1P2/1R2K2R b Kkq - 3 16"
+    )
     evaluator = StaticEvaluator()
     search = AdaptiveExpectedValue(
-        Style(center=3.0, development=1.0),
-        2.0,
+        strategy_style("positional_controller"),
+        6.0,
         evaluator,
         cdepth=1,
-        adaptive_c=0.05,
+        adaptive_c=0.3,
     )
     result = search.search_result(board)
     selected = set(result.selected_uci)
-    chosen = max(result.moves, key=lambda move: move.candidate_delta_u).uci
-    expected_detailed = selected | {chosen}
+    ranked_by_delta = sorted(
+        result.moves,
+        key=lambda move: move.candidate_delta_u,
+        reverse=board.turn == chess.WHITE,
+    )
+    expected_detailed = {move.uci for move in ranked_by_delta[: result.K]}
 
     assert result.search_mode == "accurate"
     assert result.K == len(selected)
     assert selected
+    assert expected_detailed != selected
     for move in result.moves:
         if move.uci in expected_detailed:
             assert move.candidate_delta_q is not None
@@ -429,30 +548,6 @@ def test_refined_candidate_thermo_mode_enriches_root_top_k_moves() -> None:
         else:
             assert move.candidate_delta_q is None
             assert move.responses == ()
-
-
-def test_cheap_mode_uses_parent_fallback_for_unselected_mass() -> None:
-    board = chess.Board()
-    evaluator = StaticEvaluator()
-    style = Style(center=3.0, development=1.0)
-    search = AdaptiveExpectedValue(style, 2.0, evaluator, cdepth=1, adaptive_c=0.05, search_mode="cheap")
-    search.expected_value(board)
-    landscape = search.landscape(board)
-    selection = search.node_selection(board)
-    assert selection is not None
-    selected = set(selection.selected_uci)
-    nonselected_record = next(record for record in landscape.records if record.uci not in selected)
-    nonselected_branch = next(branch for branch in selection.branches if branch.uci == nonselected_record.uci)
-    assert nonselected_branch.adaptive_branch_value == pytest.approx(nonselected_record.static_after)
-
-    selected_record = next(record for record in landscape.records if record.uci in selected)
-    selected_branch = next(branch for branch in selection.branches if branch.uci == selected_record.uci)
-    selected_mass = sum(reply.probability for reply in selected_branch.response_branches)
-    assert selected_mass < 1.0
-    expected = sum(
-        reply.probability * reply.response_value for reply in selected_branch.response_branches
-    ) + (1.0 - selected_mass) * selected_record.static_after
-    assert selected_branch.adaptive_branch_value == pytest.approx(expected)
 
 
 def test_cdepth_two_recurses_only_after_complete_cycle() -> None:
@@ -973,12 +1068,30 @@ def test_terminal_static_fallback_is_boundary_accessibility() -> None:
     assert result.decomposition_error == pytest.approx(0.0)
 
 
+def test_default_match_name_reflects_strategy_beta_solidness_and_cdepth() -> None:
+    config = MatchConfig(
+        white_strategy="material_conservative",
+        black_strategy="positional_controller",
+        beta_white=4.0,
+        beta_black=6.5,
+        white_solidness=0.2,
+        black_solidness=None,
+        cdepth=3,
+    )
+
+    assert config.match_name == default_match_name(config)
+    assert config.match_name == (
+        "material_conservative_b4_s0p2_vs_"
+        "positional_controller_b6p5_s0p8_cdepth3"
+    )
+    assert MatchConfig(match_name="custom_name").match_name == "custom_name"
+
+
 def test_simulation_saves_viewer_ready_panels(tmp_path: Path) -> None:
     config = MatchConfig(
         max_plies=2,
         seed=1,
         depth=1,
-        search_mode="cheap",
         results_dir=tmp_path / "results",
         games_dir=tmp_path / "games",
         match_name="viewer_payload",
@@ -995,7 +1108,7 @@ def test_simulation_saves_viewer_ready_panels(tmp_path: Path) -> None:
     states = data["viewer_states"]
     assert data["config"]["cdepth"] == 1
     assert data["config"]["depth"] == 1
-    assert data["config"]["search_mode"] == "cheap"
+    assert data["config"]["search_mode"] == "accurate"
     assert data["config"]["adaptive_c"] == pytest.approx(0.3)
     assert data["white_style"]["solidness"] == pytest.approx(0.2)
     assert data["black_style"]["solidness"] == pytest.approx(0.9)

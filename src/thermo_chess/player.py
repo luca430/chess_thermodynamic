@@ -116,8 +116,8 @@ class ThermoPlayer:
             raise ValueError("cdepth must be at least 0")
         if self.adaptive_c <= 0.0:
             raise ValueError("adaptive_c must be greater than 0")
-        if self.search_mode not in {"accurate", "cheap"}:
-            raise ValueError("search_mode must be 'accurate' or 'cheap'")
+        if self.search_mode != "accurate":
+            raise ValueError("search_mode must be 'accurate'")
         if self.search_workers is not None and self.search_workers < 1:
             raise ValueError("search_workers must be at least 1")
         if self.parallel_min_branches < 1:

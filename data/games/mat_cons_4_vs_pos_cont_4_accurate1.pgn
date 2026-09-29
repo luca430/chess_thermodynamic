@@ -4,6 +4,6 @@
 [Round "?"]
 [White "White material conservative"]
 [Black "Black positional controller"]
-[Result "1-0"]
+[Result "1/2-1/2"]
 
-1. e4 Nf6 2. e5 Ne4 3. d4 e6 4. Nc3 Nxc3 5. bxc3 Qh4 6. Qf3 g6 7. g3 Qh5 8. Bd2 Ba3 9. Rb1 Nc6 10. h4 Nxe5 11. Qxh5 gxh5 12. dxe5 Bc5 13. Bd3 b5 14. Rxb5 d6 15. Nf3 Bd7 16. Rb1 dxe5 17. Nxe5 f5 18. Nxd7 Kxd7 19. Bf4 Kd8 20. Kf1 Rg8 21. Re1 Be7 22. Rxe6 Rb8 23. Bxf5 Bxh4 24. Rxh4 Re8 25. Rxe8+ Kxe8 26. Bxc7 Rb1+ 27. Ke2 Kf7 28. Bxh7 Ke6 29. Rxh5 Rb6 30. Bxb6 axb6 31. Kd3 b5 32. Rxb5 Ke7 33. Be4 Kd6 34. Rd5+ Ke6 35. f4 Ke7 36. c4 Ke6 37. Rd8 Ke7 38. Rd5 Ke6 39. Rd8 Ke7 40. Rd7+ Kxd7 41. c5 Ke6 42. a3 Ke7 43. g4 Kd7 44. g5 Ke6 45. a4 Kd7 46. a5 Ke6 47. a6 Kd7 48. a7 Ke7 49. a8=Q Kf7 50. Qd5+ Ke7 51. Qd6+ Kf7 52. Qf6+ Kg8 53. Qd6 Kf7 54. Qf6+ Kg8 55. Qd6 Kh8 56. Qf8# 1-0
+1. e4 e5 2. Qg4 Nf6 3. Qf5 Bd6 4. Ke2 g6 5. Qf3 Nc6 6. c3 Bc5 7. d3 h6 8. b4 Bb6 9. b5 Bd4 10. bxc6 dxc6 11. cxd4 exd4 12. e5 Bg4 13. Qxg4 Nxg4 14. Nf3 Nxh2 15. Rxh2 Qd5 16. Rxh6 Rxh6 17. Bxh6 O-O-O 18. Kd2 Qa5+ 19. Ke2 Qd5 20. Kd2 Qa5+ 21. Ke2 Qxe5+ 22. Nxe5 Re8 23. Bf4 c5 24. Kf3 f6 25. Nxg6 b5 26. Kg3 a5 27. a4 b4 28. Ra2 f5 29. Rc2 Re1 30. Nd2 Re6 31. Nf8 Re8 32. Ng6 Re6 33. Nf8 Re8 34. Ng6 Re3+ 35. fxe3 dxe3 36. Bxe3 c6 37. Rxc5 Kd7 38. Rxf5 Kc7 39. Rxa5 Kd7 40. Ne4 Kd8 41. Kf4 Kd7 42. Rf5 b3 43. g3 b2 44. Nf8+ Kc8 45. Nd6+ Kc7 46. Ne8+ Kc8 47. Nd6+ Kc7 48. Ne8+ Kc8 49. Nd6+ 1/2-1/2

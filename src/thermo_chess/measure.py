@@ -184,6 +184,7 @@ def move_distribution(
     evaluator: StaticEvaluator,
     before_context: BoardFeatureContext | None = None,
     context_provider: Callable[[chess.Board], BoardFeatureContext] | None = None,
+    value_objective_weight: float = 0.0,
 ) -> MoveLandscape:
     context_for = context_provider or board_context
     before = before_context or context_for(board)
@@ -219,17 +220,24 @@ def move_distribution(
             )
         )
     components = [potential_components(style, features) for features in features_by_move]
-    phis = [total for _, _, total in components]
+    static_values = [
+        evaluator.evaluate(after, context=after_values)
+        for after, after_values in zip(after_boards, after_contexts)
+    ]
+    side_sign = 1.0 if board.turn == chess.WHITE else -1.0
+    phis = [
+        total + value_objective_weight * side_sign * static_after
+        for (_, _, total), static_after in zip(components, static_values)
+    ]
     probabilities = stable_softmax(phis, beta)
 
     records: List[MoveRecord] = []
     expected = 0.0
-    for move, after, after_values, features, (base_phi, phase_phi, phi), probability in zip(
-        legal_moves, after_boards, after_contexts, features_by_move, components, probabilities
+    for move, after, after_values, features, (base_phi, phase_phi, _style_phi), phi, probability, static_after in zip(
+        legal_moves, after_boards, after_contexts, features_by_move, components, phis, probabilities, static_values
     ):
         features = {**features, **castle_preserve_diagnostics(style, features)}
         san = board.san(move)
-        static_after = evaluator.evaluate(after, context=after_values)
         expected += probability * static_after
         records.append(
             MoveRecord(
