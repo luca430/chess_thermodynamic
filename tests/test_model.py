@@ -8,7 +8,7 @@ import chess
 import pytest
 
 from thermo_chess.evaluation import StaticEvaluator
-from thermo_chess.features import game_phase, move_features, phase_weights, piece_exposure
+from thermo_chess.features import board_context, game_phase, move_features, phase_weights, piece_exposure
 from thermo_chess.measure import Style, move_distribution, potential, potential_components
 from thermo_chess.metrics import effective_number, entropy
 from thermo_chess.player import ThermoPlayer
@@ -86,6 +86,38 @@ def test_expected_value_is_weighted_average() -> None:
     landscape = move_distribution(board, Style(), 3.0, evaluator)
     explicit = sum(record.probability * record.static_after for record in landscape.records)
     assert landscape.expected_value == pytest.approx(explicit)
+
+
+def test_board_feature_context_preserves_static_and_move_features() -> None:
+    board = chess.Board()
+    move = chess.Move.from_uci("g1f3")
+    after = board.copy(stack=False)
+    after.push(move)
+    before_context = board_context(board)
+    after_context = board_context(after)
+    evaluator = StaticEvaluator()
+
+    assert evaluator.evaluate(board, context=before_context) == pytest.approx(
+        evaluator.evaluate(board)
+    )
+    assert move_features(
+        board,
+        move,
+        before_context=before_context,
+        after_context=after_context,
+        after_board=after,
+    ) == pytest.approx(move_features(board, move))
+
+
+def test_future_depth_zero_is_one_ply_subjective_value() -> None:
+    board = chess.Board()
+    evaluator = StaticEvaluator()
+    style = Style(center=1.5, development=1.0)
+    search = AdaptiveExpectedValue(style, 2.0, evaluator, cdepth=1)
+    expected = move_distribution(board, style, 2.0, evaluator).expected_value
+
+    assert search._future_subjective_value(board, 0, 0) == pytest.approx(expected)
+    assert search.expected_value(board, 0) == pytest.approx(evaluator.evaluate(board))
 
 
 def test_player_choice_uses_stored_search_result_branch_value() -> None:
@@ -220,7 +252,7 @@ def test_accurate_mode_preserves_unexpanded_probability_mass() -> None:
 
 
 
-def test_top_k_uses_own_move_probability_order() -> None:
+def test_top_k_uses_immediate_static_evaluation_order() -> None:
     board = chess.Board()
     evaluator = StaticEvaluator()
     style = Style(center=3.0, development=1.0)
@@ -232,12 +264,12 @@ def test_top_k_uses_own_move_probability_order() -> None:
     expected_k = adaptive_breadth(landscape.effective_moves, 0.2, len(landscape.records))
     expected = tuple(
         record.uci
-        for record in sorted(landscape.records, key=lambda item: item.probability, reverse=True)[:expected_k]
+        for record in sorted(landscape.records, key=lambda item: item.static_after, reverse=True)[:expected_k]
     )
     assert selection.selected_uci == expected
 
 
-def test_response_k_is_independent_and_probability_ordered() -> None:
+def test_response_k_is_independent_and_static_evaluation_ordered() -> None:
     board = chess.Board()
     evaluator = StaticEvaluator()
     style = Style(center=3.0, development=1.0)
@@ -252,7 +284,7 @@ def test_response_k_is_independent_and_probability_ordered() -> None:
     expected_k = adaptive_breadth(reply_landscape.effective_moves, 0.2, len(reply_landscape.records))
     expected = {
         record.uci
-        for record in sorted(reply_landscape.records, key=lambda item: item.probability, reverse=True)[:expected_k]
+        for record in sorted(reply_landscape.records, key=lambda item: item.static_after)[:expected_k]
     }
     observed = {
         reply.uci
@@ -278,14 +310,23 @@ def test_accurate_mode_does_not_renormalize_or_drop_omitted_replies() -> None:
     assert any(not reply.selected_for_refinement for reply in branch.response_branches)
 
 
-def test_candidate_thermodynamics_conditions_on_top_k_replies() -> None:
+def test_candidate_thermodynamics_averages_all_replies_after_consuming_cycle() -> None:
     board = chess.Board()
     evaluator = StaticEvaluator()
     style = Style(center=3.0, development=1.0)
-    search = AdaptiveExpectedValue(style, 2.0, evaluator, cdepth=1, adaptive_c=0.05)
+    search = AdaptiveExpectedValue(
+        style,
+        2.0,
+        evaluator,
+        cdepth=1,
+        adaptive_c=0.05,
+        candidate_thermo_mode="all",
+    )
     result = search.search_result(board)
 
-    candidate = next(move for move in result.moves if move.response_K is not None)
+    candidate = next(
+        move for move in result.moves if move.selected_for_refinement and move.responses
+    )
     after = board.copy(stack=False)
     after.push(candidate.move)
     reply_landscape = search.landscape(after)
@@ -296,25 +337,98 @@ def test_candidate_thermodynamics_conditions_on_top_k_replies() -> None:
     )
     ranked = sorted(
         reply_landscape.records,
-        key=lambda reply: reply.probability,
-        reverse=True,
+        key=lambda reply: reply.static_after,
+        reverse=after.turn == chess.WHITE,
     )[:expected_k]
-    selected_mass = sum(reply.probability for reply in ranked)
+    selected = {reply.uci for reply in ranked}
 
-    assert candidate.response_entropy == pytest.approx(reply_landscape.entropy)
+    expected_next_u = 0.0
+    for reply in reply_landscape.records:
+        next_board = after.copy(stack=False)
+        next_board.push(reply.move)
+        if reply.uci in selected and not next_board.is_game_over(claim_draw=True):
+            future_u = move_distribution(next_board, style, 2.0, evaluator).expected_value
+        else:
+            future_u = reply.static_after
+        expected_next_u += reply.probability * future_u
+
+    assert candidate.response_entropy is None
     assert candidate.response_N_eff == pytest.approx(reply_landscape.effective_moves)
     assert candidate.response_K == expected_k
-    assert len(candidate.responses) == expected_k
-    assert [response.uci for response in candidate.responses] == [reply.uci for reply in ranked]
+    assert len(candidate.responses) == len(reply_landscape.records)
+    assert [response.uci for response in candidate.responses] == [
+        reply.uci for reply in reply_landscape.records
+    ]
     assert sum(response.probability for response in candidate.responses) == pytest.approx(1.0)
     assert [response.probability for response in candidate.responses] == pytest.approx(
-        [reply.probability / selected_mass for reply in ranked]
+        [reply.probability for reply in reply_landscape.records]
     )
-    assert all(response.selected_for_refinement for response in candidate.responses)
+    assert {
+        response.uci for response in candidate.responses if response.selected_for_refinement
+    } == selected
+    assert all(response.depth_used == 0 for response in candidate.responses)
+    assert candidate.expected_next_U == pytest.approx(expected_next_u)
     assert candidate.candidate_delta_u == pytest.approx(candidate.expected_next_U - result.U)
     assert candidate.candidate_delta_u == pytest.approx(
         candidate.candidate_delta_q + candidate.candidate_delta_w + candidate.candidate_delta_a
     )
+
+
+def test_selected_candidate_thermo_mode_only_enriches_chosen_move() -> None:
+    board = chess.Board()
+    evaluator = StaticEvaluator()
+    player = ThermoPlayer(
+        "white",
+        chess.WHITE,
+        Style(center=3.0, development=1.0),
+        beta=2.0,
+        cdepth=1,
+        adaptive_c=0.05,
+        candidate_thermo_mode="selected",
+    )
+    choice = player.choose(board, evaluator)
+
+    chosen = next(
+        move for move in choice.search_result.moves if move.uci == choice.uci
+    )
+    nonchosen = [
+        move for move in choice.search_result.moves if move.uci != choice.uci
+    ]
+
+    assert chosen.candidate_delta_q is not None
+    assert chosen.candidate_delta_u == pytest.approx(
+        chosen.candidate_delta_q + chosen.candidate_delta_w + chosen.candidate_delta_a
+    )
+    assert all(move.candidate_delta_q is None for move in nonchosen)
+
+
+def test_refined_candidate_thermo_mode_enriches_root_top_k_moves() -> None:
+    board = chess.Board()
+    evaluator = StaticEvaluator()
+    search = AdaptiveExpectedValue(
+        Style(center=3.0, development=1.0),
+        2.0,
+        evaluator,
+        cdepth=1,
+        adaptive_c=0.05,
+    )
+    result = search.search_result(board)
+    selected = set(result.selected_uci)
+    chosen = max(result.moves, key=lambda move: move.candidate_delta_u).uci
+    expected_detailed = selected | {chosen}
+
+    assert result.search_mode == "accurate"
+    assert result.K == len(selected)
+    assert selected
+    for move in result.moves:
+        if move.uci in expected_detailed:
+            assert move.candidate_delta_q is not None
+            assert move.candidate_delta_u == pytest.approx(
+                move.candidate_delta_q + move.candidate_delta_w + move.candidate_delta_a
+            )
+        else:
+            assert move.candidate_delta_q is None
+            assert move.responses == ()
 
 
 def test_cheap_mode_uses_parent_fallback_for_unselected_mass() -> None:
@@ -394,6 +508,7 @@ def test_adaptive_configuration_validation() -> None:
     assert MatchConfig().depth == 1
     assert MatchConfig().search_mode == "accurate"
     assert MatchConfig().adaptive_c == pytest.approx(0.3)
+    assert MatchConfig().candidate_thermo_mode == "refined"
 
 
 def test_builtin_strategy_presets_are_complete_and_distinct() -> None:

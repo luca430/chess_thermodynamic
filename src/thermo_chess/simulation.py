@@ -15,7 +15,7 @@ import chess.pgn
 from .evaluation import EvaluationWeights, StaticEvaluator
 from .measure import Style
 from .player import ThermoPlayer
-from .search import AdaptiveDepthThresholds, SearchMode, SearchResult
+from .search import AdaptiveDepthThresholds, CandidateThermoMode, SearchMode, SearchResult
 from .thermodynamics import decompose_transition
 
 
@@ -52,6 +52,7 @@ class MatchConfig:
     viewer_workers: int = 1
     search_workers: int | None = 1
     parallel_min_branches: int = 8
+    candidate_thermo_mode: CandidateThermoMode = "refined"
     profile: bool = False
 
     def __post_init__(self) -> None:
@@ -70,6 +71,8 @@ class MatchConfig:
             raise ValueError("search_workers must be at least 1")
         if self.parallel_min_branches < 1:
             raise ValueError("parallel_min_branches must be at least 1")
+        if self.candidate_thermo_mode not in {"selected", "refined", "all"}:
+            raise ValueError("candidate_thermo_mode must be 'selected', 'refined', or 'all'")
         if self.white_strategy not in STRATEGY_NAMES:
             raise ValueError(f"unknown white strategy: {self.white_strategy}")
         if self.black_strategy not in STRATEGY_NAMES:
@@ -380,6 +383,7 @@ def simulate_match(
         config.search_mode,
         config.search_workers,
         config.parallel_min_branches,
+        config.candidate_thermo_mode,
     )
     black = ThermoPlayer(
         "Black custom" if black_style is not None else f"Black {config.black_strategy.replace('_', ' ')}",
@@ -392,6 +396,7 @@ def simulate_match(
         config.search_mode,
         config.search_workers,
         config.parallel_min_branches,
+        config.candidate_thermo_mode,
     )
     players = {chess.WHITE: white, chess.BLACK: black}
 
@@ -447,7 +452,6 @@ def simulate_match(
             moves=search_result.moves,
             diagnostics=result_diag,
         )
-        current_analysis = player.analyze(board, evaluator)
         current_landscape = current_analysis.landscape
         thermo_transition = None
         previous_thermo = last_thermo_state.get(player.color)

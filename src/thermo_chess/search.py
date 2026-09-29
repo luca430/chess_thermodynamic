@@ -12,11 +12,13 @@ from typing import Dict, Iterable, Literal, Tuple
 import chess
 
 from .evaluation import StaticEvaluator
+from .features import BoardFeatureContext, board_context
 from .measure import MoveLandscape, MoveRecord, Style, move_distribution
 
 
 PositionKey = Tuple[str, bool, bool, bool]
 SearchMode = Literal["accurate", "cheap"]
+CandidateThermoMode = Literal["selected", "refined", "all"]
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,25 @@ def adaptive_breadth(effective_moves: float, adaptive_c: float, legal_moves: int
     if legal_moves <= 0:
         return 0
     return min(legal_moves, max(1, math.ceil(adaptive_c * effective_moves)))
+
+
+def ranked_for_refinement(
+    records: Iterable[MoveRecord], side_to_move: chess.Color
+) -> Tuple[MoveRecord, ...]:
+    """Rank branches for deeper work by immediate static board value.
+
+    The universal evaluator is White-positive, so White-favorable branches have
+    larger ``E(B_m)`` and Black-favorable branches have smaller ``E(B_m)``.
+    This ranking only allocates computation; probabilities still weight values.
+    """
+
+    return tuple(
+        sorted(
+            records,
+            key=lambda record: record.static_after,
+            reverse=side_to_move == chess.WHITE,
+        )
+    )
 
 
 def _validate_search_mode(search_mode: str) -> SearchMode:
@@ -494,8 +515,8 @@ class _CachedEvaluator:
         self.search = search
         self.weights = search.evaluator.weights
 
-    def evaluate(self, board: chess.Board) -> float:
-        return self.search.static_value(board)
+    def evaluate(self, board: chess.Board, context: BoardFeatureContext | None = None) -> float:
+        return self.search.static_value(board, context=context)
 
 
 def _terminal_observation(value: float, cdepth: int, search_mode: SearchMode) -> NodeSelection:
@@ -553,6 +574,7 @@ class AdaptiveExpectedValue:
         search_mode: SearchMode = "accurate",
         search_workers: int | None = 1,
         parallel_min_branches: int = 8,
+        candidate_thermo_mode: CandidateThermoMode = "refined",
         *,
         depth: int | None = None,
     ) -> None:
@@ -568,6 +590,8 @@ class AdaptiveExpectedValue:
             raise ValueError("search_workers must be at least 1")
         if parallel_min_branches < 1:
             raise ValueError("parallel_min_branches must be at least 1")
+        if candidate_thermo_mode not in {"selected", "refined", "all"}:
+            raise ValueError("candidate_thermo_mode must be 'selected', 'refined', or 'all'")
         self.style = style
         self.beta = beta
         self.evaluator = evaluator
@@ -578,10 +602,14 @@ class AdaptiveExpectedValue:
         self.search_mode = _validate_search_mode(search_mode)
         self.search_workers = search_workers
         self.parallel_min_branches = parallel_min_branches
+        self.candidate_thermo_mode = candidate_thermo_mode
         self._static_cache: Dict[PositionKey, float] = {}
+        self._context_cache: Dict[PositionKey, BoardFeatureContext] = {}
         self._landscape_cache: Dict[PositionKey, MoveLandscape] = {}
         self._value_cache: Dict[Tuple[PositionKey, int], float] = {}
         self._selection_cache: Dict[Tuple[PositionKey, int], NodeSelection] = {}
+        self._future_value_cache: Dict[Tuple[PositionKey, int], float] = {}
+        self._future_selection_cache: Dict[Tuple[PositionKey, int], NodeSelection] = {}
         self._result_cache: Dict[Tuple[PositionKey, int, str], SearchResult] = {}
         self._cached_evaluator = _CachedEvaluator(self)
         self.diagnostics = SearchDiagnostics(
@@ -618,25 +646,51 @@ class AdaptiveExpectedValue:
         self.diagnostics.elapsed_time = time.perf_counter() - self._started_at
         return self.diagnostics.as_dict()
 
-    def static_value(self, board: chess.Board) -> float:
-        key = self.position_key(board)
-        if key in self._static_cache:
+    def board_context(
+        self, board: chess.Board, key: PositionKey | None = None
+    ) -> BoardFeatureContext:
+        position_key = key or self.position_key(board)
+        cached = self._context_cache.get(position_key)
+        if cached is not None:
             self.diagnostics.cache_hits += 1
-            return self._static_cache[key]
-        value = self.evaluator.evaluate(board)
-        self._static_cache[key] = value
+            return cached
+        context = board_context(board)
+        self._context_cache[position_key] = context
+        return context
+
+    def static_value(
+        self,
+        board: chess.Board,
+        key: PositionKey | None = None,
+        context: BoardFeatureContext | None = None,
+    ) -> float:
+        position_key = key or self.position_key(board)
+        if position_key in self._static_cache:
+            self.diagnostics.cache_hits += 1
+            return self._static_cache[position_key]
+        values = context or self.board_context(board, position_key)
+        value = self.evaluator.evaluate(board, context=values)
+        self._static_cache[position_key] = value
         self.diagnostics.static_evaluations += 1
         return value
 
-    def landscape(self, board: chess.Board) -> MoveLandscape:
-        key = self.position_key(board)
-        if key in self._landscape_cache:
+    def landscape(
+        self, board: chess.Board, key: PositionKey | None = None
+    ) -> MoveLandscape:
+        position_key = key or self.position_key(board)
+        if position_key in self._landscape_cache:
             self.diagnostics.cache_hits += 1
-            return self._landscape_cache[key]
+            return self._landscape_cache[position_key]
+        context = self.board_context(board, position_key)
         landscape = move_distribution(
-            board, self.style, self.beta, self._cached_evaluator
+            board,
+            self.style,
+            self.beta,
+            self._cached_evaluator,
+            before_context=context,
+            context_provider=self.board_context,
         )
-        self._landscape_cache[key] = landscape
+        self._landscape_cache[position_key] = landscape
         return landscape
 
     def node_selection(self, board: chess.Board, depth: int | None = None) -> NodeSelection | None:
@@ -657,6 +711,84 @@ class AdaptiveExpectedValue:
             raise ValueError("cdepth must be at least 0")
         return self._expected_value(board, remaining, 0)
 
+    def _future_subjective_value(self, board: chess.Board, remaining_cdepth: int, level: int) -> float:
+        """Value at a same-player future state after one cycle was consumed.
+
+        Public ``expected_value(..., 0)`` intentionally remains the static board
+        value ``E(B)``. Candidate move scoring has different depth-zero
+        semantics: the observer is to move again, so depth zero is the
+        probability-weighted value of its immediate legal moves.
+        """
+
+        if remaining_cdepth < 0:
+            raise ValueError("remaining_cdepth must be at least 0")
+        if remaining_cdepth > 0:
+            return self._expected_value(board, remaining_cdepth, level)
+
+        self.diagnostics.maximum_depth_reached = max(
+            self.diagnostics.maximum_depth_reached, level
+        )
+        position_key = self.position_key(board)
+        cache_key = (position_key, remaining_cdepth)
+        if cache_key in self._future_value_cache:
+            self.diagnostics.cache_hits += 1
+            return self._future_value_cache[cache_key]
+
+        self.diagnostics.nodes_evaluated += 1
+        if board.is_game_over(claim_draw=True):
+            value = self.static_value(board)
+            self._future_selection_cache[cache_key] = _terminal_observation(
+                value, remaining_cdepth, self.search_mode
+            )
+            self._future_value_cache[cache_key] = value
+            return value
+
+        landscape = self.landscape(board)
+        if not landscape.records:
+            value = self.static_value(board)
+            self._future_selection_cache[cache_key] = _terminal_observation(
+                value, remaining_cdepth, self.search_mode
+            )
+            self._future_value_cache[cache_key] = value
+            return value
+
+        branches = tuple(
+            AdaptiveBranchObservation(
+                move=record.move,
+                uci=record.uci,
+                probability=record.probability,
+                adaptive_branch_value=record.static_after,
+                was_deepened=False,
+                depth_used=0,
+                search_mode=self.search_mode,
+                cdepth=remaining_cdepth,
+            )
+            for record in landscape.records
+        )
+        self._future_selection_cache[cache_key] = NodeSelection(
+            entropy=landscape.entropy,
+            effective_moves=landscape.effective_moves,
+            selected_depth=0,
+            expanded_count=0,
+            selected_uci=(),
+            branches=branches,
+        )
+        self._future_value_cache[cache_key] = landscape.expected_value
+        return landscape.expected_value
+
+    def _future_branch_observations(
+        self, board: chess.Board, remaining_cdepth: int, level: int
+    ) -> Tuple[AdaptiveBranchObservation, ...]:
+        if remaining_cdepth > 0:
+            self._expected_value(board, remaining_cdepth, level)
+            selection = self.node_selection(board, remaining_cdepth)
+        else:
+            self._future_subjective_value(board, remaining_cdepth, level)
+            selection = self._future_selection_cache.get(
+                (self.position_key(board), remaining_cdepth)
+            )
+        return selection.branches if selection is not None else ()
+
     def search_result(self, board: chess.Board, player: str = "", side: str | None = None) -> SearchResult:
         result_side = side or ("white" if board.turn == chess.WHITE else "black")
         key = (self.position_key(board), self.cdepth, result_side)
@@ -673,14 +805,44 @@ class AdaptiveExpectedValue:
             selected_depth = 0
             expanded_count = 0
         else:
+            position_key = self.position_key(board)
             branch_by_uci = {branch.uci: branch for branch in selection.branches}
-            current_u = self._value_cache[(self.position_key(board), self.cdepth)]
+            current_u = self._value_cache[(position_key, self.cdepth)]
             current_branches = selection.branches
+            fast_thermos = {}
+            for record in landscape.records:
+                branch = branch_by_uci.get(record.uci)
+                fast_thermos[record.uci] = self._candidate_thermodynamics(
+                    board, record, branch, current_u, current_branches, detailed=False
+                )
+
+            if board.turn == chess.WHITE:
+                chosen_uci = max(
+                    landscape.records,
+                    key=lambda record: fast_thermos[record.uci]["candidate_delta_u"],
+                ).uci
+            else:
+                chosen_uci = min(
+                    landscape.records,
+                    key=lambda record: fast_thermos[record.uci]["candidate_delta_u"],
+                ).uci
+
+            if self.candidate_thermo_mode == "all":
+                detailed_uci = {record.uci for record in landscape.records}
+            elif self.candidate_thermo_mode == "refined":
+                detailed_uci = set(selection.selected_uci) | {chosen_uci}
+            else:
+                detailed_uci = {chosen_uci}
+
             moves_list = []
             for record in landscape.records:
                 branch = branch_by_uci.get(record.uci)
                 branch_value = branch.adaptive_branch_value if branch else record.static_after
-                thermo = self._candidate_thermodynamics(board, record, branch, current_u, current_branches)
+                thermo = fast_thermos[record.uci]
+                if record.uci in detailed_uci:
+                    thermo = self._candidate_thermodynamics(
+                        board, record, branch, current_u, current_branches, detailed=True
+                    )
                 moves_list.append(
                     MoveEvaluation(
                         move=record.move,
@@ -738,9 +900,12 @@ class AdaptiveExpectedValue:
         branch: AdaptiveBranchObservation | None,
         current_u: float,
         current_branches: Tuple[AdaptiveBranchObservation, ...],
+        *,
+        detailed: bool,
     ) -> Dict[str, object]:
         from .thermodynamics import decompose_transition
 
+        branch_value = branch.adaptive_branch_value if branch else record.static_after
         after = board.copy(stack=False)
         after.push(record.move)
         if after.is_game_over(claim_draw=True):
@@ -748,111 +913,131 @@ class AdaptiveExpectedValue:
             return {
                 "expected_next_U": record.static_after,
                 "candidate_delta_u": delta,
-                "candidate_delta_q": 0.0,
-                "candidate_delta_w": 0.0,
-                "candidate_delta_a": delta,
-                "thermo_decomposition_error": 0.0,
+                "candidate_delta_q": 0.0 if detailed else None,
+                "candidate_delta_w": 0.0 if detailed else None,
+                "candidate_delta_a": delta if detailed else None,
+                "thermo_decomposition_error": 0.0 if detailed else None,
                 "response_entropy": None,
                 "response_N_eff": None,
                 "response_K": None,
                 "responses": (),
             }
 
-        reply_landscape = self.landscape(after)
-        if not reply_landscape.records:
-            delta = record.static_after - current_u
+        # Cheap mode and unrefined root candidates deliberately reuse the
+        # already-computed branch value. This keeps original probability mass in
+        # play while avoiding a fresh m -> r -> m' expansion for low-priority
+        # candidates.
+        if (
+            (self.search_mode == "cheap" and not detailed)
+            or branch is None
+            or not branch.response_branches
+            or (not detailed and not branch.was_deepened)
+        ):
+            delta = branch_value - current_u
             return {
-                "expected_next_U": record.static_after,
+                "expected_next_U": branch_value,
                 "candidate_delta_u": delta,
-                "candidate_delta_q": 0.0,
-                "candidate_delta_w": 0.0,
-                "candidate_delta_a": delta,
-                "thermo_decomposition_error": 0.0,
-                "response_entropy": reply_landscape.entropy,
-                "response_N_eff": reply_landscape.effective_moves,
-                "response_K": 0,
+                "candidate_delta_q": None,
+                "candidate_delta_w": None,
+                "candidate_delta_a": None,
+                "thermo_decomposition_error": None,
+                "response_entropy": None,
+                "response_N_eff": branch.response_neff if branch else None,
+                "response_K": branch.response_k if branch else None,
                 "responses": (),
             }
 
-        response_k = adaptive_breadth(
-            reply_landscape.effective_moves,
-            self.adaptive_c,
-            len(reply_landscape.records),
-        )
-        selected_responses = tuple(
-            sorted(
-                reply_landscape.records,
-                key=lambda reply: reply.probability,
-                reverse=True,
-            )[:response_k]
-        )
-        selected_mass = sum(response.probability for response in selected_responses)
-        if selected_mass <= 0.0:
-            delta = record.static_after - current_u
-            return {
-                "expected_next_U": record.static_after,
-                "candidate_delta_u": delta,
-                "candidate_delta_q": 0.0,
-                "candidate_delta_w": 0.0,
-                "candidate_delta_a": delta,
-                "thermo_decomposition_error": 0.0,
-                "response_entropy": reply_landscape.entropy,
-                "response_N_eff": reply_landscape.effective_moves,
-                "response_K": response_k,
-                "responses": (),
-            }
+        response_records = branch.response_branches
+        selected_uci = {
+            response.uci for response in response_records if response.selected_for_refinement
+        }
+        remaining_cdepth = max(0, self.cdepth - 1)
 
         response_evaluations: list[ResponseEvaluation] = []
         expected_next_u = 0.0
         candidate_delta_q = 0.0
         candidate_delta_w = 0.0
         candidate_delta_a = 0.0
-        for response in selected_responses:
-            conditional_probability = response.probability / selected_mass
-            next_board = after.copy(stack=False)
-            next_board.push(response.move)
-            next_u = self.expected_value(next_board, self.cdepth)
-            next_branches = self.branch_observations(next_board, self.cdepth)
-            decomposition = decompose_transition(
-                current_branches,
-                next_branches,
-                u_before=current_u,
-                u_after=next_u,
-            )
-            expected_next_u += conditional_probability * next_u
-            candidate_delta_q += conditional_probability * decomposition.delta_q
-            candidate_delta_w += conditional_probability * decomposition.delta_w
-            candidate_delta_a += conditional_probability * decomposition.delta_a
-            response_evaluations.append(
-                ResponseEvaluation(
-                    move=response.move,
-                    uci=response.uci,
-                    probability=conditional_probability,
-                    value=next_u,
-                    selected_for_refinement=True,
-                    static_value=response.static_after,
-                    depth_used=self.cdepth,
-                    next_state_U=next_u,
-                    delta_U=decomposition.delta_u,
-                    delta_Q=decomposition.delta_q,
-                    delta_W=decomposition.delta_w,
-                    delta_A=decomposition.delta_a,
-                    thermo_decomposition_error=decomposition.decomposition_error,
+        for response in response_records:
+            response_selected = response.uci in selected_uci
+            should_refine_response = response_selected and self.search_mode != "cheap"
+            next_board = None
+            if should_refine_response:
+                next_board = after.copy(stack=False)
+                next_board.push(response.move)
+                next_u = self._future_subjective_value(
+                    next_board, remaining_cdepth, level=1
                 )
-            )
+            else:
+                next_u = (
+                    response.static_value
+                    if response.static_value is not None
+                    else response.response_value
+                )
+            expected_next_u += response.probability * next_u
 
+            if detailed:
+                if should_refine_response:
+                    assert next_board is not None
+                    next_branches = self._future_branch_observations(
+                        next_board, remaining_cdepth, level=1
+                    )
+                else:
+                    next_branches = ()
+                decomposition = decompose_transition(
+                    current_branches,
+                    next_branches,
+                    u_before=current_u,
+                    u_after=next_u,
+                )
+                candidate_delta_q += response.probability * decomposition.delta_q
+                candidate_delta_w += response.probability * decomposition.delta_w
+                candidate_delta_a += response.probability * decomposition.delta_a
+                response_evaluations.append(
+                    ResponseEvaluation(
+                        move=response.move,
+                        uci=response.uci,
+                        probability=response.probability,
+                        value=next_u,
+                        selected_for_refinement=response_selected,
+                        static_value=response.static_value,
+                        depth_used=remaining_cdepth if response_selected else 0,
+                        next_state_U=next_u,
+                        delta_U=decomposition.delta_u,
+                        delta_Q=decomposition.delta_q,
+                        delta_W=decomposition.delta_w,
+                        delta_A=decomposition.delta_a,
+                        thermo_decomposition_error=decomposition.decomposition_error,
+                    )
+                )
+
+        if self.search_mode == "cheap":
+            expected_next_u = branch_value
         candidate_delta_u = expected_next_u - current_u
-        error = candidate_delta_u - (candidate_delta_q + candidate_delta_w + candidate_delta_a)
+        if detailed:
+            if self.search_mode == "cheap":
+                candidate_delta_a += candidate_delta_u - (
+                    candidate_delta_q + candidate_delta_w + candidate_delta_a
+                )
+            error = candidate_delta_u - (candidate_delta_q + candidate_delta_w + candidate_delta_a)
+            delta_q = candidate_delta_q
+            delta_w = candidate_delta_w
+            delta_a = candidate_delta_a
+        else:
+            error = None
+            delta_q = None
+            delta_w = None
+            delta_a = None
         return {
             "expected_next_U": expected_next_u,
             "candidate_delta_u": candidate_delta_u,
-            "candidate_delta_q": candidate_delta_q,
-            "candidate_delta_w": candidate_delta_w,
-            "candidate_delta_a": candidate_delta_a,
+            "candidate_delta_q": delta_q,
+            "candidate_delta_w": delta_w,
+            "candidate_delta_a": delta_a,
             "thermo_decomposition_error": error,
-            "response_entropy": reply_landscape.entropy,
-            "response_N_eff": reply_landscape.effective_moves,
-            "response_K": response_k,
+            "response_entropy": None,
+            "response_N_eff": branch.response_neff,
+            "response_K": branch.response_k,
             "responses": tuple(response_evaluations),
         }
 
@@ -890,7 +1075,7 @@ class AdaptiveExpectedValue:
         selected_depth = local_search_depth(
             cdepth, landscape.effective_moves, self.depth_thresholds
         )
-        ranked = sorted(landscape.records, key=lambda record: record.probability, reverse=True)
+        ranked = ranked_for_refinement(landscape.records, board.turn)
         selected_uci = tuple(record.uci for record in ranked[:expanded_count])
         selected = set(selected_uci)
         self.diagnostics.expanded_total += expanded_count
@@ -996,7 +1181,7 @@ class AdaptiveExpectedValue:
             reply_landscape = self.landscape(after)
             response_neff = reply_landscape.effective_moves
             response_k = adaptive_breadth(reply_landscape.effective_moves, self.adaptive_c, len(reply_landscape.records))
-            reply_ranked = sorted(reply_landscape.records, key=lambda reply: reply.probability, reverse=True)
+            reply_ranked = ranked_for_refinement(reply_landscape.records, after.turn)
             selected_replies = {reply.uci for reply in reply_ranked[:response_k]}
             self.diagnostics.response_expanded_total += response_k
             self.diagnostics.response_expanded_nodes += 1

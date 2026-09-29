@@ -83,6 +83,7 @@ def main() -> None:
     parser.add_argument("--viewer-workers", type=positive_int, default=1, help="Deprecated for normal saved-data viewer generation; retained for compatibility.")
     parser.add_argument("--search-workers", type=optional_workers, default=1, help="Process workers for root own-move branches; use 1 for serial or auto for CPU count.")
     parser.add_argument("--parallel-min-branches", type=positive_int, default=8, help="Minimum root branch count before search worker parallelism activates.")
+    parser.add_argument("--candidate-thermo-mode", choices=("selected", "refined", "all"), default="refined", help="Which candidates receive detailed Q/W/A diagnostics (default: refined).")
     parser.add_argument("--name", default="thermo_match")
     parser.add_argument("--ignore-threefold", action="store_true", help="Continue through threefold repetition until mate/stalemate or max-plies.")
     parser.add_argument("--allow-draw-claims", action="store_true", help="Stop on other claimable/automatic draw rules as well.")
@@ -104,6 +105,7 @@ def main() -> None:
             viewer_workers=args.viewer_workers,
             search_workers=args.search_workers,
             parallel_min_branches=args.parallel_min_branches,
+            candidate_thermo_mode=args.candidate_thermo_mode,
             match_name=args.name,
             stop_only_on_mate_or_stalemate=not args.allow_draw_claims,
             stop_on_threefold_repetition=not args.ignore_threefold,

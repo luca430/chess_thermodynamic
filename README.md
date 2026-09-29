@@ -10,6 +10,7 @@ It is not a conventional chess engine. In particular, it does not use minimax, a
 - [Mathematical framework](#mathematical-framework)
 - [Exact potential feature formulas](#exact-potential-feature-formulas)
 - [Exact board-evaluation formulas](#exact-board-evaluation-formulas)
+- [Exact Cycle Recursive Expectation](#exact-cycle-recursive-expectation)
 - [Adaptive cycle search](#adaptive-cycle-search)
 - [Move choice and deltaU](#move-choice-and-deltau)
 - [Heat, work, and accessibility](#heat-work-and-accessibility)
@@ -524,7 +525,7 @@ Notice that the mobility and center differences are normalized by `30` and `6` b
 
 If the side to move is checkmated, `E(B)` receives the appropriate signed checkmate value. Stalemate, insufficient material, the automatic 75-move rule, and fivefold repetition evaluate to zero. At a search terminal or depth-zero node, the search returns `E(B)` directly and never applies a softmax to an empty move set.
 
-### Exact Cycle Recursive Expectation
+## Exact Cycle Recursive Expectation
 
 The configured recursive depth is `cdepth`, where one unit is a complete interaction cycle:
 
@@ -617,7 +618,7 @@ The default is
 c = 0.3
 ```
 
-Top-`K` and top-`K'` selection is based on move probability. It selects which branches receive extra computation; it never changes or renormalizes the probability distribution.
+Top-`K` and top-`K'` breadth is still determined by entropy, but the selected branches are ranked by immediate static board evaluation. Because `E(B)` is White-positive, White-to-move branches prefer larger `E(B_m)` and Black-to-move branches prefer smaller `E(B_m)`. This ranking only selects which branches receive extra computation; it never changes or renormalizes the probability distribution.
 
 ### Entropy-selected local cdepth
 
@@ -707,7 +708,7 @@ The candidate thermodynamic diagnostic is the predicted change in the same playe
 q(r\mid B_m)=p_\lambda(r\mid B_m).
 ```
 
-For this candidate diagnostic only, responses are ranked by this probability, not by static evaluation or chess strength. The response breadth is adaptive:
+For this candidate diagnostic, responses keep their subjective probabilities for weighting, but the refinement set is ranked by immediate static evaluation for the responding side. The response breadth is adaptive:
 
 ```math
 K_{\mathrm{response}}
@@ -718,20 +719,22 @@ N_{\mathrm{legal\ replies}},
 \right),
 ```
 
-where `c` is the configured adaptive breadth coefficient and `S_reply` is the entropy of `q`. Let `R_K(m)` be those top-`K_response` replies. The candidate metric conditions on that plausible-reply set and renormalizes locally:
+where `c` is the configured adaptive breadth coefficient and `S_reply` is the entropy of `q`. Let `R_K(m)` be the `K_response` replies with best immediate static evaluation for the responding side. These replies are marked as refinement-eligible diagnostics, but candidate scoring keeps the full subjective response distribution and does not renormalize it.
+
+After a candidate move and response, one complete cycle has been consumed. The future state is therefore valued with one fewer cycle. At candidate remaining depth zero, the same player is to move again, so the future-state value is the one-ply subjective expectation
 
 ```math
-\widetilde q(r\mid B_m)
+U_{\lambda,\mathrm{future}}^{(0)}(B)
 =
-\frac{q(r\mid B_m)}{\sum_{s\in R_K(m)}q(s\mid B_m)}.
+\sum_{m'}p_\lambda(m'\mid B)E(B_{m'}).
 ```
 
-The stored predicted next value and candidate change are
+For candidate depth `d`, the stored predicted next value and candidate change are
 
 ```math
 \operatorname{expected\_next\_U}(m)
 =
-\sum_{r\in R_K(m)}\widetilde q(r\mid B_m)U_\lambda^{(d)}(B_{m,r}),
+\sum_r q(r\mid B_m)U_{\lambda,\mathrm{future}}^{(d-1)}(B_{m,r}),
 ```
 
 ```math
@@ -740,24 +743,32 @@ The stored predicted next value and candidate change are
 \operatorname{expected\_next\_U}(m)-U_\lambda^{(d)}(B).
 ```
 
-Each selected response-specific transition compares `B` with `B_mr`, where the same player is again to move, and is decomposed with the finite midpoint formulas. The candidate row stores the conditional top-`K` average:
+Each response-specific transition compares `B` with `B_mr`, where the same player is again to move, and is decomposed with the finite midpoint formulas. The candidate row stores the full-response probability average:
 
 ```math
 \Delta U_m\approx\Delta Q_m+\Delta W_m+\Delta A_m.
 ```
 
-This top-`K` renormalization is deliberately local to candidate thermodynamic diagnostics. Ordinary `accurate` and `cheap` adaptive search still use their existing omitted-probability-mass rules and do not discard or renormalize mass in this way.
+Fields named `candidate_delta_u`, `delta_u`, `candidate_delta_q`, `candidate_delta_w`, `candidate_delta_a`, `expected_next_U`, `U_current`, and `U_after_move` follow this full-response predicted-candidate definition. `response_K` is the selected reply count for refinement diagnostics, and stored response probabilities remain the original `q(r|B_m)`. `branch_value` remains the internal `O_m` term used in `U(B)=sum p_m O_m`.
 
-Fields named `candidate_delta_u`, `delta_u`, `candidate_delta_q`, `candidate_delta_w`, `candidate_delta_a`, `expected_next_U`, `U_current`, and `U_after_move` follow this conditional predicted-candidate definition. `response_K` is the selected reply count, and each stored response probability is the renormalized `\widetilde q`. `branch_value` remains the internal `O_m` term used in `U(B)=sum p_m O_m`.
+For performance, candidate scoring is split from detailed thermodynamic diagnostics. The `candidate_thermo_mode` option controls which candidates receive response-level `delta_Q`, `delta_W`, and `delta_A` records:
+
+| Mode | Meaning |
+|---|---|
+| `selected` | Only the final chosen move is enriched. Fastest mode. |
+| `refined` | Root top-`K` candidates plus the final chosen move are enriched. This is the default. |
+| `all` | Every legal candidate is enriched for debugging/research. |
+
+Non-enriched candidates still have `expected_next_U` and `candidate_delta_u`, but their detailed `candidate_delta_q`, `candidate_delta_w`, `candidate_delta_a`, and response records may be null/empty. Detailed enrichment is diagnostic and does not change the selected move. The command-line flag is `--candidate-thermo-mode selected|refined|all`.
 
 Final move selection is:
 
 ```math
-m_W^*=\arg\max_m O_m^{(d)}(B),
+m_W^*=\arg\max_m \Delta U_{\mathrm{candidate}}(m;B),
 ```
 
 ```math
-m_B^*=\arg\min_m O_m^{(d)}(B).
+m_B^*=\arg\min_m \Delta U_{\mathrm{candidate}}(m;B).
 ```
 
 The viewer ranks each observer's estimate of the side-to-move's best action:
@@ -844,6 +855,7 @@ preserved without adding a pseudo-move to ordinary chess move generation.
 | Cycle depth (`cdepth`) | `1` |
 | Search mode | `accurate` |
 | Adaptive breadth `c` | `0.3` |
+| Candidate thermo mode | `refined` |
 | Match name | `thermo_match` |
 | Stop on actual threefold repetition | Yes |
 | Stop on mate or stalemate | Yes |
@@ -951,6 +963,7 @@ conda run -n chess env PYTHONPATH=src python scripts/run_match.py \
 | `--adaptive-c X` | `0.3` | Breadth fraction in $K=\lceil cN_{\mathrm{eff}}\rceil$. Must be positive. `K` is still clipped to legal moves and at least one. |
 | `--search-workers N` | `1` | Process workers for independent root own-move branches. Use `1` for fully serial search or `auto` for CPU-based worker count. |
 | `--parallel-min-branches N` | `8` | Minimum root branch count before worker parallelism activates. |
+| `--candidate-thermo-mode MODE` | `refined` | Detailed Q/W/A diagnostics. Choices: `selected`, `refined`, `all`. |
 | `--name TEXT` | `thermo_match` | Base filename for CSV, JSON, and PGN outputs. |
 | `--ignore-threefold` | Off | Continue through actual threefold repetition instead of stopping there. |
 | `--allow-draw-claims` | Off | Requests broader draw-claim stopping. In the current control flow it takes effect for non-mate/stalemate draw handling when used with `--ignore-threefold`. |
@@ -1003,7 +1016,7 @@ For each position the viewer shows:
 - board, FEN, side to move, move history, and static `E(B)`;
 - configured `cdepth`, search mode, and `c`;
 - adaptive `U(B)`, entropy, $N_{\mathrm{eff}}$, `K`, response `K'`, and branch values for the actual decision side;
-- actual-side ranks, probabilities, conditional top-`K` expected next `U`, candidate `deltaU`, and candidate `deltaQ/deltaW/deltaA`; the opposite counterfactual side is marked unavailable unless generated separately;
+- actual-side ranks, probabilities, full-response expected next `U`, candidate `deltaU`, and candidate `deltaQ/deltaW/deltaA`; the opposite counterfactual side is marked unavailable unless generated separately;
 - shared move and $E(B_m)$ columns aligned across both observers;
 - completed same-player cycle cards for realized game-level cycle $\Delta U$, $\Delta Q$, $\Delta W$, and $\Delta A$;
 - old/new effective move counts, old/new `K`, common support data, and common probability mass.
@@ -1018,8 +1031,8 @@ The CSV contains one row per played ply. Important fields include:
 |---|---|
 | `E_before`, `E_after` | Universal static evaluations before and after the move. |
 | `U_current` | Moving observer's adaptive value of the current board. |
-| `U_after_move` | Selected candidate's conditional predicted next value `expected_next_U`. |
-| `delta_u`, `candidate_delta_u` | Conditional top-`K` predicted next value minus current adaptive value. |
+| `U_after_move` | Selected candidate's full-response predicted next value `expected_next_U`. |
+| `delta_u`, `candidate_delta_u` | Full-response predicted next value minus current adaptive value. |
 | `U_before`, `U_after`, `delta_U`, `cycle_delta_U` | Completed same-player cycle values, aligned to the later decision state. Null for the first state of each player. |
 | `delta_Q`, `delta_W`, `delta_A` | Heat/work/accessibility decomposition of the completed same-player cycle. Null until that player has a previous decision state. |
 | `decomposition_error` | `delta_U - (delta_Q + delta_W + delta_A)`. |
@@ -1052,7 +1065,7 @@ The JSON is the complete result and contains:
 - `thermodynamic_transitions`: same-player heat/work/accessibility records aligned to the later turn;
 - `viewer_states`: ready-to-render panels for every board position, including the completed same-player cycle transition visible at that state when available.
 
-Candidate diagnostics include whether each move belonged to the root top-$K$ set, plus the candidate-response entropy, `response_N_eff`, conditional `response_K`, and the renormalized top-`K` response records used for `expected_next_U` and candidate `deltaQ/deltaW/deltaA`. `viewer_states` duplicate stored search-result summary values intentionally so browser navigation requires no model computation.
+Candidate diagnostics include whether each move belonged to the root top-$K$ set, plus `response_N_eff`, `response_K`, and, when that candidate was enriched by `candidate_thermo_mode`, the response records used for candidate `deltaQ/deltaW/deltaA`. `viewer_states` duplicate stored search-result summary values intentionally so browser navigation requires no model computation.
 
 ### PGN
 

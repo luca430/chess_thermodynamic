@@ -47,6 +47,25 @@ INITIAL_MAJOR_SQUARES = {
 }
 
 
+@dataclass(frozen=True)
+class BoardFeatureContext:
+    material_by_side: Dict[chess.Color, float]
+    material_balance: float
+    material_exposure_by_side: Dict[chess.Color, float]
+    mobility_by_side: Dict[chess.Color, int]
+    legal_king_moves_by_side: Dict[chess.Color, int]
+    king_pressure_by_side: Dict[chess.Color, float]
+    king_safety_by_side: Dict[chess.Color, float]
+    center_by_side: Dict[chess.Color, float]
+    castling_rights_by_side: Dict[chess.Color, int]
+    development_by_side: Dict[chess.Color, float]
+    game_phase: float
+    phase_weights: tuple[float, float, float]
+
+    def material_for_side(self, side: chess.Color) -> float:
+        return self.material_by_side[side] - self.material_by_side[not side]
+
+
 def material(board: chess.Board, color: chess.Color) -> float:
     return sum(
         len(board.pieces(piece_type, color)) * value
@@ -288,6 +307,69 @@ def phase_weights(phase: float) -> tuple[float, float, float]:
     return 1.0 - g, 4.0 * g * (1.0 - g), g
 
 
+def board_context(board: chess.Board) -> BoardFeatureContext:
+    """Compute reusable board-level quantities for move features and E(B)."""
+
+    material_by_side = {
+        chess.WHITE: material(board, chess.WHITE),
+        chess.BLACK: material(board, chess.BLACK),
+    }
+    exposure_by_side = {
+        chess.WHITE: material_exposure(board, chess.WHITE),
+        chess.BLACK: material_exposure(board, chess.BLACK),
+    }
+    mobility_by_side = {
+        chess.WHITE: legal_mobility(board, chess.WHITE),
+        chess.BLACK: legal_mobility(board, chess.BLACK),
+    }
+    legal_king_moves_by_side = {
+        chess.WHITE: legal_king_moves(board, chess.WHITE),
+        chess.BLACK: legal_king_moves(board, chess.BLACK),
+    }
+    king_pressure_by_side = {
+        chess.WHITE: king_pressure(board, chess.WHITE),
+        chess.BLACK: king_pressure(board, chess.BLACK),
+    }
+    king_safety_by_side = {
+        chess.WHITE: king_safety(board, chess.WHITE),
+        chess.BLACK: king_safety(board, chess.BLACK),
+    }
+    center_by_side = {
+        chess.WHITE: attacked_center_score(board, chess.WHITE),
+        chess.BLACK: attacked_center_score(board, chess.BLACK),
+    }
+    castling_rights_by_side = {
+        chess.WHITE: castling_rights_count(board, chess.WHITE),
+        chess.BLACK: castling_rights_count(board, chess.BLACK),
+    }
+    development_by_side = {
+        chess.WHITE: side_development(board, chess.WHITE),
+        chess.BLACK: side_development(board, chess.BLACK),
+    }
+    phase = min(
+        1.0,
+        max(
+            0.0,
+            0.5
+            * (development_by_side[chess.WHITE] + development_by_side[chess.BLACK]),
+        ),
+    )
+    return BoardFeatureContext(
+        material_by_side=material_by_side,
+        material_balance=material_by_side[chess.WHITE] - material_by_side[chess.BLACK],
+        material_exposure_by_side=exposure_by_side,
+        mobility_by_side=mobility_by_side,
+        legal_king_moves_by_side=legal_king_moves_by_side,
+        king_pressure_by_side=king_pressure_by_side,
+        king_safety_by_side=king_safety_by_side,
+        center_by_side=center_by_side,
+        castling_rights_by_side=castling_rights_by_side,
+        development_by_side=development_by_side,
+        game_phase=phase,
+        phase_weights=phase_weights(phase),
+    )
+
+
 @dataclass(frozen=True)
 class MoveFeatureConfig:
     mobility_scale: float = 30.0
@@ -299,6 +381,9 @@ def move_features(
     board: chess.Board,
     move: chess.Move,
     config: MoveFeatureConfig | None = None,
+    before_context: BoardFeatureContext | None = None,
+    after_context: BoardFeatureContext | None = None,
+    after_board: chess.Board | None = None,
 ) -> Dict[str, float]:
     """Features from the perspective of the side actually making `move`.
 
@@ -310,50 +395,54 @@ def move_features(
     config = config or MoveFeatureConfig()
     color = board.turn
     enemy = not color
-    before_material = material_for_side(board, color)
-    before_exposure = material_exposure(board, color)
-    before_enemy_king_moves = legal_king_moves(board, enemy)
-    before_king_pressure = king_pressure(board, color)
-    before_mobility = legal_mobility(board, color)
-    before_enemy_mobility = legal_mobility(board, enemy)
-    before_center = attacked_center_score(board, color)
-    before_king = king_safety(board, color)
-    before_castling = castling_rights_count(board, color)
-    before_enemy_castling = castling_rights_count(board, enemy)
-    before_development = side_development(board, color)
-    phase = game_phase(board)
-    development_weight, castle_weight, attack_weight = phase_weights(phase)
+    before = before_context or board_context(board)
+    before_material = before.material_for_side(color)
+    before_exposure = before.material_exposure_by_side[color]
+    before_enemy_king_moves = before.legal_king_moves_by_side[enemy]
+    before_king_pressure = before.king_pressure_by_side[color]
+    before_mobility = before.mobility_by_side[color]
+    before_enemy_mobility = before.mobility_by_side[enemy]
+    before_center = before.center_by_side[color]
+    before_king = before.king_safety_by_side[color]
+    before_castling = before.castling_rights_by_side[color]
+    before_enemy_castling = before.castling_rights_by_side[enemy]
+    before_development = before.development_by_side[color]
+    phase = before.game_phase
+    development_weight, castle_weight, attack_weight = before.phase_weights
     is_castling = board.is_castling(move)
 
     promotion = 0.0
     if move.promotion:
         promotion = PIECE_VALUES[move.promotion] - PIECE_VALUES[chess.PAWN]
 
-    after = board.copy(stack=False)
-    after.push(move)
-    material_delta = material_for_side(after, color) - before_material
-    preservation = before_exposure - material_exposure(after, color)
-    king_restriction = before_enemy_king_moves - legal_king_moves(after, enemy)
-    pressure = king_pressure(after, color) - before_king_pressure
+    after = after_board
+    if after is None:
+        after = board.copy(stack=False)
+        after.push(move)
+    after_values = after_context or board_context(after)
+    material_delta = after_values.material_for_side(color) - before_material
+    preservation = before_exposure - after_values.material_exposure_by_side[color]
+    king_restriction = before_enemy_king_moves - after_values.legal_king_moves_by_side[enemy]
+    pressure = after_values.king_pressure_by_side[color] - before_king_pressure
 
-    after_mobility = legal_mobility(after, color)
-    after_enemy_mobility = legal_mobility(after, enemy)
+    after_mobility = after_values.mobility_by_side[color]
+    after_enemy_mobility = after_values.mobility_by_side[enemy]
     activity = (
         (after_mobility - before_mobility)
         - 0.5 * (after_enemy_mobility - before_enemy_mobility)
     ) / config.mobility_scale
 
-    center = (attacked_center_score(after, color) - before_center) / config.center_scale
-    king = (king_safety(after, color) - before_king) / max(config.king_safety_scale, 1e-12)
-    castle_preserve = float(castling_rights_count(after, color) - before_castling)
+    center = (after_values.center_by_side[color] - before_center) / config.center_scale
+    king = (after_values.king_safety_by_side[color] - before_king) / max(config.king_safety_scale, 1e-12)
+    castle_preserve = float(after_values.castling_rights_by_side[color] - before_castling)
     if is_castling:
         castle_preserve = 0.0
     castle_deny = float(
-        before_enemy_castling - castling_rights_count(after, enemy)
+        before_enemy_castling - after_values.castling_rights_by_side[enemy]
     )
     castle = 1.0 if is_castling else 0.0
     development_feature = (
-        side_development(after, color) - before_development + max(0.0, activity)
+        after_values.development_by_side[color] - before_development + max(0.0, activity)
     )
     phase_castle_feature = castle + king
     phase_attack_feature = activity + pressure + float(king_restriction) + (
@@ -384,15 +473,24 @@ def move_features(
     }
 
 
-def white_minus_black_features(board: chess.Board) -> Dict[str, float]:
+def white_minus_black_features(
+    board: chess.Board, context: BoardFeatureContext | None = None
+) -> Dict[str, float]:
+    values = context or board_context(board)
     return {
-        "material": material_balance(board),
-        "mobility": (legal_mobility(board, chess.WHITE) - legal_mobility(board, chess.BLACK))
+        "material": values.material_balance,
+        "mobility": (
+            values.mobility_by_side[chess.WHITE]
+            - values.mobility_by_side[chess.BLACK]
+        )
         / 30.0,
-        "king_safety": king_safety(board, chess.WHITE) - king_safety(board, chess.BLACK),
+        "king_safety": (
+            values.king_safety_by_side[chess.WHITE]
+            - values.king_safety_by_side[chess.BLACK]
+        ),
         "center": (
-            attacked_center_score(board, chess.WHITE)
-            - attacked_center_score(board, chess.BLACK)
+            values.center_by_side[chess.WHITE]
+            - values.center_by_side[chess.BLACK]
         )
         / 6.0,
     }

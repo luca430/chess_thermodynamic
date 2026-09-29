@@ -9,7 +9,7 @@ import chess
 
 from .evaluation import StaticEvaluator
 from .measure import MoveLandscape, Style
-from .search import AdaptiveDepthThresholds, AdaptiveExpectedValue, PositionKey, SearchMode, SearchResult, MoveEvaluation
+from .search import AdaptiveDepthThresholds, AdaptiveExpectedValue, CandidateThermoMode, PositionKey, SearchMode, SearchResult, MoveEvaluation
 
 
 @dataclass(frozen=True)
@@ -102,6 +102,7 @@ class ThermoPlayer:
     search_mode: SearchMode = "accurate"
     search_workers: int | None = 1
     parallel_min_branches: int = 8
+    candidate_thermo_mode: CandidateThermoMode = "refined"
     depth: int | None = None
     _search: AdaptiveExpectedValue | None = field(default=None, init=False, repr=False, compare=False)
     _evaluator_id: int | None = field(default=None, init=False, repr=False, compare=False)
@@ -121,6 +122,8 @@ class ThermoPlayer:
             raise ValueError("search_workers must be at least 1")
         if self.parallel_min_branches < 1:
             raise ValueError("parallel_min_branches must be at least 1")
+        if self.candidate_thermo_mode not in {"selected", "refined", "all"}:
+            raise ValueError("candidate_thermo_mode must be 'selected', 'refined', or 'all'")
 
     def search(self, evaluator: StaticEvaluator) -> AdaptiveExpectedValue:
         if self._search is None or self._evaluator_id != id(evaluator):
@@ -134,6 +137,7 @@ class ThermoPlayer:
                 search_mode=self.search_mode,
                 search_workers=self.search_workers,
                 parallel_min_branches=self.parallel_min_branches,
+                candidate_thermo_mode=self.candidate_thermo_mode,
             )
             self._evaluator_id = id(evaluator)
             self._analysis_cache.clear()

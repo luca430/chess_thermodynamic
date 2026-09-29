@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List
+from typing import Callable, Dict, Iterable, List
 
 import chess
 
 from .evaluation import StaticEvaluator
-from .features import move_features
+from .features import BoardFeatureContext, board_context, move_features
 from .metrics import effective_number, entropy
 
 
@@ -182,10 +182,14 @@ def move_distribution(
     style: Style,
     beta: float,
     evaluator: StaticEvaluator,
+    before_context: BoardFeatureContext | None = None,
+    context_provider: Callable[[chess.Board], BoardFeatureContext] | None = None,
 ) -> MoveLandscape:
+    context_for = context_provider or board_context
+    before = before_context or context_for(board)
     legal_moves = list(board.legal_moves)
     if not legal_moves:
-        value = evaluator.evaluate(board)
+        value = evaluator.evaluate(board, context=before)
         return MoveLandscape(
             fen=board.fen(),
             turn="white" if board.turn == chess.WHITE else "black",
@@ -196,21 +200,36 @@ def move_distribution(
             expected_value=value,
         )
 
-    features_by_move = [move_features(board, move) for move in legal_moves]
+    after_boards = []
+    after_contexts = []
+    features_by_move = []
+    for move in legal_moves:
+        after = board.copy(stack=False)
+        after.push(move)
+        after_values = context_for(after)
+        after_boards.append(after)
+        after_contexts.append(after_values)
+        features_by_move.append(
+            move_features(
+                board,
+                move,
+                before_context=before,
+                after_context=after_values,
+                after_board=after,
+            )
+        )
     components = [potential_components(style, features) for features in features_by_move]
     phis = [total for _, _, total in components]
     probabilities = stable_softmax(phis, beta)
 
     records: List[MoveRecord] = []
     expected = 0.0
-    for move, features, (base_phi, phase_phi, phi), probability in zip(
-        legal_moves, features_by_move, components, probabilities
+    for move, after, after_values, features, (base_phi, phase_phi, phi), probability in zip(
+        legal_moves, after_boards, after_contexts, features_by_move, components, probabilities
     ):
         features = {**features, **castle_preserve_diagnostics(style, features)}
         san = board.san(move)
-        after = board.copy(stack=False)
-        after.push(move)
-        static_after = evaluator.evaluate(after)
+        static_after = evaluator.evaluate(after, context=after_values)
         expected += probability * static_after
         records.append(
             MoveRecord(
