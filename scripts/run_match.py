@@ -53,6 +53,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--beta-white", type=float, default=4.0)
     parser.add_argument("--beta-black", type=float, default=4.0)
+    parser.add_argument("--kappa", type=positive_float, default=1.0, help="Boltzmann-like constant in pawn units (default: 1.0).")
     parser.add_argument(
         "--white-strategy",
         choices=STRATEGY_NAMES,
@@ -103,6 +104,7 @@ def main() -> None:
             seed=args.seed,
             beta_white=args.beta_white,
             beta_black=args.beta_black,
+            kappa=args.kappa,
             white_strategy=args.white_strategy,
             black_strategy=args.black_strategy,
             white_solidness=args.solidness_white,

@@ -2,7 +2,16 @@
 
 from .evaluation import EvaluationWeights, StaticEvaluator
 from .features import game_phase, phase_weights
-from .measure import MoveLandscape, Style, entropy, move_distribution
+from .measure import (
+    KAPPA,
+    MoveLandscape,
+    Style,
+    beta_from_temperature,
+    entropy,
+    move_distribution,
+    strategy_weights,
+    temperature_from_beta,
+)
 from .player import ThermoPlayer
 from .search import (
     AdaptiveBranchObservation,
@@ -26,6 +35,7 @@ __all__ = [
     "AdaptiveBranchObservation",
     "AdaptiveDepthThresholds",
     "MatchConfig",
+    "KAPPA",
     "MoveLandscape",
     "StaticEvaluator",
     "Style",
@@ -37,6 +47,7 @@ __all__ = [
     "RefinementPolicy",
     "ThermoPlayer",
     "TransitionDecomposition",
+    "beta_from_temperature",
     "entropy",
     "game_phase",
     "adaptive_breadth",
@@ -46,5 +57,7 @@ __all__ = [
     "move_distribution",
     "phase_weights",
     "simulate_match",
+    "strategy_weights",
+    "temperature_from_beta",
     "strategy_style",
 ]

@@ -4,13 +4,46 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, List
+from typing import Callable, Dict, Iterable, List, Mapping
 
 import chess
 
 from .evaluation import StaticEvaluator
 from .features import BoardFeatureContext, board_context, move_features
 from .metrics import effective_number, entropy
+
+KAPPA = 1.0
+STRATEGY_FEATURES = (
+    "material",
+    "preservation",
+    "activity",
+    "king_safety",
+    "king_restriction",
+    "king_pressure",
+    "center",
+    "check",
+    "promotion",
+    "castle_preserve",
+    "castle_deny",
+    "castle",
+    "development",
+)
+FEATURE_ENERGY_SCALES = {
+    "material": 1.0,
+    "preservation": 1.0,
+    "activity": 1.0,
+    "king_safety": 1.0,
+    "king_restriction": 0.12,
+    "king_pressure": 0.08,
+    "center": 1.0,
+    "check": 0.35,
+    "promotion": 1.0,
+    "castle_preserve": 0.35,
+    "castle_deny": 0.25,
+    "castle": 0.45,
+    "development": 0.4,
+}
+
 
 
 @dataclass(frozen=True)
@@ -97,6 +130,7 @@ class MoveLandscape:
     entropy: float
     effective_moves: float
     expected_value: float
+    kappa: float = KAPPA
 
     def as_dict(self) -> Dict[str, object]:
         return {
@@ -106,66 +140,127 @@ class MoveLandscape:
             "entropy": self.entropy,
             "effective_moves": self.effective_moves,
             "expected_value": self.expected_value,
+            "kappa": self.kappa,
+            "temperature": temperature_from_beta(self.beta, self.kappa),
             "moves": [record.as_dict() for record in self.records],
         }
 
 
+def _clip(value: float, low: float = -2.0, high: float = 2.0) -> float:
+    return min(high, max(low, value))
+
+
+def beta_from_temperature(temperature: float, kappa: float = KAPPA) -> float:
+    if kappa <= 0.0:
+        raise ValueError("kappa must be greater than 0")
+    if temperature <= 0.0:
+        raise ValueError("temperature must be greater than 0")
+    return 1.0 / (kappa * temperature)
+
+
+def temperature_from_beta(beta: float, kappa: float = KAPPA) -> float:
+    if kappa <= 0.0:
+        raise ValueError("kappa must be greater than 0")
+    if beta <= 0.0:
+        raise ValueError("beta must be greater than 0")
+    return 1.0 / (kappa * beta)
+
+
+def feature_energy_values(features: Mapping[str, float]) -> Dict[str, float]:
+    """Move features as pawn-equivalent energy increments entering Phi."""
+
+    energies: Dict[str, float] = {}
+    for name in STRATEGY_FEATURES:
+        value = float(features.get(name, 0.0))
+        scaled = value * FEATURE_ENERGY_SCALES[name]
+        if name not in {"material", "preservation"}:
+            scaled = _clip(scaled)
+        energies[name] = scaled
+    return energies
+
+
+def strategy_weights(
+    style: Style,
+    features: Mapping[str, float] | None = None,
+    *,
+    phase_modulated: bool = True,
+) -> Dict[str, float]:
+    """Return active non-terminal strategy weights normalized to sum to one."""
+
+    raw = style.as_dict()
+    phase = 0.0 if features is None else float(features.get("game_phase", 0.0))
+    phase = min(1.0, max(0.0, phase))
+    if features is None:
+        development_phase, castle_phase, attack_phase = 1.0 - phase, 4.0 * phase * (1.0 - phase), phase
+    else:
+        development_phase = float(features.get("development_phase_weight", 1.0 - phase))
+        castle_phase = float(features.get("castle_phase_weight", 4.0 * phase * (1.0 - phase)))
+        attack_phase = float(features.get("attack_phase_weight", phase))
+
+    weights: Dict[str, float] = {}
+    for name in STRATEGY_FEATURES:
+        baseline = max(0.0, float(raw.get(name, 0.0)))
+        factor = 1.0
+        if phase_modulated:
+            if name == "development":
+                factor *= 1.0 + style.solidness * development_phase
+            elif name in {"castle", "castle_preserve", "castle_deny", "king_safety"}:
+                factor *= 1.0 + style.solidness * style.phase_castle * castle_phase
+                if name == "castle_preserve":
+                    factor *= max(0.15, 1.0 - phase)
+            elif name in {"activity", "king_restriction", "king_pressure", "check"}:
+                factor *= 1.0 + style.solidness * style.phase_attack * attack_phase
+        weights[name] = baseline * factor
+
+    total = sum(weights.values())
+    if total <= 0.0:
+        return {name: 0.0 for name in STRATEGY_FEATURES}
+    return {name: value / total for name, value in weights.items()}
+
+
 def castle_preserve_diagnostics(style: Style, features: Dict[str, float]) -> Dict[str, float]:
     raw = features.get("castle_preserve", 0.0)
-    phase = min(1.0, max(0.0, features.get("game_phase", 0.0)))
-    rights_weight = 1.0 - phase
-    castle_phase_weight = features.get("castle_phase_weight", 0.0)
-    effective_weight = (
-        style.castle_preserve
-        * rights_weight
-        * (1.0 + style.solidness * castle_phase_weight)
-    )
+    energies = feature_energy_values(features)
+    weights = strategy_weights(style, features)
+    effective_weight = weights.get("castle_preserve", 0.0)
     return {
         "castle_preserve_raw": raw,
-        "castle_preserve_phase_weight": rights_weight,
+        "castle_preserve_phase_weight": max(0.15, 1.0 - min(1.0, max(0.0, features.get("game_phase", 0.0)))),
         "castle_preserve_effective_weight": effective_weight,
-        "castle_preserve_contribution": effective_weight * raw,
+        "castle_preserve_energy": energies.get("castle_preserve", 0.0),
+        "castle_preserve_contribution": effective_weight * energies.get("castle_preserve", 0.0),
     }
 
 
 def potential_components(style: Style, features: Dict[str, float]) -> tuple[float, float, float]:
-    weights = style.as_dict()
-    special_parameters = {
-        "development",
-        "phase_castle",
-        "phase_attack",
-        "solidness",
-        "castle_preserve",
-        "castle_preserve_raw",
-        "castle_preserve_phase_weight",
-        "castle_preserve_effective_weight",
-        "castle_preserve_contribution",
-    }
-    castle_terms = castle_preserve_diagnostics(style, features)
-    base = sum(
-        weights.get(name, 0.0) * value
-        for name, value in features.items()
-        if name not in special_parameters
-    ) + castle_terms["castle_preserve_contribution"]
-    phase = (
-        style.development
-        * features.get("development_phase_weight", 0.0)
-        * features.get("development_feature", 0.0)
-        + style.phase_castle
-        * features.get("castle_phase_weight", 0.0)
-        * features.get("phase_castle_feature", 0.0)
-        + style.phase_attack
-        * features.get("attack_phase_weight", 0.0)
-        * features.get("phase_attack_feature", 0.0)
-    )
-    return base, phase, base + style.solidness * phase
+    energies = feature_energy_values(features)
+    base_weights = strategy_weights(style, features, phase_modulated=False)
+    phase_weights = strategy_weights(style, features, phase_modulated=True)
+    base = sum(base_weights[name] * energies[name] for name in STRATEGY_FEATURES)
+    modulated = sum(phase_weights[name] * energies[name] for name in STRATEGY_FEATURES)
+    mate = max(0.0, style.mate) * float(features.get("mate", 0.0))
+    return base, modulated - base, modulated + mate
 
 
 def potential(style: Style, features: Dict[str, float]) -> float:
     return potential_components(style, features)[2]
 
 
-def stable_softmax(values: Iterable[float], beta: float) -> List[float]:
+def boltzmann_probabilities(
+    values: Iterable[float],
+    *,
+    beta: float | None = None,
+    temperature: float | None = None,
+    kappa: float = KAPPA,
+) -> List[float]:
+    if beta is None:
+        if temperature is None:
+            raise ValueError("either beta or temperature must be provided")
+        beta = beta_from_temperature(temperature, kappa)
+    elif beta <= 0.0:
+        raise ValueError("beta must be greater than 0")
+    if kappa <= 0.0:
+        raise ValueError("kappa must be greater than 0")
     scaled = [beta * value for value in values]
     if not scaled:
         return []
@@ -177,6 +272,10 @@ def stable_softmax(values: Iterable[float], beta: float) -> List[float]:
     return [value / normalizer for value in exp_values]
 
 
+def stable_softmax(values: Iterable[float], beta: float) -> List[float]:
+    return boltzmann_probabilities(values, beta=beta, kappa=KAPPA)
+
+
 def move_distribution(
     board: chess.Board,
     style: Style,
@@ -185,6 +284,7 @@ def move_distribution(
     before_context: BoardFeatureContext | None = None,
     context_provider: Callable[[chess.Board], BoardFeatureContext] | None = None,
     value_objective_weight: float = 0.0,
+    kappa: float = KAPPA,
 ) -> MoveLandscape:
     context_for = context_provider or board_context
     before = before_context or context_for(board)
@@ -199,6 +299,7 @@ def move_distribution(
             entropy=0.0,
             effective_moves=0.0,
             expected_value=value,
+            kappa=kappa,
         )
 
     after_boards = []
@@ -229,7 +330,7 @@ def move_distribution(
         total + value_objective_weight * side_sign * static_after
         for (_, _, total), static_after in zip(components, static_values)
     ]
-    probabilities = stable_softmax(phis, beta)
+    probabilities = boltzmann_probabilities(phis, beta=beta, kappa=kappa)
 
     records: List[MoveRecord] = []
     expected = 0.0
@@ -262,4 +363,5 @@ def move_distribution(
         entropy=s,
         effective_moves=effective_number(s),
         expected_value=expected,
+        kappa=kappa,
     )

@@ -13,11 +13,42 @@ import chess
 import chess.pgn
 
 from .evaluation import EvaluationWeights, StaticEvaluator
-from .measure import Style
+from .features import PIECE_VALUES, material_balance
+from .measure import KAPPA, Style
 from .player import ThermoPlayer
 from .search import AdaptiveDepthThresholds, CandidateThermoMode, RefinementPolicy, SearchMode, SearchResult
 from .thermodynamics import decompose_transition
 
+
+
+_CAPTURE_BASE_COUNTS = {
+    chess.PAWN: 8,
+    chess.KNIGHT: 2,
+    chess.BISHOP: 2,
+    chess.ROOK: 2,
+    chess.QUEEN: 1,
+}
+
+
+def captured_material(board: chess.Board) -> Dict[str, object]:
+    def side_payload(captured_color: chess.Color) -> Dict[str, object]:
+        pieces = {}
+        value = 0.0
+        for piece_type, initial in _CAPTURE_BASE_COUNTS.items():
+            count = max(0, initial - len(board.pieces(piece_type, captured_color)))
+            symbol = chess.piece_symbol(piece_type)
+            pieces[symbol.upper()] = count
+            value += count * PIECE_VALUES[piece_type]
+        return {"pieces": pieces, "value": value}
+
+    balance = material_balance(board)
+    return {
+        "white": side_payload(chess.BLACK),
+        "black": side_payload(chess.WHITE),
+        "balance": balance,
+        "white_advantage": max(0.0, balance),
+        "black_advantage": max(0.0, -balance),
+    }
 
 STRATEGY_NAMES = (
     "material_conservative",
@@ -33,6 +64,7 @@ class MatchConfig:
     seed: int = 1
     beta_white: float = 4.0
     beta_black: float = 4.0
+    kappa: float = KAPPA
     white_strategy: str = "material_conservative"
     black_strategy: str = "activity_aggressive"
     white_solidness: float | None = None
@@ -60,6 +92,8 @@ class MatchConfig:
         if self.depth is not None:
             self.cdepth = self.depth
         self.depth = self.cdepth
+        if self.kappa <= 0.0:
+            raise ValueError("kappa must be greater than 0")
         if self.cdepth < 0:
             raise ValueError("cdepth must be at least 0")
         if self.search_mode != "accurate":
@@ -386,6 +420,7 @@ def _viewer_state(
         "fen": board.fen(),
         "turn": _side_name(board.turn),
         "static_evaluation": evaluator.evaluate(board),
+        "captured_material": captured_material(board),
         "prediction_error": previous_row.get("prediction_error") if previous_row else None,
         "is_game_over": is_game_over,
         "result": board.result(claim_draw=False) if is_game_over else "*",
@@ -433,6 +468,7 @@ def simulate_match(
         config.parallel_min_branches,
         config.candidate_thermo_mode,
         config.refinement_policy,
+        kappa=config.kappa,
     )
     black = ThermoPlayer(
         "Black custom" if black_style is not None else f"Black {config.black_strategy.replace('_', ' ')}",
@@ -447,6 +483,7 @@ def simulate_match(
         config.parallel_min_branches,
         config.candidate_thermo_mode,
         config.refinement_policy,
+        kappa=config.kappa,
     )
     players = {chess.WHITE: white, chess.BLACK: black}
 

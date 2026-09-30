@@ -8,7 +8,7 @@ from typing import Dict, Optional
 import chess
 
 from .evaluation import StaticEvaluator
-from .measure import MoveLandscape, Style
+from .measure import KAPPA, MoveLandscape, Style
 from .search import AdaptiveDepthThresholds, AdaptiveExpectedValue, CandidateThermoMode, MoveEvaluation, PositionKey, RefinementPolicy, SearchMode, SearchResult
 
 
@@ -104,6 +104,7 @@ class ThermoPlayer:
     parallel_min_branches: int = 8
     candidate_thermo_mode: CandidateThermoMode = "refined"
     refinement_policy: RefinementPolicy = "static_eval"
+    kappa: float = KAPPA
     depth: int | None = None
     _search: AdaptiveExpectedValue | None = field(default=None, init=False, repr=False, compare=False)
     _evaluator_id: int | None = field(default=None, init=False, repr=False, compare=False)
@@ -113,6 +114,8 @@ class ThermoPlayer:
         if self.depth is not None:
             self.cdepth = self.depth
         self.depth = self.cdepth
+        if self.kappa <= 0.0:
+            raise ValueError("kappa must be greater than 0")
         if self.cdepth < 0:
             raise ValueError("cdepth must be at least 0")
         if self.adaptive_c <= 0.0:
@@ -134,6 +137,7 @@ class ThermoPlayer:
                 self.style,
                 self.beta,
                 evaluator,
+                kappa=self.kappa,
                 cdepth=self.cdepth,
                 adaptive_c=self.adaptive_c,
                 depth_thresholds=self.depth_thresholds,

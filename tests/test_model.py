@@ -9,7 +9,17 @@ import pytest
 
 from thermo_chess.evaluation import EvaluationWeights, StaticEvaluator
 from thermo_chess.features import board_context, game_phase, move_features, phase_weights, piece_exposure
-from thermo_chess.measure import Style, move_distribution, potential, potential_components
+from thermo_chess.measure import (
+    KAPPA,
+    Style,
+    beta_from_temperature,
+    boltzmann_probabilities,
+    move_distribution,
+    potential,
+    potential_components,
+    strategy_weights,
+    temperature_from_beta,
+)
 from thermo_chess.metrics import effective_number, entropy
 from thermo_chess.player import ThermoPlayer
 from thermo_chess.search import (
@@ -26,6 +36,7 @@ from thermo_chess.simulation import (
     MatchConfig,
     _terminal_result,
     _termination_reason,
+    captured_material,
     default_match_name,
     simulate_match,
     strategy_style,
@@ -110,6 +121,85 @@ def test_terminal_positions() -> None:
     assert evaluator.evaluate(black_mated) > 9000
     assert stalemate.is_stalemate()
     assert evaluator.evaluate(stalemate) == 0.0
+
+
+def test_static_evaluation_material_unit_is_pawns() -> None:
+    evaluator = StaticEvaluator(
+        EvaluationWeights(
+            material=1.0,
+            exposure=0.0,
+            mobility=0.0,
+            king_safety=0.0,
+            center=0.0,
+        )
+    )
+    white_up_rook = chess.Board("4k3/8/8/8/8/8/8/4KR2 w - - 0 1")
+
+    assert evaluator.evaluate(white_up_rook) == pytest.approx(5.0)
+
+
+def test_kappa_is_explicit_and_beta_temperature_are_inverse() -> None:
+    assert KAPPA == pytest.approx(1.0)
+    assert beta_from_temperature(0.25, KAPPA) == pytest.approx(4.0)
+    assert temperature_from_beta(4.0, KAPPA) == pytest.approx(0.25)
+
+
+def test_boltzmann_probabilities_use_phi_over_kappa_temperature() -> None:
+    phis = [0.0, 0.5, 1.0]
+    beta_probs = boltzmann_probabilities(phis, beta=2.0, kappa=1.0)
+    temperature_probs = boltzmann_probabilities(phis, temperature=0.25, kappa=2.0)
+
+    assert beta_probs == pytest.approx(temperature_probs)
+
+
+def test_strategy_weights_sum_to_one_across_phases() -> None:
+    style = strategy_style("positional_controller")
+    for phase in (0.0, 0.25, 0.5, 0.9):
+        weights = strategy_weights(
+            style,
+            {
+                "game_phase": phase,
+                "development_phase_weight": 1.0 - phase,
+                "castle_phase_weight": 4.0 * phase * (1.0 - phase),
+                "attack_phase_weight": phase,
+            },
+        )
+        assert sum(weights.values()) == pytest.approx(1.0)
+        assert "mate" not in weights
+
+
+def test_phase_changes_relative_weights_without_total_rescaling() -> None:
+    style = Style(
+        material=1.0,
+        activity=1.0,
+        development=1.0,
+        king_pressure=1.0,
+        phase_attack=2.0,
+        solidness=1.0,
+    )
+    early = strategy_weights(
+        style,
+        {
+            "game_phase": 0.1,
+            "development_phase_weight": 0.9,
+            "castle_phase_weight": 0.36,
+            "attack_phase_weight": 0.1,
+        },
+    )
+    late = strategy_weights(
+        style,
+        {
+            "game_phase": 0.9,
+            "development_phase_weight": 0.1,
+            "castle_phase_weight": 0.36,
+            "attack_phase_weight": 0.9,
+        },
+    )
+
+    assert sum(early.values()) == pytest.approx(1.0)
+    assert sum(late.values()) == pytest.approx(1.0)
+    assert early["development"] > late["development"]
+    assert late["king_pressure"] > early["king_pressure"]
 
 
 def test_changing_lambda_changes_distribution() -> None:
@@ -252,37 +342,32 @@ def test_search_workers_one_is_serial() -> None:
     assert result.diagnostics["parallel_branches"] == 0
 
 
-def test_value_objective_weight_favors_side_to_move_goal() -> None:
+def test_response_landscape_uses_style_only_probabilities() -> None:
+    board = chess.Board()
+    board.push_san("e4")
     evaluator = StaticEvaluator()
-    zero_style = Style(
-        material=0.0,
-        preservation=0.0,
-        king_restriction=0.0,
-        king_pressure=0.0,
-        check=0.0,
-        mate=0.0,
-        activity=0.0,
-        king_safety=0.0,
-        center=0.0,
-        promotion=0.0,
+    style = _quiet_style()
+    beta = 1.7
+    search = AdaptiveExpectedValue(style, beta, evaluator, cdepth=1)
+
+    response = search.response_landscape(board)
+    plain = move_distribution(board, style, beta, evaluator)
+    objective_weighted = move_distribution(
+        board, style, beta, evaluator, value_objective_weight=1.0
     )
 
-    black_board = chess.Board()
-    black_board.push_san("e4")
-    black_landscape = move_distribution(
-        black_board, zero_style, 1.0, evaluator, value_objective_weight=1.0
-    )
-    black_low = min(black_landscape.records, key=lambda record: record.static_after)
-    black_high = max(black_landscape.records, key=lambda record: record.static_after)
-    assert black_low.probability > black_high.probability
+    response_probabilities = {record.uci: record.probability for record in response.records}
+    plain_probabilities = {record.uci: record.probability for record in plain.records}
+    objective_probabilities = {
+        record.uci: record.probability for record in objective_weighted.records
+    }
 
-    white_board = chess.Board()
-    white_landscape = move_distribution(
-        white_board, zero_style, 1.0, evaluator, value_objective_weight=1.0
+    assert response_probabilities == pytest.approx(plain_probabilities)
+    assert any(
+        abs(response_probabilities[uci] - objective_probabilities[uci]) > 1e-6
+        for uci in response_probabilities
     )
-    white_low = min(white_landscape.records, key=lambda record: record.static_after)
-    white_high = max(white_landscape.records, key=lambda record: record.static_after)
-    assert white_high.probability > white_low.probability
+    assert len({record.static_after for record in response.records}) > 1
 
 
 def test_terminal_result_reports_standard_chess_draw_rules() -> None:
@@ -349,7 +434,7 @@ def test_cdepth_one_accurate_matches_full_move_response_expectation() -> None:
         after = board.copy(stack=False)
         after.push(record.move)
         reply_landscape = move_distribution(
-            after, style, 1.5, evaluator, value_objective_weight=1.0
+            after, style, 1.5, evaluator
         )
         reply_expected = sum(
             reply.probability * reply.static_after for reply in reply_landscape.records
@@ -375,7 +460,7 @@ def test_accurate_mode_preserves_unexpanded_probability_mass() -> None:
         after = board.copy(stack=False)
         after.push(record.move)
         reply_landscape = move_distribution(
-            after, _quiet_style(), 1.0, evaluator, value_objective_weight=1.0
+            after, _quiet_style(), 1.0, evaluator
         )
         branch_value = sum(reply.probability * reply.static_after for reply in reply_landscape.records)
         if record.uci not in selected:
@@ -542,6 +627,69 @@ def test_accurate_mode_does_not_renormalize_or_drop_omitted_replies() -> None:
     assert branch.response_k < len(branch.response_branches)
     assert sum(reply.probability for reply in branch.response_branches) == pytest.approx(1.0)
     assert any(not reply.selected_for_refinement for reply in branch.response_branches)
+
+
+def test_refined_candidate_diagnostics_use_actual_selected_root_moves() -> None:
+    board = chess.Board()
+    evaluator = StaticEvaluator()
+    search = AdaptiveExpectedValue(
+        Style(center=3.0, development=1.0),
+        2.0,
+        evaluator,
+        cdepth=1,
+        adaptive_c=0.2,
+        candidate_thermo_mode="refined",
+    )
+    result = search.search_result(board)
+    selection = search.node_selection(board)
+    assert selection is not None
+
+    detailed = {move.uci for move in result.moves if move.responses}
+
+    assert detailed == set(selection.selected_uci)
+
+
+def test_response_refinement_ranks_and_depth_flags_are_serialized() -> None:
+    board = chess.Board()
+    evaluator = StaticEvaluator()
+    search = AdaptiveExpectedValue(
+        Style(center=3.0, development=1.0),
+        2.0,
+        evaluator,
+        cdepth=1,
+        adaptive_c=0.2,
+        candidate_thermo_mode="refined",
+    )
+    result = search.search_result(board)
+    candidate = next(move for move in result.moves if move.responses)
+    after = board.copy(stack=False)
+    after.push(candidate.move)
+    reply_landscape = search.response_landscape(after)
+    expected = [
+        reply.uci
+        for reply in sorted(reply_landscape.records, key=lambda item: item.static_after)[: candidate.response_K]
+    ]
+    selected = sorted(
+        (response for response in candidate.responses if response.selected_for_refinement),
+        key=lambda response: response.refinement_rank or 999,
+    )
+
+    assert [response.uci for response in selected] == expected
+    assert [response.refinement_rank for response in selected] == list(range(1, len(selected) + 1))
+    assert all(response.depth_used == 0 for response in selected)
+    assert all(response.as_dict()["recursively_deepened"] is False for response in selected)
+    assert candidate.as_dict()["actually_deepened"] is False
+
+
+def test_captured_material_from_current_board_state() -> None:
+    board = chess.Board("4k3/8/8/8/8/8/8/4KQ2 w - - 0 1")
+    captured = captured_material(board)
+
+    assert captured["white"]["pieces"] == {"Q": 1, "R": 2, "B": 2, "N": 2, "P": 8}
+    assert captured["black"]["pieces"] == {"Q": 0, "R": 2, "B": 2, "N": 2, "P": 8}
+    assert captured["balance"] == pytest.approx(9.0)
+    assert captured["white_advantage"] == pytest.approx(9.0)
+    assert captured["black_advantage"] == pytest.approx(0.0)
 
 
 def test_candidate_thermodynamics_averages_all_replies_after_consuming_cycle() -> None:
@@ -714,7 +862,7 @@ def test_refined_candidate_thermo_mode_enriches_delta_u_top_k_moves() -> None:
     assert selected
     assert expected_detailed != selected
     for move in result.moves:
-        if move.uci in expected_detailed:
+        if move.uci in selected:
             assert move.candidate_delta_q is not None
             assert move.candidate_delta_u == pytest.approx(
                 move.candidate_delta_q + move.candidate_delta_w + move.candidate_delta_a
@@ -727,7 +875,7 @@ def test_refined_candidate_thermo_mode_enriches_delta_u_top_k_moves() -> None:
 def test_cdepth_two_recurses_only_after_complete_cycle() -> None:
     board = chess.Board()
     evaluator = StaticEvaluator()
-    search = AdaptiveExpectedValue(Style(center=3.0), 2.0, evaluator, cdepth=2, adaptive_c=0.05)
+    search = AdaptiveExpectedValue(Style(center=3.0), 20.0, evaluator, cdepth=2, adaptive_c=0.05)
     search.expected_value(board)
     selection = search.node_selection(board)
     assert selection is not None
@@ -975,8 +1123,11 @@ def test_early_king_move_has_large_castling_preservation_contribution() -> None:
     features = record["features"]
     assert features["castle_preserve_raw"] == -2.0
     assert features["castle_preserve_phase_weight"] > 0.9
-    assert features["castle_preserve_effective_weight"] > 1.8
-    assert features["castle_preserve_contribution"] < -3.6
+    assert 0.0 <= features["castle_preserve_effective_weight"] <= 1.0
+    assert features["castle_preserve_energy"] == pytest.approx(-0.7)
+    assert features["castle_preserve_contribution"] == pytest.approx(
+        features["castle_preserve_effective_weight"] * features["castle_preserve_energy"]
+    )
 
 
 def test_original_rook_move_has_castling_preservation_contribution() -> None:
@@ -984,7 +1135,10 @@ def test_original_rook_move_has_castling_preservation_contribution() -> None:
     record = _move_record(board, Style(castle_preserve=2.0), "h1h2")
     features = record["features"]
     assert features["castle_preserve_raw"] == -1.0
-    assert features["castle_preserve_contribution"] == pytest.approx(-2.0)
+    assert features["castle_preserve_energy"] == pytest.approx(-0.35)
+    assert features["castle_preserve_contribution"] == pytest.approx(
+        features["castle_preserve_effective_weight"] * features["castle_preserve_energy"]
+    )
 
 
 def test_castling_has_no_castling_preservation_contribution() -> None:
@@ -1017,8 +1171,8 @@ def test_castling_preservation_fades_with_game_phase() -> None:
     assert early_record["features"]["castle_preserve_phase_weight"] == pytest.approx(
         1.0 - early_record["features"]["game_phase"]
     )
-    early_contribution = potential_components(style, early)[0]
-    late_contribution = potential_components(style, late)[0]
+    early_contribution = potential_components(style, early)[2]
+    late_contribution = potential_components(style, late)[2]
     assert early_contribution < late_contribution
     assert abs(early_contribution) > abs(late_contribution)
 
@@ -1030,9 +1184,9 @@ def test_solidness_strengthens_early_castling_preservation() -> None:
         "game_phase": 0.25,
         "castle_phase_weight": weights[1],
     }
-    flexible = Style(castle_preserve=2.0, solidness=0.0)
-    solid = Style(castle_preserve=2.0, solidness=1.0)
-    assert potential_components(solid, features)[0] < potential_components(flexible, features)[0]
+    flexible = Style(material=1.0, castle_preserve=2.0, phase_castle=1.0, solidness=0.0)
+    solid = Style(material=1.0, castle_preserve=2.0, phase_castle=1.0, solidness=1.0)
+    assert potential_components(solid, features)[2] < potential_components(flexible, features)[2]
 
 
 def test_all_builtin_strategies_preserve_castling_rights_meaningfully() -> None:
@@ -1087,14 +1241,14 @@ def test_solidness_validation_and_zero_reproduces_base_potential() -> None:
     features = move_features(board, chess.Move.from_uci("g1f3"))
     style = Style(development=2.0, phase_castle=2.0, phase_attack=2.0, solidness=0.0)
     base, phase, total = potential_components(style, features)
-    assert phase != 0.0
+    assert phase == pytest.approx(0.0)
     assert total == pytest.approx(base)
     assert potential(style, features) == pytest.approx(base)
 
 
 def test_solidness_emphasizes_development_early_and_attack_late() -> None:
-    solid = _quiet_style(development=1.0, phase_attack=1.0, solidness=1.0)
-    ordinary = _quiet_style(development=1.0, phase_attack=1.0, solidness=0.0)
+    solid = _quiet_style(development=1.0, king_pressure=1.0, phase_attack=1.0, solidness=1.0)
+    ordinary = _quiet_style(development=1.0, king_pressure=1.0, phase_attack=1.0, solidness=0.0)
     template = {
         "game_phase": 0.1,
         "development_phase_weight": 0.9,
@@ -1103,10 +1257,10 @@ def test_solidness_emphasizes_development_early_and_attack_late() -> None:
         "phase_castle_feature": 0.0,
     }
     early_development = {
-        **template, "development_feature": 1.0, "phase_attack_feature": 0.0
+        **template, "development": 1.0, "king_pressure": 0.0
     }
     early_attack = {
-        **template, "development_feature": 0.0, "phase_attack_feature": 1.0
+        **template, "development": 0.0, "king_pressure": 5.0
     }
     late_development = {
         **early_development,

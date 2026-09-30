@@ -53,18 +53,21 @@ Let:
 - $B$ be a chess position;
 - $\mathcal M(B)$ be the legal moves in that position;
 - $B_m$ be the position after legal move $m$;
-- $\lambda$ be an observer's vector of style coefficients;
-- $\beta$ be that observer's inverse-temperature parameter.
+- $\lambda^{(0)}$ be an observer's baseline vector of style preferences;
+- $\kappa$ be the Boltzmann-like constant, defaulting to `1.0` in pawn units;
+- $T$ be that observer's temperature, with $\beta = 1/(\kappa T)$ kept as the backward-compatible inverse-temperature interface.
 
 ### Move features and style potential
 
 For every legal move, the project computes features $F_k(m,B)$ from the perspective of the side actually making the move:
 
 ```math
-\Phi_{\mathrm{total}}(m,B)
+\Phi_p(m,B)
 =
-\Phi_{\mathrm{base}}(m,B)+\sigma\Phi_{\mathrm{phase}}(m,B).
+\sum_k \lambda_{p,k}(g)F_k(m,B).
 ```
+
+Features entering `Phi` are interpreted in pawn-equivalent units. Material and preservation are naturally in pawns; tactical and positional features are conservatively scaled to pawn fractions. Mate remains a separate dominant terminal feature. Baseline strategy coefficients are first phase-modulated into unnormalized weights and then renormalized so active non-terminal strategy weights sum to `1` at every game phase.
 
 This mover-relative convention is important. For example, winning material is a positive move feature whether White or Black makes the capture. When an observer evaluates opponent moves deeper in the tree, the observer's same $\lambda$ is retained, while `move_features(board, move)` still describes the side that actually moves at that node.
 
@@ -447,18 +450,20 @@ The style potential induces a probability distribution:
 ```math
 p_\lambda(m\mid B)
 =
-\frac{\exp\left(\beta\Phi_\lambda(m,B)\right)}
+\frac{\exp\left(\Phi_\lambda(m,B)/(\kappa T)\right)}
 {\sum_{m'\in\mathcal M(B)}
-\exp\left(\beta\Phi_\lambda(m',B)\right)}.
+\exp\left(\Phi_\lambda(m',B)/(\kappa T)\right)}.
 ```
 
 The implementation uses a numerically stable softmax by subtracting the largest scaled potential before exponentiation.
 
-Interpretation of $\beta$:
+Interpretation of temperature:
 
-- smaller $\beta$ produces a flatter distribution;
-- larger $\beta$ concentrates probability on moves with high style potential;
-- $\beta$ changes the probability measure, not the static evaluator.
+- $\kappa=1.0$ by default, with pawns as the energy unit;
+- the existing $\beta$ interface is preserved as $\beta=1/(\kappa T)$;
+- smaller $\beta$ / larger $T$ produces a flatter distribution;
+- larger $\beta$ / smaller $T$ concentrates probability on moves with high style potential;
+- temperature changes the probability measure, not the static evaluator.
 
 ## Exact Board-Evaluation Formulas
 
@@ -659,6 +664,17 @@ A recursive call consumes one unit only after a complete own-move/opponent-respo
 
 ### Response Evaluation
 
+For every legal own move, the opponent-response probabilities use the same observer style and beta as root move probabilities:
+
+```math
+q_\lambda(r\mid B_m)
+=
+\frac{\exp\left(\Phi_\lambda(r,B_m)/(\kappa T)\right)}
+{\sum_{r'}\exp\left(\Phi_\lambda(r',B_m)/(\kappa T)\right)}.
+```
+
+The response move features remain mover-relative, so a response made by Black is described from Black's mover perspective, but the style weights are still the focal observer's weights. Static `E(B_{m,r})` does not enter this response softmax.
+
 For every legal own move, non-recursed probability mass is evaluated at the response board:
 
 ```math
@@ -707,7 +723,7 @@ U_\lambda^{(d)}(B)
 \sum_m p_\lambda(m\mid B)O_m^{(d)}(B).
 ```
 
-The candidate thermodynamic diagnostic is the predicted change in the same player's next decision landscape. For candidate `m`, the model first computes the subjective opponent-response distribution `q(r | B_m)`. This distribution uses the observer's fixed style from the responding side's feature perspective, with an added side-to-move objective term: White replies favor larger White-positive value, while Black replies favor smaller White-positive value.
+The candidate thermodynamic diagnostic is the predicted change in the same player's next decision landscape. For candidate `m`, the model first computes the subjective opponent-response distribution `q(r | B_m)` from the observer's fixed style. The response move features are computed from the responding mover's perspective, but no extra side-to-move static-evaluation term is added to the probability.
 
 Response probabilities weight the expectation, but the `K_response` replies selected for deeper recursive work are ranked by the configured `refinement_policy`. With the default `static_eval`, White-to-move replies prefer larger `E(B_{m,r})` and Black-to-move replies prefer smaller `E(B_{m,r})`. With `probability`, replies are ranked by `q(r | B_m)` for both sides. The response breadth is adaptive:
 
@@ -845,6 +861,7 @@ preserved without adding a pseudo-move to ordinary chess move generation.
 | Seed | `1` |
 | White beta | `4.0` |
 | Black beta | `4.0` |
+| Kappa | `1.0` |
 | White strategy | `material_conservative` |
 | Black strategy | `activity_aggressive` |
 | Cycle depth (`cdepth`) | `1` |
@@ -952,6 +969,7 @@ Use `--refinement-policy probability` to deepen the most probable root `K` moves
 | `--seed N` | `1` | Initializes Python's random generator. Current move selection is deterministic, so this is mainly a reproducibility hook for future stochastic behavior. |
 | `--beta-white X` | `4.0` | White observer's inverse temperature. Larger values concentrate White's move probabilities. |
 | `--beta-black X` | `4.0` | Black observer's inverse temperature. Larger values concentrate Black's move probabilities. |
+| `--kappa X` | `1.0` | Boltzmann-like constant in pawn units. The effective temperature is `1 / (kappa * beta)`. |
 | `--white-strategy NAME` | `material_conservative` | White preset. Choices: `material_conservative`, `activity_aggressive`, `tactical_attacker`, `positional_controller`. |
 | `--black-strategy NAME` | `activity_aggressive` | Black preset. Uses the same four choices. |
 | `--solidness-white X` | Preset value | Override White's solidness $\sigma$. Must be between `0` and `1`. |

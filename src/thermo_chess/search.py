@@ -13,7 +13,7 @@ import chess
 
 from .evaluation import StaticEvaluator
 from .features import BoardFeatureContext, board_context
-from .measure import MoveLandscape, MoveRecord, Style, move_distribution
+from .measure import KAPPA, MoveLandscape, MoveRecord, Style, move_distribution
 
 
 PositionKey = Tuple[str, bool, bool, bool]
@@ -121,21 +121,26 @@ def _move_from_uci(uci: str) -> chess.Move:
 class ResponseObservation:
     move: chess.Move
     uci: str
+    san: str
     probability: float
     response_value: float
     selected_for_refinement: bool
     depth_used: int
     static_value: float | None = None
+    refinement_rank: int | None = None
 
     def as_dict(self) -> Dict[str, object]:
         return {
             "uci": self.uci,
+            "san": self.san,
             "probability": self.probability,
             "response_value": self.response_value,
             "value": self.response_value,
             "selected_for_refinement": self.selected_for_refinement,
             "depth_used": self.depth_used,
+            "recursively_deepened": self.depth_used > 0,
             "static_value": self.static_value,
+            "refinement_rank": self.refinement_rank,
         }
 
     @classmethod
@@ -144,11 +149,13 @@ class ResponseObservation:
         return cls(
             move=_move_from_uci(uci),
             uci=uci,
+            san=str(data.get("san", uci)),
             probability=float(data["probability"]),
             response_value=float(data.get("response_value", data.get("value", 0.0))),
             selected_for_refinement=bool(data.get("selected_for_refinement", False)),
             depth_used=int(data.get("depth_used", 0)),
             static_value=None if data.get("static_value") is None else float(data["static_value"]),
+            refinement_rank=None if data.get("refinement_rank") is None else int(data["refinement_rank"]),
         )
 
 
@@ -174,6 +181,7 @@ class AdaptiveBranchObservation:
             "branch_value": self.adaptive_branch_value,
             "was_deepened": self.was_deepened,
             "selected_for_refinement": self.was_deepened,
+            "actually_deepened": self.depth_used > 1,
             "depth_used": self.depth_used,
             "cdepth": self.cdepth,
             "search_mode": self.search_mode,
@@ -187,10 +195,12 @@ class AdaptiveBranchObservation:
 class ResponseEvaluation:
     move: chess.Move
     uci: str
+    san: str
     probability: float
     value: float
     selected_for_refinement: bool
     static_value: float | None = None
+    refinement_rank: int | None = None
     depth_used: int = 0
     next_state_U: float | None = None
     delta_U: float | None = None
@@ -203,11 +213,13 @@ class ResponseEvaluation:
         return ResponseObservation(
             move=self.move,
             uci=self.uci,
+            san=self.san,
             probability=self.probability,
             response_value=self.value,
             selected_for_refinement=self.selected_for_refinement,
             depth_used=self.depth_used,
             static_value=self.static_value,
+            refinement_rank=self.refinement_rank,
         )
 
     def as_dict(self) -> Dict[str, object]:
@@ -228,10 +240,12 @@ class ResponseEvaluation:
         return cls(
             move=obs.move,
             uci=obs.uci,
+            san=obs.san,
             probability=obs.probability,
             value=obs.response_value,
             selected_for_refinement=obs.selected_for_refinement,
             static_value=obs.static_value,
+            refinement_rank=obs.refinement_rank,
             depth_used=obs.depth_used,
             next_state_U=None if data.get("next_state_U") is None else float(data["next_state_U"]),
             delta_U=None if data.get("delta_U") is None else float(data["delta_U"]),
@@ -310,6 +324,7 @@ class MoveEvaluation:
             "thermo_decomposition_error": self.thermo_decomposition_error,
             "selected_for_refinement": self.selected_for_refinement,
             "selected_for_deeper_analysis": self.selected_for_refinement,
+            "actually_deepened": self.depth_used > 1,
             "base_potential": self.base_potential,
             "phase_potential": self.phase_potential,
             "total_potential": self.potential,
@@ -370,6 +385,7 @@ class SearchResult:
     moves: Tuple[MoveEvaluation, ...]
     diagnostics: Dict[str, float | int | str]
     refinement_policy: RefinementPolicy = "static_eval"
+    kappa: float = KAPPA
 
     def branch_observations(self) -> Tuple[AdaptiveBranchObservation, ...]:
         return tuple(
@@ -414,6 +430,8 @@ class SearchResult:
             "search_depth": self.cdepth,
             "search_mode": self.search_mode,
             "adaptive_c": self.adaptive_c,
+            "kappa": self.kappa,
+            "temperature": 1.0 / (self.kappa * self.beta),
             "refinement_policy": self.refinement_policy,
             "diagnostics": self.diagnostics,
             "sort_direction": sort_direction,
@@ -428,6 +446,8 @@ class SearchResult:
             "cdepth": self.cdepth,
             "search_mode": self.search_mode,
             "beta": self.beta,
+            "kappa": self.kappa,
+            "temperature": 1.0 / (self.kappa * self.beta),
             "adaptive_c": self.adaptive_c,
             "refinement_policy": self.refinement_policy,
             "U": self.U,
@@ -449,6 +469,7 @@ class SearchResult:
             cdepth=int(data.get("cdepth", 0)),
             search_mode=_validate_search_mode(str(data.get("search_mode", "accurate"))),
             beta=float(data.get("beta", 1.0)),
+            kappa=float(data.get("kappa", KAPPA)),
             adaptive_c=float(data.get("adaptive_c", 0.3)),
             refinement_policy=_validate_refinement_policy(str(data.get("refinement_policy", "static_eval"))),
             U=float(data.get("U", data.get("expected_value", 0.0))),
@@ -563,6 +584,7 @@ def _branch_worker(args: Dict[str, object]) -> tuple[AdaptiveBranchObservation, 
         search_workers=1,
         parallel_min_branches=int(args["parallel_min_branches"]),
         refinement_policy=_validate_refinement_policy(str(args.get("refinement_policy", "static_eval"))),
+        kappa=float(args.get("kappa", KAPPA)),
     )
     search.begin_diagnostics()
     board = chess.Board(str(args["fen"]))
@@ -594,6 +616,7 @@ class AdaptiveExpectedValue:
         parallel_min_branches: int = 8,
         candidate_thermo_mode: CandidateThermoMode = "refined",
         refinement_policy: RefinementPolicy = "static_eval",
+        kappa: float = KAPPA,
         *,
         depth: int | None = None,
     ) -> None:
@@ -603,6 +626,8 @@ class AdaptiveExpectedValue:
             raise ValueError("cdepth must be at least 0")
         if adaptive_c <= 0.0:
             raise ValueError("adaptive_c must be greater than 0")
+        if kappa <= 0.0:
+            raise ValueError("kappa must be greater than 0")
         if search_workers is None:
             search_workers = max(1, (os.cpu_count() or 1) - 1)
         if search_workers < 1:
@@ -614,6 +639,7 @@ class AdaptiveExpectedValue:
         refinement_policy = _validate_refinement_policy(refinement_policy)
         self.style = style
         self.beta = beta
+        self.kappa = kappa
         self.evaluator = evaluator
         self.cdepth = cdepth
         self.depth = cdepth
@@ -711,6 +737,7 @@ class AdaptiveExpectedValue:
             self._cached_evaluator,
             before_context=context,
             context_provider=self.board_context,
+            kappa=self.kappa,
         )
         self._landscape_cache[position_key] = landscape
         return landscape
@@ -730,7 +757,7 @@ class AdaptiveExpectedValue:
             self._cached_evaluator,
             before_context=context,
             context_provider=self.board_context,
-            value_objective_weight=1.0,
+            kappa=self.kappa,
         )
         self._response_landscape_cache[position_key] = landscape
         return landscape
@@ -872,14 +899,7 @@ class AdaptiveExpectedValue:
             if self.candidate_thermo_mode == "all":
                 detailed_uci = {record.uci for record in landscape.records}
             elif self.candidate_thermo_mode == "refined":
-                detailed_ranked = sorted(
-                    landscape.records,
-                    key=lambda record: fast_thermos[record.uci]["candidate_delta_u"],
-                    reverse=board.turn == chess.WHITE,
-                )
-                detailed_uci = {
-                    record.uci for record in detailed_ranked[: selection.expanded_count]
-                }
+                detailed_uci = set(selection.selected_uci)
             else:
                 detailed_uci = {chosen_uci}
 
@@ -945,6 +965,7 @@ class AdaptiveExpectedValue:
             beta=self.beta,
             adaptive_c=self.adaptive_c,
             refinement_policy=self.refinement_policy,
+            kappa=self.kappa,
             U=self._value_cache[(self.position_key(board), self.cdepth)],
             entropy=landscape.entropy,
             N_eff=landscape.effective_moves,
@@ -1048,10 +1069,12 @@ class AdaptiveExpectedValue:
                     ResponseEvaluation(
                         move=response.move,
                         uci=response.uci,
+                        san=response.san,
                         probability=response.probability,
                         value=next_u,
                         selected_for_refinement=response_selected,
                         static_value=response.static_value,
+                        refinement_rank=response.refinement_rank,
                         depth_used=response_depth,
                         next_state_U=next_u,
                         delta_U=decomposition.delta_u,
@@ -1177,6 +1200,7 @@ class AdaptiveExpectedValue:
                 "eval_weights": self.evaluator.weights,
                 "parallel_min_branches": self.parallel_min_branches,
                 "refinement_policy": self.refinement_policy,
+                "kappa": self.kappa,
             }
             for record in records
         ]
@@ -1226,7 +1250,8 @@ class AdaptiveExpectedValue:
             response_neff = reply_landscape.effective_moves
             response_k = adaptive_breadth(reply_landscape.effective_moves, self.adaptive_c, len(reply_landscape.records))
             reply_ranked = ranked_for_refinement(reply_landscape.records, after.turn, self.refinement_policy)
-            selected_replies = {reply.uci for reply in reply_ranked[:response_k]}
+            selected_reply_rank = {reply.uci: rank for rank, reply in enumerate(reply_ranked[:response_k], start=1)}
+            selected_replies = set(selected_reply_rank)
             self.diagnostics.response_expanded_total += response_k
             self.diagnostics.response_expanded_nodes += 1
             branch_value = 0.0
@@ -1245,11 +1270,13 @@ class AdaptiveExpectedValue:
                     ResponseObservation(
                         move=reply.move,
                         uci=reply.uci,
+                        san=after.san(reply.move),
                         probability=reply.probability,
                         response_value=reply_value,
                         selected_for_refinement=reply_selected,
                         depth_used=selected_depth - 1 if own_selected and reply_selected and selected_depth > 1 else 0,
                         static_value=reply.static_after,
+                        refinement_rank=selected_reply_rank.get(reply.uci),
                     )
                 )
         return AdaptiveBranchObservation(
