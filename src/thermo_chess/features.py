@@ -199,6 +199,12 @@ def material_exposure(board: chess.Board, side: chess.Color) -> float:
     return _material_exposure_from_fen(board.fen(), bool(side))
 
 
+def total_exposure(board: chess.Board, side: chess.Color) -> float:
+    """Alias for the side's total exchange-aware exposed material."""
+
+    return material_exposure(board, side)
+
+
 @lru_cache(maxsize=100_000)
 def _material_exposure_from_fen(fen: str, side: bool) -> float:
     """Total profitable material currently exposed for `side`.
@@ -315,8 +321,8 @@ def board_context(board: chess.Board) -> BoardFeatureContext:
         chess.BLACK: material(board, chess.BLACK),
     }
     exposure_by_side = {
-        chess.WHITE: material_exposure(board, chess.WHITE),
-        chess.BLACK: material_exposure(board, chess.BLACK),
+        chess.WHITE: total_exposure(board, chess.WHITE),
+        chess.BLACK: total_exposure(board, chess.BLACK),
     }
     mobility_by_side = {
         chess.WHITE: legal_mobility(board, chess.WHITE),
@@ -479,6 +485,10 @@ def white_minus_black_features(
     values = context or board_context(board)
     return {
         "material": values.material_balance,
+        "exposure": (
+            values.material_exposure_by_side[chess.BLACK]
+            - values.material_exposure_by_side[chess.WHITE]
+        ),
         "mobility": (
             values.mobility_by_side[chess.WHITE]
             - values.mobility_by_side[chess.BLACK]

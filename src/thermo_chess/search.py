@@ -19,6 +19,7 @@ from .measure import MoveLandscape, MoveRecord, Style, move_distribution
 PositionKey = Tuple[str, bool, bool, bool]
 SearchMode = Literal["accurate"]
 CandidateThermoMode = Literal["selected", "refined", "all"]
+RefinementPolicy = Literal["static_eval", "probability"]
 
 
 @dataclass(frozen=True)
@@ -75,28 +76,41 @@ def adaptive_breadth(effective_moves: float, adaptive_c: float, legal_moves: int
 
 
 def ranked_for_refinement(
-    records: Iterable[MoveRecord], side_to_move: chess.Color
+    records: Iterable[MoveRecord],
+    side_to_move: chess.Color,
+    policy: RefinementPolicy = "static_eval",
 ) -> Tuple[MoveRecord, ...]:
-    """Rank branches for deeper work by immediate static board value.
+    """Rank branches for deeper work.
 
-    The universal evaluator is White-positive, so White-favorable branches have
-    larger ``E(B_m)`` and Black-favorable branches have smaller ``E(B_m)``.
-    This ranking only allocates computation; probabilities still weight values.
+    ``static_eval`` ranks by immediate board value in the side-to-move's favor.
+    ``probability`` ranks by the move probability assigned by the observer's
+    current policy distribution. This only allocates computation; probabilities
+    still weight values.
     """
 
-    return tuple(
-        sorted(
-            records,
-            key=lambda record: record.static_after,
-            reverse=side_to_move == chess.WHITE,
+    if policy == "probability":
+        return tuple(sorted(records, key=lambda record: record.probability, reverse=True))
+    if policy == "static_eval":
+        return tuple(
+            sorted(
+                records,
+                key=lambda record: record.static_after,
+                reverse=side_to_move == chess.WHITE,
+            )
         )
-    )
+    raise ValueError("refinement_policy must be 'static_eval' or 'probability'")
 
 
 def _validate_search_mode(search_mode: str) -> SearchMode:
     if search_mode != "accurate":
         raise ValueError("search_mode must be 'accurate'")
     return search_mode  # type: ignore[return-value]
+
+
+def _validate_refinement_policy(refinement_policy: str) -> RefinementPolicy:
+    if refinement_policy not in {"static_eval", "probability"}:
+        raise ValueError("refinement_policy must be 'static_eval' or 'probability'")
+    return refinement_policy  # type: ignore[return-value]
 
 
 def _move_from_uci(uci: str) -> chess.Move:
@@ -355,6 +369,7 @@ class SearchResult:
     selected_uci: Tuple[str, ...]
     moves: Tuple[MoveEvaluation, ...]
     diagnostics: Dict[str, float | int | str]
+    refinement_policy: RefinementPolicy = "static_eval"
 
     def branch_observations(self) -> Tuple[AdaptiveBranchObservation, ...]:
         return tuple(
@@ -374,19 +389,18 @@ class SearchResult:
 
     def as_viewer_panel(self, board_turn: chess.Color) -> Dict[str, object]:
         moves = [move.as_dict() for move in self.moves]
-        if board_turn == chess.WHITE:
-            moves.sort(
-                key=lambda item: (item["delta_u"], item["probability"], item["reply_expected_value"]),
-                reverse=True,
-            )
-            sort_direction = "descending"
+        if self.refinement_policy == "probability":
+            moves.sort(key=lambda item: item["probability"], reverse=True)
+            sort_direction = "probability_descending"
+        elif board_turn == chess.WHITE:
+            moves.sort(key=lambda item: item["static_after"], reverse=True)
+            sort_direction = "static_eval_descending"
         else:
-            moves.sort(
-                key=lambda item: (item["delta_u"], -item["probability"], item["reply_expected_value"]),
-            )
-            sort_direction = "ascending"
+            moves.sort(key=lambda item: item["static_after"])
+            sort_direction = "static_eval_ascending"
         for rank, move in enumerate(moves, start=1):
             move["advantage_rank"] = rank
+            move["refinement_rank"] = rank
         return {
             "actual_decision": True,
             "player": self.player,
@@ -400,6 +414,7 @@ class SearchResult:
             "search_depth": self.cdepth,
             "search_mode": self.search_mode,
             "adaptive_c": self.adaptive_c,
+            "refinement_policy": self.refinement_policy,
             "diagnostics": self.diagnostics,
             "sort_direction": sort_direction,
             "moves": moves,
@@ -414,6 +429,7 @@ class SearchResult:
             "search_mode": self.search_mode,
             "beta": self.beta,
             "adaptive_c": self.adaptive_c,
+            "refinement_policy": self.refinement_policy,
             "U": self.U,
             "entropy": self.entropy,
             "N_eff": self.N_eff,
@@ -434,6 +450,7 @@ class SearchResult:
             search_mode=_validate_search_mode(str(data.get("search_mode", "accurate"))),
             beta=float(data.get("beta", 1.0)),
             adaptive_c=float(data.get("adaptive_c", 0.3)),
+            refinement_policy=_validate_refinement_policy(str(data.get("refinement_policy", "static_eval"))),
             U=float(data.get("U", data.get("expected_value", 0.0))),
             entropy=float(data.get("entropy", 0.0)),
             N_eff=float(data.get("N_eff", data.get("effective_moves", 0.0))),
@@ -545,6 +562,7 @@ def _branch_worker(args: Dict[str, object]) -> tuple[AdaptiveBranchObservation, 
         search_mode=_validate_search_mode(str(args["search_mode"])),
         search_workers=1,
         parallel_min_branches=int(args["parallel_min_branches"]),
+        refinement_policy=_validate_refinement_policy(str(args.get("refinement_policy", "static_eval"))),
     )
     search.begin_diagnostics()
     board = chess.Board(str(args["fen"]))
@@ -575,6 +593,7 @@ class AdaptiveExpectedValue:
         search_workers: int | None = 1,
         parallel_min_branches: int = 8,
         candidate_thermo_mode: CandidateThermoMode = "refined",
+        refinement_policy: RefinementPolicy = "static_eval",
         *,
         depth: int | None = None,
     ) -> None:
@@ -592,6 +611,7 @@ class AdaptiveExpectedValue:
             raise ValueError("parallel_min_branches must be at least 1")
         if candidate_thermo_mode not in {"selected", "refined", "all"}:
             raise ValueError("candidate_thermo_mode must be 'selected', 'refined', or 'all'")
+        refinement_policy = _validate_refinement_policy(refinement_policy)
         self.style = style
         self.beta = beta
         self.evaluator = evaluator
@@ -603,6 +623,7 @@ class AdaptiveExpectedValue:
         self.search_workers = search_workers
         self.parallel_min_branches = parallel_min_branches
         self.candidate_thermo_mode = candidate_thermo_mode
+        self.refinement_policy = refinement_policy
         self._static_cache: Dict[PositionKey, float] = {}
         self._context_cache: Dict[PositionKey, BoardFeatureContext] = {}
         self._landscape_cache: Dict[PositionKey, MoveLandscape] = {}
@@ -923,6 +944,7 @@ class AdaptiveExpectedValue:
             search_mode=self.search_mode,
             beta=self.beta,
             adaptive_c=self.adaptive_c,
+            refinement_policy=self.refinement_policy,
             U=self._value_cache[(self.position_key(board), self.cdepth)],
             entropy=landscape.entropy,
             N_eff=landscape.effective_moves,
@@ -997,27 +1019,19 @@ class AdaptiveExpectedValue:
         candidate_delta_a = 0.0
         for response in response_records:
             response_selected = response.uci in selected_uci
-            should_refine_response = response_selected
+            response_depth = response.depth_used if response_selected else 0
             next_board = None
-            if should_refine_response:
+            if response_depth > 0:
                 next_board = after.copy(stack=False)
                 next_board.push(response.move)
-                next_u = self._future_subjective_value(
-                    next_board, remaining_cdepth, level=1
-                )
-            else:
-                next_u = (
-                    response.static_value
-                    if response.static_value is not None
-                    else response.response_value
-                )
+            next_u = response.response_value
             expected_next_u += response.probability * next_u
 
             if detailed:
-                if should_refine_response:
+                if response_depth > 0:
                     assert next_board is not None
                     next_branches = self._future_branch_observations(
-                        next_board, remaining_cdepth, level=1
+                        next_board, response_depth, level=1
                     )
                 else:
                     next_branches = ()
@@ -1038,7 +1052,7 @@ class AdaptiveExpectedValue:
                         value=next_u,
                         selected_for_refinement=response_selected,
                         static_value=response.static_value,
-                        depth_used=remaining_cdepth if response_selected else 0,
+                        depth_used=response_depth,
                         next_state_U=next_u,
                         delta_U=decomposition.delta_u,
                         delta_Q=decomposition.delta_q,
@@ -1106,7 +1120,7 @@ class AdaptiveExpectedValue:
         selected_depth = local_search_depth(
             cdepth, landscape.effective_moves, self.depth_thresholds
         )
-        ranked = ranked_for_refinement(landscape.records, board.turn)
+        ranked = ranked_for_refinement(landscape.records, board.turn, self.refinement_policy)
         selected_uci = tuple(record.uci for record in ranked[:expanded_count])
         selected = set(selected_uci)
         self.diagnostics.expanded_total += expanded_count
@@ -1162,6 +1176,7 @@ class AdaptiveExpectedValue:
                 "search_mode": self.search_mode,
                 "eval_weights": self.evaluator.weights,
                 "parallel_min_branches": self.parallel_min_branches,
+                "refinement_policy": self.refinement_policy,
             }
             for record in records
         ]
@@ -1210,7 +1225,7 @@ class AdaptiveExpectedValue:
             reply_landscape = self.response_landscape(after)
             response_neff = reply_landscape.effective_moves
             response_k = adaptive_breadth(reply_landscape.effective_moves, self.adaptive_c, len(reply_landscape.records))
-            reply_ranked = ranked_for_refinement(reply_landscape.records, after.turn)
+            reply_ranked = ranked_for_refinement(reply_landscape.records, after.turn, self.refinement_policy)
             selected_replies = {reply.uci for reply in reply_ranked[:response_k]}
             self.diagnostics.response_expanded_total += response_k
             self.diagnostics.response_expanded_nodes += 1

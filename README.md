@@ -470,16 +470,18 @@ The shared evaluator is
 E(B)
 =
 \alpha_M\Delta M
++\alpha_{\mathrm{exposure}}\Delta H
 +\alpha_{\mathrm{mob}}\Delta\mathrm{Mobility}
 +\alpha_K\Delta K
 +\alpha_C\Delta C,
 ```
 
-where all differences are White minus Black. The default weights are:
+where material, mobility, king safety, and center are White-minus-Black features, while exposure is signed as Black exposed material minus White exposed material. The default weights are:
 
 | Static component | Default |
 |---|---:|
 | Material | `1.0` |
+| Exposure | `0.5` |
 | Mobility | `0.25` |
 | King safety | `0.6` |
 | Center control | `0.35` |
@@ -490,6 +492,16 @@ The board features passed to this evaluator are computed exactly as follows:
 ```math
 \Delta M(B)=M(B,\mathrm{White})-M(B,\mathrm{Black}),
 ```
+
+```math
+H_a(B)
+=
+\sum_{s\text{ occupied by a non-king piece of }a} R_s(B),
+\qquad
+\Delta H(B)=H_{\mathrm{Black}}(B)-H_{\mathrm{White}}(B).
+```
+
+Here `R_s(B)` is the same exchange-aware profitable-capture exposure used by the preservation move feature. White exposed material decreases `E(B)`; Black exposed material increases it.
 
 ```math
 \Delta\mathrm{Mobility}(B)
@@ -516,12 +528,13 @@ With default weights, a nonterminal board is therefore evaluated as
 E(B)
 =
 \Delta M(B)
++0.5\,\Delta H(B)
 +0.25\,\Delta\mathrm{Mobility}(B)
 +0.6\,\Delta K(B)
 +0.35\,\Delta C(B).
 ```
 
-Notice that the mobility and center differences are normalized by `30` and `6` before their evaluator weights are applied. The static evaluator does not directly use preservation, activity, checks, king restriction, king pressure, or promotion; those belong to the observer-dependent move potential.
+Notice that the mobility and center differences are normalized by `30` and `6` before their evaluator weights are applied. The static exposure term uses the same exchange-aware helper as preservation, but it is a universal board feature rather than a style-dependent move feature. The static evaluator does not directly use preservation, activity, checks, king restriction, king pressure, or promotion; those belong to the observer-dependent move potential.
 
 If the side to move is checkmated, `E(B)` receives the appropriate signed checkmate value. Stalemate, insufficient material, the automatic 75-move rule, and fivefold repetition evaluate to zero. At a search terminal or depth-zero node, the search returns `E(B)` directly and never applies a softmax to an empty move set.
 
@@ -618,7 +631,7 @@ The default is
 c = 0.3
 ```
 
-Top-`K` and top-`K'` selection is based on move probability. It selects which branches receive extra computation; it never changes or renormalizes the probability distribution.
+Top-`K` and top-`K'` selection is controlled by `refinement_policy`. The default `static_eval` policy ranks immediate boards by the side-to-move objective: larger `E(B_m)` for White, smaller `E(B_m)` for Black. The alternative `probability` policy ranks by the observer's move probability. This choice selects which branches receive extra computation; it never changes or renormalizes the probability distribution. Use `--refinement-policy static_eval|probability` in `run_match.py`.
 
 ### Entropy-selected local cdepth
 
@@ -696,7 +709,7 @@ U_\lambda^{(d)}(B)
 
 The candidate thermodynamic diagnostic is the predicted change in the same player's next decision landscape. For candidate `m`, the model first computes the subjective opponent-response distribution `q(r | B_m)`. This distribution uses the observer's fixed style from the responding side's feature perspective, with an added side-to-move objective term: White replies favor larger White-positive value, while Black replies favor smaller White-positive value.
 
-Response probabilities weight the expectation, but the `K_response` replies selected for deeper recursive work are ranked by immediate static evaluation from the responding side's objective: White-to-move replies prefer larger `E(B_{m,r})`, and Black-to-move replies prefer smaller `E(B_{m,r})`. The response breadth is adaptive:
+Response probabilities weight the expectation, but the `K_response` replies selected for deeper recursive work are ranked by the configured `refinement_policy`. With the default `static_eval`, White-to-move replies prefer larger `E(B_{m,r})` and Black-to-move replies prefer smaller `E(B_{m,r})`. With `probability`, replies are ranked by `q(r | B_m)` for both sides. The response breadth is adaptive:
 
 ```math
 K_{\mathrm{response}}
@@ -707,15 +720,9 @@ N_{\mathrm{legal\ replies}},
 \right),
 ```
 
-where `c` is the configured adaptive breadth coefficient and `S_reply` is the entropy of `q`. Let `R_K(m)` be those static-evaluation-ranked top-`K_response` replies. These replies are marked as refinement-eligible diagnostics, but candidate scoring keeps the full subjective response distribution and does not renormalize it.
+where `c` is the configured adaptive breadth coefficient and `S_reply` is the entropy of `q`. Let `R_K(m)` be the top-`K_response` replies under the configured refinement policy. These replies are marked as refinement-eligible diagnostics, but candidate scoring keeps the full subjective response distribution and does not renormalize it.
 
-After a candidate move and response, one complete cycle has been consumed. The future state is therefore valued with one fewer cycle. At candidate remaining depth zero, the same player is to move again, so the future-state value is the one-ply subjective expectation
-
-```math
-U_{\lambda,\mathrm{future}}^{(0)}(B)
-=
-\sum_{m'}p_\lambda(m'\mid B)E(B_{m'}).
-```
+After a candidate move and response, one complete cycle has been consumed. The future state is therefore valued with one fewer cycle. At candidate remaining depth zero, the future-state value is the static board value `E(B_{m,r})`. When remaining depth is positive, selected response branches recurse into the next complete cycle.
 
 For candidate depth `d`, the stored predicted next value and candidate change are
 
@@ -731,7 +738,7 @@ For candidate depth `d`, the stored predicted next value and candidate change ar
 \operatorname{expected\_next\_U}(m)-U_\lambda^{(d)}(B).
 ```
 
-Each response-specific transition compares `B` with `B_mr`, where the same player is again to move, and is decomposed with the finite midpoint formulas. The candidate row stores the full-response probability average:
+Each response-specific transition compares `B` with `B_mr`, where the same player is again to move, and is decomposed with the finite midpoint formulas. At remaining depth zero, `U_future(B_mr)` is the static board value `E(B_mr)`; it does not add another same-player decision expansion. The candidate row stores the full-response probability average:
 
 ```math
 \Delta U_m\approx\Delta Q_m+\Delta W_m+\Delta A_m.
@@ -843,6 +850,7 @@ preserved without adding a pseudo-move to ordinary chess move generation.
 | Cycle depth (`cdepth`) | `1` |
 | Adaptive breadth `c` | `0.3` |
 | Candidate thermo mode | `refined` |
+| Refinement policy | `static_eval` |
 | Match name | Generated from strategies, beta, solidness, and `cdepth` |
 | Stop on checkmate/stalemate | Yes |
 | Stop on insufficient material | Yes |
@@ -930,8 +938,11 @@ conda run -n chess env PYTHONPATH=src python scripts/run_match.py \
   --solidness-white 0.3 \
   --solidness-black 0.85 \
   --cdepth 1 \
-  --adaptive-c 0.3
+  --adaptive-c 0.3 \
+  --refinement-policy probability
 ```
+
+Use `--refinement-policy probability` to deepen the most probable root `K` moves and response `K'` replies. Omit it, or pass `--refinement-policy static_eval`, to keep the default side-aware immediate-evaluation ordering. With `cdepth=1`, this changes the saved/decomposed K/K' branches but normally not the played moves, because no selected response can recurse into another complete cycle. To make the policy affect decisions, use `--cdepth 2` or higher and positions whose entropy-selected local depth exceeds `1`.
 
 ### Simulation flags
 
@@ -951,6 +962,7 @@ conda run -n chess env PYTHONPATH=src python scripts/run_match.py \
 | `--search-workers N` | `1` | Process workers for independent root own-move branches. Use `1` for fully serial search or `auto` for CPU-based worker count. |
 | `--parallel-min-branches N` | `8` | Minimum root branch count before worker parallelism activates. |
 | `--candidate-thermo-mode MODE` | `refined` | Detailed Q/W/A diagnostics. Choices: `selected`, `refined`, `all`. |
+| `--refinement-policy POLICY` | `static_eval` | Selects which root `K` moves and response `K'` replies are deepened. Choices: `static_eval`, `probability`. At `cdepth=1`, this affects diagnostics but not move choice. |
 | `--name TEXT` | Generated | Base filename for CSV, JSON, and PGN outputs. By default it includes both strategy names, beta values, effective solidness values, and `cdepth`. |
 | `--ignore-threefold` | Off | Continue through actual threefold repetition instead of stopping there. |
 | `--allow-draw-claims` | Off | Also stop when a fifty-move or threefold-repetition draw can be claimed. Automatic draw rules still stop regardless of this flag. |
@@ -1147,6 +1159,7 @@ config = MatchConfig(
     black_solidness=0.35,
     cdepth=1,
     adaptive_c=0.3,
+    refinement_policy="static_eval",
     depth4_max_neff=4.0,
     depth3_max_neff=8.0,
     depth2_max_neff=15.0,

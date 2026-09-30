@@ -13,6 +13,7 @@ from .features import BoardFeatureContext, white_minus_black_features
 @dataclass(frozen=True)
 class EvaluationWeights:
     material: float = 1.0
+    exposure: float = 0.5
     mobility: float = 0.25
     king_safety: float = 0.6
     center: float = 0.35
@@ -22,6 +23,7 @@ class EvaluationWeights:
     def as_dict(self) -> Dict[str, float]:
         weights = {
             "material": self.material,
+            "exposure": self.exposure,
             "mobility": self.mobility,
             "king_safety": self.king_safety,
             "center": self.center,

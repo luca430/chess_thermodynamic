@@ -15,7 +15,7 @@ import chess.pgn
 from .evaluation import EvaluationWeights, StaticEvaluator
 from .measure import Style
 from .player import ThermoPlayer
-from .search import AdaptiveDepthThresholds, CandidateThermoMode, SearchMode, SearchResult
+from .search import AdaptiveDepthThresholds, CandidateThermoMode, RefinementPolicy, SearchMode, SearchResult
 from .thermodynamics import decompose_transition
 
 
@@ -53,6 +53,7 @@ class MatchConfig:
     search_workers: int | None = 1
     parallel_min_branches: int = 8
     candidate_thermo_mode: CandidateThermoMode = "refined"
+    refinement_policy: RefinementPolicy = "static_eval"
     profile: bool = False
 
     def __post_init__(self) -> None:
@@ -73,6 +74,8 @@ class MatchConfig:
             raise ValueError("parallel_min_branches must be at least 1")
         if self.candidate_thermo_mode not in {"selected", "refined", "all"}:
             raise ValueError("candidate_thermo_mode must be 'selected', 'refined', or 'all'")
+        if self.refinement_policy not in {"static_eval", "probability"}:
+            raise ValueError("refinement_policy must be 'static_eval' or 'probability'")
         if self.white_strategy not in STRATEGY_NAMES:
             raise ValueError(f"unknown white strategy: {self.white_strategy}")
         if self.black_strategy not in STRATEGY_NAMES:
@@ -429,6 +432,7 @@ def simulate_match(
         config.search_workers,
         config.parallel_min_branches,
         config.candidate_thermo_mode,
+        config.refinement_policy,
     )
     black = ThermoPlayer(
         "Black custom" if black_style is not None else f"Black {config.black_strategy.replace('_', ' ')}",
@@ -442,6 +446,7 @@ def simulate_match(
         config.search_workers,
         config.parallel_min_branches,
         config.candidate_thermo_mode,
+        config.refinement_policy,
     )
     players = {chess.WHITE: white, chess.BLACK: black}
 
@@ -482,6 +487,7 @@ def simulate_match(
             search_mode=search_result.search_mode,
             beta=search_result.beta,
             adaptive_c=search_result.adaptive_c,
+            refinement_policy=search_result.refinement_policy,
             U=search_result.U,
             entropy=search_result.entropy,
             N_eff=search_result.N_eff,
@@ -550,6 +556,7 @@ def simulate_match(
             "search_depth": config.cdepth,
             "search_mode": config.search_mode,
             "adaptive_c": config.adaptive_c,
+            "refinement_policy": config.refinement_policy,
             "U_current": search_result.U,
             "U_after_move": choice.value,
             "candidate_delta_u": choice.delta_u,

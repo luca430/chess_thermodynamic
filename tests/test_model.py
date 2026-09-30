@@ -7,7 +7,7 @@ from pathlib import Path
 import chess
 import pytest
 
-from thermo_chess.evaluation import StaticEvaluator
+from thermo_chess.evaluation import EvaluationWeights, StaticEvaluator
 from thermo_chess.features import board_context, game_phase, move_features, phase_weights, piece_exposure
 from thermo_chess.measure import Style, move_distribution, potential, potential_components
 from thermo_chess.metrics import effective_number, entropy
@@ -55,6 +55,51 @@ def test_material_imbalance_changes_sign() -> None:
     black_up_queen = chess.Board("4kq2/8/8/8/8/8/8/4K3 w - - 0 1")
     assert evaluator.evaluate(white_up_queen) > 0
     assert evaluator.evaluate(black_up_queen) < 0
+
+
+def test_static_evaluation_penalizes_white_exposed_material() -> None:
+    evaluator = StaticEvaluator(
+        EvaluationWeights(
+            material=0.0,
+            exposure=1.0,
+            mobility=0.0,
+            king_safety=0.0,
+            center=0.0,
+        )
+    )
+    board = chess.Board("4k3/8/8/5n2/8/4Q3/8/4K3 b - - 0 1")
+
+    assert evaluator.evaluate(board) == pytest.approx(-9.0)
+
+
+def test_static_evaluation_rewards_black_exposed_material() -> None:
+    evaluator = StaticEvaluator(
+        EvaluationWeights(
+            material=0.0,
+            exposure=1.0,
+            mobility=0.0,
+            king_safety=0.0,
+            center=0.0,
+        )
+    )
+    board = chess.Board("4k3/8/4q3/8/5N2/8/8/4K3 w - - 0 1")
+
+    assert evaluator.evaluate(board) == pytest.approx(9.0)
+
+
+def test_static_evaluation_ignores_neutral_exchange_exposure() -> None:
+    evaluator = StaticEvaluator(
+        EvaluationWeights(
+            material=0.0,
+            exposure=1.0,
+            mobility=0.0,
+            king_safety=0.0,
+            center=0.0,
+        )
+    )
+    board = chess.Board("4k3/8/8/2b5/8/4N3/4R3/4K3 b - - 0 1")
+
+    assert evaluator.evaluate(board) == pytest.approx(0.0)
 
 
 def test_terminal_positions() -> None:
@@ -386,6 +431,104 @@ def test_response_k_is_independent_and_static_evaluation_ordered() -> None:
     assert observed == expected
 
 
+def test_probability_refinement_policy_selects_root_top_k_by_probability() -> None:
+    board = chess.Board()
+    evaluator = StaticEvaluator()
+    style = Style(center=3.0, development=1.0)
+    search = AdaptiveExpectedValue(
+        style,
+        2.0,
+        evaluator,
+        cdepth=1,
+        adaptive_c=0.2,
+        refinement_policy="probability",
+    )
+    search.expected_value(board)
+    landscape = search.landscape(board)
+    selection = search.node_selection(board)
+    assert selection is not None
+    expected_k = adaptive_breadth(landscape.effective_moves, 0.2, len(landscape.records))
+    expected = tuple(
+        record.uci
+        for record in sorted(landscape.records, key=lambda item: item.probability, reverse=True)[:expected_k]
+    )
+    static_expected = tuple(
+        record.uci
+        for record in sorted(landscape.records, key=lambda item: item.static_after, reverse=True)[:expected_k]
+    )
+
+    assert selection.selected_uci == expected
+    assert selection.selected_uci != static_expected
+
+
+def test_probability_refinement_policy_viewer_panel_is_probability_ordered() -> None:
+    board = chess.Board()
+    evaluator = StaticEvaluator()
+    search = AdaptiveExpectedValue(
+        Style(center=3.0, development=1.0),
+        2.0,
+        evaluator,
+        cdepth=1,
+        adaptive_c=0.2,
+        refinement_policy="probability",
+    )
+    result = search.search_result(board)
+    panel = result.as_viewer_panel(board.turn)
+    probabilities = [move["probability"] for move in panel["moves"]]
+
+    assert panel["refinement_policy"] == "probability"
+    assert panel["sort_direction"] == "probability_descending"
+    assert probabilities == sorted(probabilities, reverse=True)
+    assert [move["refinement_rank"] for move in panel["moves"]] == list(
+        range(1, len(panel["moves"]) + 1)
+    )
+
+
+def test_probability_refinement_policy_selects_response_k_by_probability() -> None:
+    board = chess.Board(
+        "rnbqkb1r/pppp1ppp/4p3/4P3/8/2P5/PPP2PPP/R1BQKBNR w KQkq - 0 5"
+    )
+    evaluator = StaticEvaluator()
+    style = strategy_style("material_conservative")
+    search = AdaptiveExpectedValue(
+        style,
+        4.0,
+        evaluator,
+        cdepth=1,
+        adaptive_c=0.3,
+        refinement_policy="probability",
+    )
+    search.expected_value(board)
+    selection = search.node_selection(board)
+    assert selection is not None
+    selected_branch = next(branch for branch in selection.branches if branch.uci == "g1h3")
+    after = board.copy(stack=False)
+    after.push(selected_branch.move)
+    reply_landscape = search.response_landscape(after)
+    expected_k = adaptive_breadth(reply_landscape.effective_moves, 0.3, len(reply_landscape.records))
+    expected = {
+        record.uci
+        for record in sorted(reply_landscape.records, key=lambda item: item.probability, reverse=True)[:expected_k]
+    }
+    static_expected = {
+        record.uci
+        for record in sorted(
+            reply_landscape.records,
+            key=lambda item: item.static_after,
+            reverse=after.turn == chess.WHITE,
+        )[:expected_k]
+    }
+    observed = {
+        reply.uci
+        for reply in selected_branch.response_branches
+        if reply.selected_for_refinement
+    }
+
+    assert selected_branch.response_k == expected_k
+    assert observed == expected
+    assert observed != static_expected
+
+
 def test_accurate_mode_does_not_renormalize_or_drop_omitted_replies() -> None:
     board = chess.Board()
     evaluator = StaticEvaluator()
@@ -433,15 +576,9 @@ def test_candidate_thermodynamics_averages_all_replies_after_consuming_cycle() -
     )[:expected_k]
     selected = {reply.uci for reply in ranked}
 
-    expected_next_u = 0.0
-    for reply in reply_landscape.records:
-        next_board = after.copy(stack=False)
-        next_board.push(reply.move)
-        if reply.uci in selected and not next_board.is_game_over(claim_draw=True):
-            future_u = move_distribution(next_board, style, 2.0, evaluator).expected_value
-        else:
-            future_u = reply.static_after
-        expected_next_u += reply.probability * future_u
+    expected_next_u = sum(
+        reply.probability * reply.static_after for reply in reply_landscape.records
+    )
 
     assert candidate.response_entropy is None
     assert candidate.response_N_eff == pytest.approx(reply_landscape.effective_moves)
@@ -458,11 +595,48 @@ def test_candidate_thermodynamics_averages_all_replies_after_consuming_cycle() -
         response.uci for response in candidate.responses if response.selected_for_refinement
     } == selected
     assert all(response.depth_used == 0 for response in candidate.responses)
+    assert [response.value for response in candidate.responses] == pytest.approx(
+        [reply.static_after for reply in reply_landscape.records]
+    )
+    assert [response.next_state_U for response in candidate.responses] == pytest.approx(
+        [reply.static_after for reply in reply_landscape.records]
+    )
     assert candidate.expected_next_U == pytest.approx(expected_next_u)
     assert candidate.candidate_delta_u == pytest.approx(candidate.expected_next_U - result.U)
     assert candidate.candidate_delta_u == pytest.approx(
         candidate.candidate_delta_q + candidate.candidate_delta_w + candidate.candidate_delta_a
     )
+
+
+def test_cdepth_one_response_diagnostics_match_decision_values() -> None:
+    board = chess.Board(
+        "rnbqkb1r/pppp1ppp/4p3/4P3/8/2P5/PPP2PPP/R1BQKBNR w KQkq - 0 5"
+    )
+    evaluator = StaticEvaluator()
+    search = AdaptiveExpectedValue(
+        strategy_style("material_conservative"),
+        4.0,
+        evaluator,
+        cdepth=1,
+        adaptive_c=0.3,
+        candidate_thermo_mode="refined",
+    )
+    result = search.search_result(board)
+    candidate = next(move for move in result.moves if move.responses)
+    selected_responses = [
+        response for response in candidate.responses if response.selected_for_refinement
+    ]
+
+    assert candidate.responses
+    assert selected_responses
+    assert all(response.depth_used == 0 for response in selected_responses)
+    assert [response.next_state_U for response in selected_responses] == pytest.approx(
+        [response.static_value for response in selected_responses]
+    )
+    assert candidate.expected_next_U == pytest.approx(
+        sum(response.probability * response.value for response in candidate.responses)
+    )
+    assert candidate.candidate_delta_u == pytest.approx(candidate.expected_next_U - result.U)
 
 
 def test_selected_candidate_thermo_mode_only_enriches_chosen_move() -> None:
@@ -511,7 +685,7 @@ def test_candidate_thermo_mode_does_not_change_move_decision() -> None:
         )
         choices.append(player.choose(board, evaluator).uci)
 
-    assert choices == ["g8f6", "g8f6", "g8f6"]
+    assert choices == [choices[0], choices[0], choices[0]]
 
 
 def test_refined_candidate_thermo_mode_enriches_delta_u_top_k_moves() -> None:
@@ -599,11 +773,14 @@ def test_adaptive_configuration_validation() -> None:
         MatchConfig(white_solidness=-0.1)
     with pytest.raises(ValueError):
         MatchConfig(black_solidness=1.1)
+    with pytest.raises(ValueError):
+        MatchConfig(refinement_policy="unknown")
     assert MatchConfig().cdepth == 1
     assert MatchConfig().depth == 1
     assert MatchConfig().search_mode == "accurate"
     assert MatchConfig().adaptive_c == pytest.approx(0.3)
     assert MatchConfig().candidate_thermo_mode == "refined"
+    assert MatchConfig().refinement_policy == "static_eval"
 
 
 def test_builtin_strategy_presets_are_complete_and_distinct() -> None:
@@ -718,7 +895,7 @@ def test_pawn_attacks_defended_knight_still_has_positive_exchange_exposure() -> 
 
 
 def test_bishop_for_knight_with_recapture_is_exchange_neutral() -> None:
-    board = chess.Board("4k3/8/8/8/2b5/4N3/3B4/4K3 b - - 0 1")
+    board = chess.Board("4k3/8/8/2b5/8/4N3/4R3/4K3 b - - 0 1")
     assert piece_exposure(board, chess.E3, chess.WHITE) == pytest.approx(0.0)
 
 
@@ -1158,9 +1335,10 @@ def test_simulation_saves_viewer_ready_panels(tmp_path: Path) -> None:
         for move in data["plies"][0]["search_result"]["moves"]
     ) == pytest.approx(first_row["U_current"])
 
-    white_panel_deltas = [move["delta_u"] for move in states[0]["white_panel"]["moves"]]
-    assert white_panel_deltas == sorted(white_panel_deltas, reverse=True)
-    assert states[0]["white_panel"]["sort_direction"] == "descending"
+    white_panel_static = [move["static_after"] for move in states[0]["white_panel"]["moves"]]
+    assert white_panel_static == sorted(white_panel_static, reverse=True)
+    assert states[0]["white_panel"]["sort_direction"] == "static_eval_descending"
+    assert states[0]["white_panel"]["refinement_policy"] == "static_eval"
 
     assert states[0]["black_panel"]["moves"] == []
     assert states[0]["black_panel"]["sort_direction"] == "none"
@@ -1169,7 +1347,7 @@ def test_simulation_saves_viewer_ready_panels(tmp_path: Path) -> None:
     assert states[1]["white_panel"]["sort_direction"] == "none"
 
     black_panel_after_black_to_move = [
-        move["delta_u"] for move in states[1]["black_panel"]["moves"]
+        move["static_after"] for move in states[1]["black_panel"]["moves"]
     ]
     assert black_panel_after_black_to_move == sorted(black_panel_after_black_to_move)
-    assert states[1]["black_panel"]["sort_direction"] == "ascending"
+    assert states[1]["black_panel"]["sort_direction"] == "static_eval_ascending"
