@@ -1,38 +1,48 @@
 # Thermodynamic Toy Chess
 
-`chess_thermodynamic` is an experimental chess simulator based on probability-weighted expected values, information entropy, and player-specific strategic styles. It is intended for studying how two observers can assign different importance to the same legal moves.
+`chess_thermodynamic` is an experimental chess simulator in which legal moves are assigned observer-dependent probabilities, while board positions are evaluated by a shared static evaluator. The simulator then combines these two ingredients through probability-weighted expectations.
 
-It is not a conventional chess engine. In particular, it does not use minimax, alpha-beta pruning, opening books, or an external engine. Max/min operations are used only to choose the final move and to decide which branches receive more computation. The value of a position remains a probability-weighted expectation.
+The project is intended for studying how two observers with different strategic preferences can assign different importance to the same legal moves and, as a consequence, allocate computational effort differently when looking ahead.
+
+This is **not** a conventional chess engine. It does not use minimax, alpha-beta pruning, opening books, or an external chess engine. Maxima and minima are used only at the final decision stage, when White selects the largest move score and Black selects the smallest one. All intermediate position values remain probability-weighted expectations.
+
+---
 
 ## Contents
 
-- [Conceptual overview](#conceptual-overview)
-- [Mathematical framework](#mathematical-framework)
-- [Exact potential feature formulas](#exact-potential-feature-formulas)
-- [Exact board-evaluation formulas](#exact-board-evaluation-formulas)
-- [Exact Cycle Recursive Expectation](#exact-cycle-recursive-expectation)
-- [Adaptive cycle search](#adaptive-cycle-search)
-- [Decision making](#decision-making)
-- [Heat, work, and accessibility](#heat-work-and-accessibility)
-- [Default model parameters](#default-model-parameters)
-- [Installation](#installation)
-- [Running simulations](#running-simulations)
-- [Viewer](#viewer)
-- [Saved data](#saved-data)
-- [Analysis and tests](#analysis-and-tests)
-- [Python configuration](#python-configuration)
-- [Project structure](#project-structure)
-- [Performance and limitations](#performance-and-limitations)
+1. [Model overview](#1-model-overview)
+2. [Notation and conventions](#2-notation-and-conventions)
+3. [Observer-dependent move model](#3-observer-dependent-move-model)
+4. [Universal board evaluation](#4-universal-board-evaluation)
+5. [Entropy and adaptive search](#5-entropy-and-adaptive-search)
+6. [Move selection](#6-move-selection)
+7. [Thermodynamic diagnostics](#7-thermodynamic-diagnostics)
+8. [Default parameters and strategy presets](#8-default-parameters-and-strategy-presets)
+9. [Installation](#9-installation)
+10. [Running simulations](#10-running-simulations)
+11. [Viewer](#11-viewer)
+12. [Saved data](#12-saved-data)
+13. [Analysis, tests, and benchmark](#13-analysis-tests-and-benchmark)
+14. [Python configuration](#14-python-configuration)
+15. [Project structure](#15-project-structure)
+16. [Performance and limitations](#16-performance-and-limitations)
 
-## Conceptual Overview
+---
 
-The model separates three ideas:
+# 1. Model Overview
 
-1. **Universal board evaluation:** `E(B)` describes whether a board favors White or Black. Both players use the same evaluator.
-2. **Observer-dependent move measure:** each player has style coefficients that produce a probability distribution over legal moves.
-3. **Adaptive expected value:** the distribution's entropy controls how broadly and deeply future positions are explored.
+The model separates three concepts.
 
-The sign convention is global:
+1. **Universal board evaluation.**  
+   A scalar function \(E(B)\) evaluates a board position \(B\). The same evaluator is used by both players.
+
+2. **Observer-dependent move probabilities.**  
+   Each player has a vector of strategic preferences. These preferences define a potential \(\Phi_p(m,B)\) for every legal move \(m\), which is converted into a probability distribution over moves.
+
+3. **Adaptive expected-value search.**  
+   The entropy of the move distribution determines how many branches receive refined evaluation and how deep the search is allowed to continue locally.
+
+The global sign convention is
 
 ```math
 E(B)>0 \quad\text{favors White},
@@ -40,100 +50,113 @@ E(B)>0 \quad\text{favors White},
 E(B)<0 \quad\text{favors Black}.
 ```
 
-The same convention applies to adaptive expected values and `expected_delta_u_star`. Legacy `delta_u` fields are aliases for that same White-positive quantity.
+The same sign convention is used for all expected board values derived from \(E(B)\).
 
-The players differ because they weight moves differently, not because they use different definitions of material or different signs for `E`.
+The players differ only through their observer-dependent move distributions. They do **not** use different material values, different board-evaluation formulas, or different sign conventions.
 
-## Mathematical Framework
+The rest of the README builds these ingredients in this order:
 
-### Board and move notation
+```text
+board and move notation
+        ↓
+move features and style potential
+        ↓
+move probabilities
+        ↓
+universal board evaluation
+        ↓
+entropy and adaptive refinement
+        ↓
+expected-value decision rule
+        ↓
+Q/W/A and prediction diagnostics
+```
 
-Let:
+---
 
-- $B$ be a chess position;
-- $\mathcal M(B)$ be the legal moves in that position;
-- $B_m$ be the position after legal move $m$;
-- $\lambda^{(0)}$ be an observer's baseline vector of style preferences;
-- $\kappa$ be the Boltzmann-like constant, defaulting to `1.0` in pawn units;
-- $T$ be that observer's temperature, with $\beta = 1/(\kappa T)$ kept as the backward-compatible inverse-temperature interface.
+# 2. Notation and Conventions
 
-### Move features and style potential
+## 2.1 Board and move notation
 
-For every legal move, the project computes features $F_k(m,B)$ from the perspective of the side actually making the move:
+Let
+
+- \(B\) be a chess position;
+- \(\mathcal M(B)\) be the set of legal moves in \(B\);
+- \(m\in\mathcal M(B)\) be one legal move;
+- \(B_m\) be the board obtained after move \(m\);
+- \(r\) be a legal response to \(m\);
+- \(B_{mr}\) be the board after the sequence \(m\) followed by \(r\);
+- \(p\) denote the observer whose preferences are being used;
+- \(c\in\{\mathrm{White},\mathrm{Black}\}\) denote a chess color;
+- \(\bar c\) denote the opposite color.
+
+A complete interaction cycle is
+
+```text
+player move -> opponent response
+```
+
+and therefore contains two plies.
+
+The search parameter `cdepth` counts these complete interaction cycles.
+
+## 2.2 Piece values
+
+All material-like quantities are expressed in pawn units:
+
+| Piece | Value |
+|---|---:|
+| Pawn | `1` |
+| Knight | `3` |
+| Bishop | `3` |
+| Rook | `5` |
+| Queen | `9` |
+| King | `0` |
+
+The king has value zero because checkmate is handled separately as a terminal condition.
+
+## 2.3 Material notation
+
+Let \(n_t(B,c)\) be the number of pieces of type \(t\) and color \(c\) on board \(B\).
+
+Then the material owned by color \(c\) is
 
 ```math
-\Phi_p(m,B)
+M(B,c)
 =
-\sum_k \lambda_{p,k}(g)F_k(m,B).
+\sum_{t\in\{P,N,B,R,Q,K\}}
+v(t)\,n_t(B,c),
 ```
 
-Features entering `Phi` are interpreted in pawn-equivalent units. Material and preservation are naturally in pawns; tactical and positional features are conservatively scaled to pawn fractions. Mate remains a separate dominant terminal feature. Baseline strategy coefficients are first phase-modulated into unnormalized weights and then renormalized so active non-terminal strategy weights sum to `1` at every game phase.
+where \(v(t)\) is the piece value in the table above.
 
-This mover-relative convention is important. For example, winning material is a positive move feature whether White or Black makes the capture. When an observer evaluates opponent moves deeper in the tree, the observer's same $\lambda$ is retained, while `move_features(board, move)` still describes the side that actually moves at that node.
-
-The implemented move features are:
-
-| Feature | Meaning |
-|---|---|
-| `material` | Change in mover-relative material balance, in pawn units. |
-| `preservation` | Reduction in the mover's exchange-aware exposed material. |
-| `activity` | Normalized change in own mobility minus half the opponent's mobility change. |
-| `king_safety` | Change in the mover's static king-safety score. |
-| `king_restriction` | Reduction in the opponent king's legal moves. |
-| `king_pressure` | Increase in attacked squares around the opponent king. |
-| `center` | Normalized change in attacked central and extended-central squares. |
-| `check` | `1` if the resulting position checks the opponent, otherwise `0`. |
-| `mate` | `1` if the move checkmates, otherwise `0`. |
-| `promotion` | Promotion material gain, normalized by `8`. |
-| `castle_preserve` | Change in the mover's retained castling rights; castling itself is exempt. |
-| `castle_deny` | Number of opponent castling rights removed by the move. |
-| `castle` | `1` when the move is castling, otherwise `0`. |
-
-Piece values are pawn `1`, knight `3`, bishop `3`, rook `5`, queen `9`, and king `0`. Preservation uses a shallow legal-capture exchange calculation rather than raw attacker or defender counts.
-
-### Shared helper quantities
-
-The formulas below use the following helper quantities. Let $B$ be a board
-position, $c\in\{\mathrm{White},\mathrm{Black}\}$ a color, $\bar c$ its
-opponent, and $t$ a piece type. Define
+The mover-relative material balance is
 
 ```math
-n_t(B,c)=\text{the number of pieces of type }t\text{ and color }c
-\text{ present on board }B.
-```
-
-Here $t$ ranges over pawn, knight, bishop, rook, queen, and king. For example,
-$n_{\mathrm{rook}}(B,\mathrm{White})=2$ when White has both rooks. Let $v(t)$
-be the piece value above; in particular, $v(\mathrm{king})=0$, so the king is
-included in the sum but contributes no material value.
-
-Material owned by one color is
-
-```math
-M(B,c)=\sum_{t\in\{P,N,B,R,Q,K\}} v(t)\,n_t(B,c),
-```
-
-and mover-relative material balance is
-
-```math
-M_{\mathrm{rel}}(B,c)=M(B,c)-M(B,\bar c).
-```
-
-`legal_mobility(B, c)` copies the board, sets the side to move to $c$, and counts legal moves. Denote this count by $L(B,c)$. It returns zero for checkmate, stalemate, or insufficient-material positions.
-
-The attacked-center score is
-
-```math
-C(B,c)
+M_{\mathrm{rel}}(B,c)
 =
-\sum_{s\in\{d4,e4,d5,e5\}}
-\mathbf 1[c\text{ attacks }s]
-+0.35
-\sum_{s\in\mathcal C_{\mathrm{ext}}}
-\mathbf 1[c\text{ attacks }s],
+M(B,c)-M(B,\bar c).
 ```
 
-where
+This quantity is positive when color \(c\) has more material than its opponent.
+
+## 2.4 Mobility
+
+Let
+
+```math
+L(B,c)
+```
+
+be the number of legal moves available to color \(c\) in board position \(B\).
+
+Operationally, the board is copied, the side to move is set to \(c\), and legal moves are counted.
+
+The value is zero for checkmate, stalemate, or insufficient-material positions.
+
+## 2.5 Center control
+
+Define the extended-center set
 
 ```math
 \mathcal C_{\mathrm{ext}}
@@ -141,13 +164,28 @@ where
 \{c3,d3,e3,f3,c4,f4,c5,f5,c6,d6,e6,f6\}.
 ```
 
+The attacked-center score of color \(c\) is
+
+```math
+C(B,c)
+=
+\sum_{s\in\{d4,e4,d5,e5\}}
+\mathbf 1[c\text{ attacks }s]
++
+0.35
+\sum_{s\in\mathcal C_{\mathrm{ext}}}
+\mathbf 1[c\text{ attacks }s].
+```
+
 This measures attacked squares, not piece occupancy.
 
-For king square $k_c$, define
+## 2.6 King safety
 
-- $A(B,c)$: enemy attackers of $k_c$;
-- $D(B,c)$: friendly defenders of $k_c$;
-- $P(B,c)$: king-adjacent squares attacked by the enemy.
+Let \(k_c\) be the square occupied by the king of color \(c\). Define
+
+- \(A(B,c)\): number of enemy attackers of \(k_c\);
+- \(D(B,c)\): number of friendly defenders of \(k_c\);
+- \(P(B,c)\): number of king-adjacent squares attacked by the opponent.
 
 The king-safety helper is
 
@@ -157,11 +195,15 @@ K_{\mathrm{safe}}(B,c)
 \frac{D(B,c)-1.5A(B,c)-0.25P(B,c)}{8}.
 ```
 
-If color $c$ has no king, this helper returns `-1`.
+If color \(c\) has no king, the helper returns `-1`.
 
-### Exchange exposure used by preservation
+## 2.7 Exchange-aware exposure
 
-For a square $s$ occupied by an opposing non-king piece, the exchange routine considers only legal captures onto that square. If $G(B,s,c)$ is the best profitable gain available to attacker $c$, then conceptually
+Several later formulas require an estimate of how much material can be profitably captured on a square.
+
+For a square \(s\) occupied by an opposing non-king piece, let \(\mathcal X(B,s,c)\) be the legal captures by color \(c\) onto \(s\).
+
+Define the best profitable exchange gain recursively as
 
 ```math
 G(B,s,c)
@@ -169,13 +211,15 @@ G(B,s,c)
 \max\left(
 0,
 \max_{m\in\mathcal X(B,s,c)}
-\left[v(\text{piece on }s)-G(B_m,s,\bar c)\right]
-\right),
+\left[
+v(\text{piece on }s)-G(B_m,s,\bar c)
+\right]
+\right).
 ```
 
-where $\mathcal X(B,s,c)$ is the set of legal captures by $c$ onto $s$. The outer zero lets either side decline an unprofitable continuation.
+The outer zero allows the attacking side to stop the exchange whenever continuing would be unprofitable.
 
-The total exposed material for side $c$ is
+The total exposed material of color \(c\) is
 
 ```math
 X(B,c)
@@ -184,17 +228,219 @@ X(B,c)
 G(B,s,\bar c).
 ```
 
-This is a local static-exchange-style calculation. It recursively follows captures on one square, but it is not a general board search.
+This is a local static-exchange-style calculation restricted to repeated captures on one square. It is not a general tactical search.
 
-## Exact Potential Feature Formulas
+---
 
-Let $c$ be `board.turn` before move $m$, and let $B_m$ be the resulting board.
+# 3. Observer-Dependent Move Model
 
-The base move potential contains the original ten features plus three explicit
-castling features:
+This section defines how an observer assigns probabilities to legal moves. The board evaluator \(E(B)\), which is independent of observer style, is introduced later in [Section 4](#4-universal-board-evaluation).
+
+## 3.1 Style coefficients
+
+Each observer \(p\) has a vector of style coefficients
 
 ```math
-\Phi_\lambda(m,B)
+\lambda_p
+=
+(\lambda_{p,1},\lambda_{p,2},\ldots).
+```
+
+For a legal move \(m\), the simulator computes mover-relative features
+
+```math
+F_k(m,B).
+```
+
+The move potential is a weighted sum of these features:
+
+```math
+\Phi_p(m,B)
+=
+\sum_k \lambda_{p,k}(g)\,F_k(m,B),
+```
+
+where \(g\in[0,1]\) is the development-phase variable defined in [Section 3.4](#34-development-phase).
+
+All move features are evaluated from the perspective of the side that actually makes the move. For example, gaining material is positive whether White or Black performs the capture.
+
+An observer's style coefficients remain fixed throughout that observer's search, including nodes where the opponent is the side to move.
+
+## 3.2 Move features
+
+The model uses the following features:
+
+| Feature | Meaning |
+|---|---|
+| `material` | Change in mover-relative material balance, in pawn units. |
+| `preservation` | Reduction in the mover's exchange-aware exposed material. |
+| `activity` | Change in own mobility minus half the opponent's mobility change, normalized by `30`. |
+| `king_safety` | Change in the mover's static king-safety score. |
+| `king_restriction` | Reduction in the opponent king's legal moves. |
+| `king_pressure` | Increase in attacked squares around the opponent king. |
+| `center` | Change in attacked center and extended-center squares, normalized by `6`. |
+| `check` | `1` if the resulting position gives check, otherwise `0`. |
+| `mate` | `1` if the move gives checkmate, otherwise `0`. |
+| `promotion` | Promotion material gain normalized by `8`. |
+| `castle_preserve` | Change in retained castling rights, with actual castling exempted. |
+| `castle_deny` | Number of opponent castling rights removed. |
+| `castle` | `1` if the move is castling, otherwise `0`. |
+
+The exact formulas are defined below.
+
+### Material
+
+Let \(c\) be the side to move before \(m\). Then
+
+```math
+F_{\mathrm{material}}(m,B)
+=
+M_{\mathrm{rel}}(B_m,c)
+-
+M_{\mathrm{rel}}(B,c).
+```
+
+### Preservation
+
+```math
+F_{\mathrm{preservation}}(m,B)
+=
+X(B,c)-X(B_m,c).
+```
+
+A positive value means that the mover leaves less material profitably capturable after the move.
+
+### Activity
+
+```math
+F_{\mathrm{activity}}(m,B)
+=
+\frac{
+[L(B_m,c)-L(B,c)]
+-
+0.5[L(B_m,\bar c)-L(B,\bar c)]
+}{30}.
+```
+
+### King safety
+
+```math
+F_{\mathrm{king\_safety}}(m,B)
+=
+K_{\mathrm{safe}}(B_m,c)
+-
+K_{\mathrm{safe}}(B,c).
+```
+
+### King restriction
+
+Let \(L_K(B,c)\) be the number of legal moves available specifically to the king of color \(c\). Then
+
+```math
+F_{\mathrm{king\_restriction}}(m,B)
+=
+L_K(B,\bar c)
+-
+L_K(B_m,\bar c).
+```
+
+### King pressure
+
+Let \(Q(B,c)\) be the number of squares adjacent to the opponent king that are attacked by color \(c\). Then
+
+```math
+F_{\mathrm{king\_pressure}}(m,B)
+=
+Q(B_m,c)-Q(B,c).
+```
+
+### Center control
+
+```math
+F_{\mathrm{center}}(m,B)
+=
+\frac{C(B_m,c)-C(B,c)}{6}.
+```
+
+### Check
+
+```math
+F_{\mathrm{check}}(m,B)
+=
+\mathbf 1[B_m\text{ gives check}].
+```
+
+### Mate
+
+```math
+F_{\mathrm{mate}}(m,B)
+=
+\mathbf 1[B_m\text{ is checkmate}].
+```
+
+### Promotion
+
+If move \(m\) promotes a pawn to piece type \(t\),
+
+```math
+F_{\mathrm{promotion}}(m,B)
+=
+\frac{v(t)-v(\mathrm{pawn})}{8}.
+```
+
+For non-promotion moves this feature is zero.
+
+Therefore, before multiplication by its style coefficient:
+
+- queen promotion contributes `1.0`;
+- rook promotion contributes `0.5`;
+- bishop promotion contributes `0.25`;
+- knight promotion contributes `0.25`.
+
+### Castling rights
+
+Let
+
+```math
+C_c(B)\in\{0,1,2\}
+```
+
+be the number of castling rights retained by color \(c\), counting kingside and queenside rights separately.
+
+The castling-preservation feature is
+
+```math
+F_{\mathrm{castle\_preserve}}(m,B)
+=
+C_c(B_m)-C_c(B),
+```
+
+except that it is set to zero when \(m\) is itself castling.
+
+Thus an ordinary king move usually gives `-2`, an original-rook move usually gives `-1`, and actually using the castling right is not treated as losing it.
+
+The castling-denial feature is
+
+```math
+F_{\mathrm{castle\_deny}}(m,B)
+=
+C_{\bar c}(B)-C_{\bar c}(B_m).
+```
+
+Actual castling is represented by
+
+```math
+F_{\mathrm{castle}}(m,B)
+=
+\mathbf 1[m\text{ is castling}].
+```
+
+## 3.3 Base move potential
+
+Ignoring the phase-dependent modification for the moment, the move potential is
+
+```math
+\Phi_{\mathrm{base}}(m,B)
 =
 \lambda_{\mathrm{material}}F_{\mathrm{material}}
 +\lambda_{\mathrm{preservation}}F_{\mathrm{preservation}}
@@ -211,277 +457,297 @@ castling features:
 +\lambda_{\mathrm{castle}}F_{\mathrm{castle}}.
 ```
 
-### Material
+The next subsection introduces the phase variable \(g\) and the additional phase-dependent contribution.
 
-Material is the change in own-minus-opponent material from the mover's perspective:
+## 3.4 Development phase
+
+The phase variable is board-dependent and does not use the move number.
+
+For each color \(c\), define:
+
+- \(d_N(B,c)\): fraction of the four original minor-piece squares no longer occupied by that color's original minor-piece type;
+- \(d_P(B,c)\): analogous fraction for the two original central-pawn squares;
+- \(d_R(B,c)\): analogous fraction for the original rook and queen squares.
+
+The relevant starting squares are:
+
+```text
+White minor pieces: b1 c1 f1 g1
+Black minor pieces: b8 c8 f8 g8
+
+White central pawns: d2 e2
+Black central pawns: d7 e7
+
+White rooks/queen: a1 d1 h1
+Black rooks/queen: a8 d8 h8
+```
+
+For each color,
 
 ```math
-\boxed{
-F_{\mathrm{material}}(m,B)
+d(B,c)
 =
-M_{\mathrm{rel}}(B_m,c)-M_{\mathrm{rel}}(B,c).
-}
+0.60\,d_N(B,c)
++
+0.25\,d_P(B,c)
++
+0.15\,d_R(B,c).
 ```
 
-### Preservation
-
-Preservation is exposed material before the move minus exposed material afterward:
+The global phase is
 
 ```math
-\boxed{
-F_{\mathrm{preservation}}(m,B)
+g(B)
 =
-X(B,c)-X(B_m,c).
-}
+\operatorname{clamp}_{[0,1]}
+\left(
+\frac{d(B,\mathrm{White})+d(B,\mathrm{Black})}{2}
+\right).
 ```
 
-A positive value means the mover leaves less material profitably capturable after the move. Capturing enemy material is represented separately by `material`.
-
-### Activity
-
-Activity combines the mover's mobility change with half the negative opponent mobility change:
+Three phase weights are then defined:
 
 ```math
-\boxed{
-F_{\mathrm{activity}}(m,B)
+w_D(g)=1-g,
+\qquad
+w_C(g)=4g(1-g),
+\qquad
+w_A(g)=g.
+```
+
+They weight development, consolidation, and attacking tendencies respectively.
+
+The corresponding phase features are
+
+```math
+F_D(m,B)
 =
-\frac{
-[L(B_m,c)-L(B,c)]
--0.5[L(B_m,\bar c)-L(B,\bar c)]
-}{30}.
-}
+d(B_m,c)-d(B,c)
++
+\max(0,F_{\mathrm{activity}}),
 ```
 
-### King Safety
-
-King safety is the change in the mover's king-safety helper:
-
 ```math
-\boxed{
-F_{\mathrm{king\_safety}}(m,B)
+F_C(m,B)
 =
-K_{\mathrm{safe}}(B_m,c)-K_{\mathrm{safe}}(B,c).
-}
+F_{\mathrm{castle}}
++
+F_{\mathrm{king\_safety}},
 ```
 
-### King Restriction
-
-Let $L_K(B,c)$ be the number of legal moves made by color $c$'s king. King restriction is the reduction in enemy king mobility:
+and
 
 ```math
-\boxed{
-F_{\mathrm{king\_restriction}}(m,B)
+F_A(m,B)
 =
-L_K(B,\bar c)-L_K(B_m,\bar c).
-}
+F_{\mathrm{activity}}
++
+F_{\mathrm{king\_pressure}}
++
+F_{\mathrm{king\_restriction}}
++
+F_{\mathrm{check}}.
 ```
 
-### King Pressure
+Let \(\sigma\in[0,1]\) be the observer's `solidness`.
 
-Let $Q(B,c)$ be the number of squares adjacent to the opponent king that are attacked by $c$. King pressure is its change:
+The unscaled phase contribution is
 
 ```math
-\boxed{
-F_{\mathrm{king\_pressure}}(m,B)
+\Phi_{\mathrm{phase}}
 =
-Q(B_m,c)-Q(B,c).
-}
+\lambda_D w_D F_D
++
+\lambda_C w_C F_C
++
+\lambda_A w_A F_A.
 ```
 
-### Center Control
-
-Center control is the normalized change in attacked center score:
-
-```math
-\boxed{
-F_{\mathrm{center}}(m,B)
-=
-\frac{C(B_m,c)-C(B,c)}{6}.
-}
-```
-
-### Check
-
-```math
-\boxed{
-F_{\mathrm{check}}(m,B)
-=
-\mathbf 1[B_m\text{ gives check}],
-}
-```
-
-### Mate
-
-```math
-\boxed{
-F_{\mathrm{mate}}(m,B)
-=
-\mathbf 1[B_m\text{ is checkmate}].
-}
-```
-
-### Promotion
-
-For a promotion to piece type $t$,
-
-```math
-\boxed{
-F_{\mathrm{promotion}}(m,B)
-=
-\frac{v(t)-v(\mathrm{pawn})}{8},
-}
-```
-
-and it is zero for a non-promotion. A queen promotion therefore contributes `1.0`, rook `0.5`, and bishop or knight `0.25` before multiplication by the style coefficient.
-
-### Castling Rights
-
-Let $C_c(B)\in\{0,1,2\}$ count the kingside and queenside castling rights
-still held by color $c$. Each right has value one. Then
-
-```math
-\boxed{F_{\mathrm{castle\_preserve}}(m,B)=C_c(B_m)-C_c(B),}
-```
-
-except that this feature is set to zero when $m$ is itself castling. Thus an
-ordinary king move usually scores `-2`, moving an original rook usually scores
-`-1`, and legitimately using a castling right is not treated as losing it.
-
-For the opponent's rights,
-
-```math
-\boxed{F_{\mathrm{castle\_deny}}(m,B)=C_{\bar c}(B)-C_{\bar c}(B_m),}
-```
-
-and actual castling is represented by
-
-```math
-\boxed{F_{\mathrm{castle}}(m,B)=\mathbf 1[m\text{ is castling}].}
-```
-
-### Development Phase
-
-The phase is board-dependent and does not use the move number. For each color
-$c$, let $d_N(B,c)$ be the fraction of its four original minor-piece squares
-(`b1/c1/f1/g1` or `b8/c8/f8/g8`) no longer occupied by that color's original
-minor-piece type. Define $d_P(B,c)$ analogously for the two original central
-pawn squares (`d2/e2` or `d7/e7`), and $d_R(B,c)$ for the original rook and
-queen squares (`a1/d1/h1` or `a8/d8/h8`). A moved or captured original piece
-therefore advances this simple occupancy-based phase measure.
-
-```math
-d(B,c)=0.60d_N(B,c)+0.25d_P(B,c)+0.15d_R(B,c),
-```
-
-```math
-\boxed{g(B)=\operatorname{clamp}_{[0,1]}
-\left(\frac{d(B,\mathrm{White})+d(B,\mathrm{Black})}{2}\right).}
-```
-
-The phase weights are
-
-```math
-w_D(g)=1-g,\qquad w_C(g)=4g(1-g),\qquad w_A(g)=g.
-```
-
-Writing $F_{\mathrm{activity}}$, $F_{\mathrm{king\_safety}}$, and the other
-terms as defined above, the three phase features are exactly
-
-```math
-\boxed{F_D(m,B)=d(B_m,c)-d(B,c)+\max(0,F_{\mathrm{activity}}),}
-```
-
-```math
-\boxed{F_C(m,B)=F_{\mathrm{castle}}+F_{\mathrm{king\_safety}},}
-```
-
-```math
-\boxed{F_A(m,B)=F_{\mathrm{activity}}+F_{\mathrm{king\_pressure}}
-+F_{\mathrm{king\_restriction}}+F_{\mathrm{check}}.}
-```
-
-Castling-right preservation is weighted separately from the generic phase
-potential. The raw feature remains $F_{\mathrm{castle\_preserve}}$, but its
-effective contribution is
+Castling-right preservation receives a separate phase-dependent weight:
 
 ```math
 w_{\mathrm{castle\_rights}}(g)=1-g,
 ```
 
 ```math
-\boxed{\Phi_{\mathrm{castle\_preserve}}
-=\lambda_{\mathrm{CP}}(1-g)(1+\sigma w_C(g))
-F_{\mathrm{castle\_preserve}}.}
-```
-
-This makes wasted castling rights expensive in the opening and early
-middlegame, with an additional consolidation-phase boost for high-solidness
-players. The multiplier fades as $g$ approaches `1`. Since
-$F_{\mathrm{castle\_preserve}}=0$ for actual castling, using the castling
-right is not penalized.
-
-For `solidness` $\sigma\in[0,1]$, the unscaled phase contribution and final
-potential are
-
-```math
-\Phi_{\mathrm{phase}}
-=\lambda_Dw_DF_D+\lambda_Cw_CF_C+\lambda_Aw_AF_A,
-```
-
-```math
-\boxed{\Phi_{\mathrm{total}}=\Phi_{\mathrm{base}}^*
-+\sigma\Phi_{\mathrm{phase}},
-\qquad
-\Phi_{\mathrm{base}}^*=\Phi_{\mathrm{base\ without\ CP}}
-+\Phi_{\mathrm{castle\_preserve}}.}
-```
-
-At `solidness=0`, the phase mechanism contributes nothing and the potential is
-exactly this adjusted non-phase base.
-Candidate diagnostics save $g$, all three phase weights and features,
-`castle_preserve_raw`, `castle_preserve_phase_weight`,
-`castle_preserve_effective_weight`, `castle_preserve_contribution`,
-`base_potential`, unscaled `phase_potential`, and `total_potential`.
-
-### Boltzmann move distribution
-
-The style potential induces a probability distribution:
-
-```math
-p_\lambda(m\mid B)
+\Phi_{\mathrm{castle\_preserve}}
 =
-\frac{\exp\left(\Phi_\lambda(m,B)/(\kappa T)\right)}
-{\sum_{m'\in\mathcal M(B)}
-\exp\left(\Phi_\lambda(m',B)/(\kappa T)\right)}.
+\lambda_{\mathrm{CP}}
+(1-g)
+\left(1+\sigma w_C(g)\right)
+F_{\mathrm{castle\_preserve}}.
 ```
 
-The implementation uses a numerically stable softmax by subtracting the largest scaled potential before exponentiation.
+This makes wasted castling rights more costly in the opening and early middlegame, while the contribution fades as \(g\to 1\).
 
-Interpretation of temperature:
+The final move potential is
 
-- $\kappa=1.0$ by default, with pawns as the energy unit;
-- the existing $\beta$ interface is preserved as $\beta=1/(\kappa T)$;
-- smaller $\beta$ / larger $T$ produces a flatter distribution;
-- larger $\beta$ / smaller $T$ concentrates probability on moves with high style potential;
-- temperature changes the probability measure, not the static evaluator.
+```math
+\Phi_{\mathrm{total}}
+=
+\Phi_{\mathrm{base}}^*
++
+\sigma\Phi_{\mathrm{phase}},
+```
 
-## Exact Board-Evaluation Formulas
+where
 
-### Universal static evaluation
+```math
+\Phi_{\mathrm{base}}^*
+```
 
-The shared evaluator is
+is the base potential with the ordinary `castle_preserve` term replaced by the phase-dependent castling-preservation contribution above.
+
+At `solidness = 0`, the additional phase term vanishes.
+
+## 3.5 Move probabilities
+
+Let
+
+- \(\kappa>0\) be the Boltzmann-like scale parameter;
+- \(T_p>0\) be the temperature of observer \(p\);
+- \(\beta_p\) be the corresponding inverse temperature,
+
+with
+
+```math
+\beta_p=\frac{1}{\kappa T_p}.
+```
+
+The probability assigned by observer \(p\) to legal move \(m\) is
+
+```math
+P_p(m\mid B)
+=
+\frac{
+\exp\left(\Phi_p(m,B)/(\kappa T_p)\right)
+}{
+\sum_{m'\in\mathcal M(B)}
+\exp\left(\Phi_p(m',B)/(\kappa T_p)\right)
+}.
+```
+
+Equivalently, because \(\beta_p=1/(\kappa T_p)\),
+
+```math
+P_p(m\mid B)
+\propto
+\exp\left(\beta_p\Phi_p(m,B)\right).
+```
+
+The implementation evaluates this softmax in numerically stable form by subtracting the largest scaled potential before exponentiation.
+
+Interpretation:
+
+- larger `beta` means lower effective temperature and a more concentrated move distribution;
+- smaller `beta` means higher effective temperature and a flatter move distribution;
+- `kappa` rescales the relationship between `beta` and temperature;
+- temperature affects the observer-dependent move probabilities, not the universal board evaluator.
+
+The default value is
+
+```text
+kappa = 1.0
+```
+
+in pawn units.
+
+---
+
+# 4. Universal Board Evaluation
+
+The previous section defined **which moves an observer considers likely or important**. This section defines the separate, observer-independent function used to evaluate a board.
+
+## 4.1 Static evaluator
+
+The universal evaluator is
 
 ```math
 E(B)
 =
-\alpha_M\Delta M
-+\alpha_{\mathrm{exposure}}\Delta H
-+\alpha_{\mathrm{mob}}\Delta\mathrm{Mobility}
-+\alpha_K\Delta K
-+\alpha_C\Delta C,
+\alpha_M\Delta M(B)
++
+\alpha_{\mathrm{exposure}}\Delta H(B)
++
+\alpha_{\mathrm{mob}}\Delta\mathrm{Mobility}(B)
++
+\alpha_K\Delta K(B)
++
+\alpha_C\Delta C(B).
 ```
 
-where material, mobility, king safety, and center are White-minus-Black features, while exposure is signed as Black exposed material minus White exposed material. The default weights are:
+The components are defined below.
+
+### Material difference
+
+```math
+\Delta M(B)
+=
+M(B,\mathrm{White})
+-
+M(B,\mathrm{Black}).
+```
+
+### Exposure difference
+
+Let the exposed material of side \(a\) be
+
+```math
+H_a(B)
+=
+\sum_{s\text{ occupied by a non-king piece of }a}
+R_s(B),
+```
+
+where \(R_s(B)\) is the exchange-aware profitable-capture exposure defined through the same local exchange logic used in \(X(B,c)\).
+
+The signed exposure difference is
+
+```math
+\Delta H(B)
+=
+H_{\mathrm{Black}}(B)
+-
+H_{\mathrm{White}}(B).
+```
+
+Therefore White exposure lowers \(E(B)\), while Black exposure raises it.
+
+### Mobility difference
+
+```math
+\Delta\mathrm{Mobility}(B)
+=
+\frac{
+L(B,\mathrm{White})
+-
+L(B,\mathrm{Black})
+}{30}.
+```
+
+### King-safety difference
+
+```math
+\Delta K(B)
+=
+K_{\mathrm{safe}}(B,\mathrm{White})
+-
+K_{\mathrm{safe}}(B,\mathrm{Black}).
+```
+
+### Center-control difference
+
+```math
+\Delta C(B)
+=
+\frac{
+C(B,\mathrm{White})
+-
+C(B,\mathrm{Black})
+}{6}.
+```
+
+## 4.2 Default evaluation weights
 
 | Static component | Default |
 |---|---:|
@@ -492,157 +758,143 @@ where material, mobility, king safety, and center are White-minus-Black features
 | Center control | `0.35` |
 | Checkmate magnitude | `10000.0` |
 
-The board features passed to this evaluator are computed exactly as follows:
-
-```math
-\Delta M(B)=M(B,\mathrm{White})-M(B,\mathrm{Black}),
-```
-
-```math
-H_a(B)
-=
-\sum_{s\text{ occupied by a non-king piece of }a} R_s(B),
-\qquad
-\Delta H(B)=H_{\mathrm{Black}}(B)-H_{\mathrm{White}}(B).
-```
-
-Here `R_s(B)` is the same exchange-aware profitable-capture exposure used by the preservation move feature. White exposed material decreases `E(B)`; Black exposed material increases it.
-
-```math
-\Delta\mathrm{Mobility}(B)
-=
-\frac{L(B,\mathrm{White})-L(B,\mathrm{Black})}{30},
-```
-
-```math
-\Delta K(B)
-=
-K_{\mathrm{safe}}(B,\mathrm{White})
--K_{\mathrm{safe}}(B,\mathrm{Black}),
-```
-
-```math
-\Delta C(B)
-=
-\frac{C(B,\mathrm{White})-C(B,\mathrm{Black})}{6}.
-```
-
-With default weights, a nonterminal board is therefore evaluated as
+With these defaults,
 
 ```math
 E(B)
 =
 \Delta M(B)
-+0.5\,\Delta H(B)
-+0.25\,\Delta\mathrm{Mobility}(B)
-+0.6\,\Delta K(B)
-+0.35\,\Delta C(B).
++
+0.5\,\Delta H(B)
++
+0.25\,\Delta\mathrm{Mobility}(B)
++
+0.6\,\Delta K(B)
++
+0.35\,\Delta C(B).
 ```
 
-Notice that the mobility and center differences are normalized by `30` and `6` before their evaluator weights are applied. The static exposure term uses the same exchange-aware helper as preservation, but it is a universal board feature rather than a style-dependent move feature. The static evaluator does not directly use preservation, activity, checks, king restriction, king pressure, or promotion; those belong to the observer-dependent move potential.
+The static evaluator does not directly use the observer-style coefficients defined in Section 3.
 
-If the side to move is checkmated, `E(B)` receives the appropriate signed checkmate value. Stalemate, insufficient material, the automatic 75-move rule, and fivefold repetition evaluate to zero. At a search terminal or depth-zero node, the search returns `E(B)` directly and never applies a softmax to an empty move set.
+## 4.3 Terminal positions
 
-## Exact Cycle Recursive Expectation
+If the side to move is checkmated, the evaluator returns the appropriate signed checkmate value.
 
-The configured recursive depth is `cdepth`, where one unit is a complete interaction cycle:
+The following positions evaluate to zero:
 
-```text
-player move -> opponent response
-```
+- stalemate;
+- insufficient material;
+- automatic 75-move draw;
+- automatic fivefold repetition.
 
-The static depth-zero value used by the public `expected_value(..., 0)` API is
+At a search terminal or a static depth-zero node, the search returns \(E(B)\) directly.
+
+---
+
+# 5. Entropy and Adaptive Search
+
+The probability distribution from Section 3 determines both the expectation over future positions and how computational effort is allocated.
+
+## 5.1 Entropy
+
+For observer \(p\), the move-distribution entropy is
 
 ```math
-U^{(0)}_{\mathrm{static}}(B)=E(B).
-```
-
-Move selection uses a different base value after a complete cycle, because the same player is to move again. The shallow same-player decision landscape is
-
-```math
-V_p^{(0)}(B)=U_p^{1/2}(B)=\sum_a P_p(a\mid B)E(B_a).
-```
-
-For remaining full-cycle depth `d >= 1`, the observer computes
-
-```math
-V_p^{(d)}(B)=\sum_m P_p(m\mid B)\sum_r P_p(r\mid B_m)\widetilde V^{(d-1)}_{p,m,r},
-```
-
-where probabilities are always defined over all legal moves or replies. The adaptive approximation is
-
-```math
-\widetilde V^{(d-1)}_{p,m,r}=
-\begin{cases}
-V_p^{(d-1)}(B_{mr}), & m\in K,\ r\in K'_m,\\
-E(B_{mr}), & \text{otherwise}.
-\end{cases}
-```
-
-Thus selected branches consume one full cycle and recurse with one fewer cycle remaining. At `cdepth = 1`, selected replies use `U_p^{1/2}(B_mr)`; unselected replies use `E(B_mr)`. At `cdepth > 1`, selected replies genuinely recurse into another full `m -> r` cycle. No probability mass is dropped or renormalized.
-
-This is not minimax. Every branch contributes according to its probability. White finally chooses the legal move with the largest `expected_delta_u_star`, while Black chooses the smallest.
-
-### Entropy and effective number of moves
-
-For each nonterminal move distribution:
-
-```math
-S_\lambda(B)
+S_p(B)
 =
--\sum_m p_\lambda(m\mid B)\log p_\lambda(m\mid B),
+-\sum_{m\in\mathcal M(B)}
+P_p(m\mid B)
+\log P_p(m\mid B).
 ```
 
-and
+The corresponding effective number of moves is
 
 ```math
-N_{\mathrm{eff}}(B)=e^{S_\lambda(B)}.
+N_{\mathrm{eff}}(B)
+=
+e^{S_p(B)}.
 ```
 
-`N_eff` is the number of equally likely moves that would have the same entropy. A concentrated distribution has `N_eff` near `1`; a broad distribution has a larger value.
+Interpretation:
 
-## Adaptive Cycle Search
+- concentrated move distributions have \(N_{\mathrm{eff}}\) close to `1`;
+- broad distributions have larger \(N_{\mathrm{eff}}\).
 
-The implementation uses entropy for both adaptive breadth and the local cycle-depth cap.
+## 5.2 Adaptive breadth
 
-### Adaptive breadth
+Let `adaptive_c` be the positive breadth parameter \(c\).
 
-At the focal player's board, the number of own moves selected for refinement is
+At board \(B\), the number of root moves selected for refined evaluation is
 
 ```math
 K(B)
 =
 \min\left(
 |\mathcal M(B)|,
-\max\left(1,\left\lceil cN_{\mathrm{eff}}(B)\right\rceil\right)
+\max\left(
+1,
+\left\lceil
+cN_{\mathrm{eff}}(B)
+\right\rceil
+\right)
 \right).
 ```
 
-For each selected own move, the opponent-response distribution has its own independently computed
+For a selected root move \(m\), let \(\mathcal R(B_m)\) be the legal responses in \(B_m\). The number of responses selected for refinement is
 
 ```math
 K'_m
 =
 \min\left(
 |\mathcal R(B_m)|,
-\max\left(1,\left\lceil cN_{\mathrm{eff}}(B_m)\right\rceil\right)
+\max\left(
+1,
+\left\lceil
+cN_{\mathrm{eff}}(B_m)
+\right\rceil
+\right)
 \right).
 ```
 
 The default is
 
 ```text
-c = 0.3
+adaptive_c = 0.3
 ```
 
-Top-`K` and top-`K'` selection is controlled by `refinement_policy`. The default `static_eval` policy ranks immediate boards by the side-to-move objective: larger `E(B_m)` for White, smaller `E(B_m)` for Black. The alternative `probability` policy ranks by the observer's move probability. This choice selects which branches receive extra computation; it never changes or renormalizes the probability distribution. Use `--refinement-policy static_eval|probability` in `run_match.py`.
+Only the selected branches receive extra computation. All legal moves and responses retain their original probability mass.
 
-### Entropy-selected local cdepth
+## 5.3 Refinement policy
 
-The local cycle-depth cap is still chosen from `N_eff`:
+The option `refinement_policy` determines **which** branches belong to the top-\(K\) and top-\(K'\) sets.
+
+Available values are:
+
+| Policy | Meaning |
+|---|---|
+| `static_eval` | Rank branches by the immediate universal evaluation \(E\), using the objective of the side whose action is being ranked. |
+| `probability` | Rank branches by the observer's move probability. |
+
+The default is
+
+```text
+refinement_policy = static_eval
+```
+
+For `static_eval`:
+
+- White-favored branches are ranked by larger \(E\);
+- Black-favored branches are ranked by smaller \(E\).
+
+The refinement policy changes only which branches receive extra computation. It does not modify or renormalize the move probabilities.
+
+## 5.4 Entropy-based local depth cap
+
+The entropy-derived depth cap is
 
 ```math
-d_{\mathrm{eff}}(B)=
+d_{\mathrm{eff}}(B)
+=
 \begin{cases}
 4, & N_{\mathrm{eff}}(B)\le 4,\\
 3, & 4<N_{\mathrm{eff}}(B)\le 8,\\
@@ -651,211 +903,313 @@ d_{\mathrm{eff}}(B)=
 \end{cases}
 ```
 
-For remaining cycle budget `r`, the node uses
+If the remaining global cycle budget is \(r\), the local search depth is
 
 ```math
 d_{\mathrm{local}}(B,r)
 =
-\min\left(r,d_{\mathrm{eff}}(B)\right).
+\min(r,d_{\mathrm{eff}}(B)).
 ```
 
-The current decision model uses this breadth machinery to decide which root and response branches receive extra computation. `cdepth` counts full future interaction cycles `m -> r`. At `cdepth = 0`, the public adaptive value falls back to the static board value. For selected complete-cycle branches, the remaining cycle depth decreases by one after `B -> B_m -> B_mr`: if no full cycles remain, the child is valued by the one-ply same-player landscape `U^{1/2}`; if cycles remain, the child is evaluated recursively with the same adaptive K/K' logic. Unrefined branches fall back to immediate `E`.
+The global parameter `cdepth` therefore acts as a hard upper bound, while entropy can reduce the depth locally.
 
-### Decision Making
+## 5.5 Shallow same-player landscape
 
-The universal evaluator remains a side-neutral board score in pawn units:
+Before defining the recursive search, define the one-ply same-player expected value
 
 ```math
-E(B)>0\quad\text{favors White},\qquad E(B)<0\quad\text{favors Black}.
+U_p^{1/2}(B)
+=
+\sum_{a\in\mathcal M(B)}
+P_p(a\mid B)\,E(B_a).
 ```
 
-For observer/player `p`, legal moves use the subjective strategy distribution
+This is the expected static value after one move sampled from observer \(p\)'s move distribution.
+
+It is called a "same-player landscape" because it is later compared with the analogous quantity after a complete move-response cycle, when the same player is again to move.
+
+## 5.6 Recursive cycle expectation
+
+For a remaining full-cycle depth \(d\ge 1\), define
 
 ```math
-P_p(a\mid B)=
-\frac{\exp\left(\Phi_p(a,B)/(\kappa T_p)\right)}
-{\sum_b\exp\left(\Phi_p(b,B)/(\kappa T_p)\right)}.
+V_p^{(d)}(B)
+=
+\sum_m
+P_p(m\mid B)
+\sum_r
+P_p(r\mid B_m)
+\widetilde V_{p,m,r}^{(d-1)}.
 ```
 
-The shallow future decision landscape is
+For a complete branch
 
-```math
-U_p^{1/2}(B)=\sum_a P_p(a\mid B)E(B_a).
+```text
+B -> B_m -> B_mr
 ```
 
-For a complete candidate cycle
+the branch value is
 
 ```math
-B\xrightarrow{m}B_m\xrightarrow{r}B_{mr},
-```
-
-the realized cycle diagnostic is
-
-```math
-\Delta U^*_{m,r}=U_p^{1/2}(B_{mr})-U_p^{1/2}(B).
-```
-
-Move selection uses the response expectation of this full-cycle change. The selected-move score stored as `expected_next_U` is
-
-```math
-V_m=\sum_r P_p(r\mid B_m)V_{m,r},
-```
-
-and the response-averaged decision quantity is
-
-```math
-\langle\Delta U^*\rangle_m=V_m-U_p^{1/2}(B).
-```
-
-White chooses the move with maximal `expected_delta_u_star`; Black chooses the move with minimal `expected_delta_u_star`. The legacy fields `candidate_delta_u` and `delta_u` are retained as aliases for this same quantity in saved data.
-
-Response probabilities use the same observer style as root probabilities:
-
-```math
-P_p(r\mid B_m)\propto \exp\left(\Phi_p(r,B_m)/(\kappa T_p)\right).
-```
-
-The response move features remain mover-relative, so a Black response is described from Black's mover perspective, but the style weights are still player `p`'s weights. The universal static evaluator `E(B_{mr})` does not enter this softmax.
-
-### Adaptive Ranking/Refinement
-
-The K/K' approximation avoids computing `U_p^{1/2}(B_{mr})` for every legal response. Root breadth `K` is selected by the entropy rule above. Under the default `static_eval` refinement policy, root moves are ranked by immediate `E(B_m)` in player `p`'s favor: larger values for White, smaller values for Black. Under `probability`, roots are ranked by `P_p(m|B)`.
-
-For each selected root `m`, response breadth `K'_m` is selected independently from the response entropy. Under `static_eval`, responses are ranked in the responder `p*`'s favor: larger `E(B_{mr})` when White responds, smaller `E(B_{mr})` when Black responds. Under `probability`, responses are ranked by `P_p(r|B_m)`. This ranking decides which branches receive the shallow future-landscape evaluation; it does not change the probabilities.
-
-At the first refinement level, the approximation is
-
-```math
-V_{m,r}=
+\widetilde V_{p,m,r}^{(d-1)}
+=
 \begin{cases}
-U_p^{1/2}(B_{mr}), & m\in K,\ r\in K'_m,\\
-E(B_{mr}), & \text{otherwise}.
+V_p^{(d-1)}(B_{mr}),
+& m\in K,\ r\in K'_m,\ d-1>0,\\[4pt]
+U_p^{1/2}(B_{mr}),
+& m\in K,\ r\in K'_m,\ d-1=0,\\[4pt]
+E(B_{mr}),
+& \text{otherwise}.
 \end{cases}
 ```
 
-For `cdepth > 1`, the selected case becomes the recursive adaptive value at `B_{mr}` with one fewer full cycle remaining; when that remaining depth reaches zero it resolves to `U_p^{1/2}(B_{mr})`. All legal responses keep their original probability mass in `V_m`; top-`K` and top-`K'` sets are never renormalized. Thus unrefined branches still contribute through `E(B_{mr})`.
+Thus:
 
-### Q/W/A Decomposition
+- selected branches receive refined evaluation;
+- unselected branches fall back to the immediate static evaluator;
+- no probability mass is discarded;
+- no top-\(K\) distribution is renormalized.
 
-The Q/W/A diagnostic describes the realized complete-cycle landscape change, not necessarily the approximation used for move selection:
+At `cdepth = 1`, a refined complete cycle ends in the shallow same-player landscape \(U_p^{1/2}(B_{mr})\).
+
+At `cdepth > 1`, a refined complete cycle can recurse into another complete interaction cycle.
+
+At `cdepth = 0`, the adaptive value reduces to the static board evaluator \(E(B)\).
+
+This search remains an expectation, not minimax.
+
+---
+
+# 6. Move Selection
+
+The previous section defined how future branch values are approximated. This section defines the quantity used to choose the move that is actually played.
+
+For a candidate root move \(m\), let
 
 ```math
-\Delta U^*_{m,r}=\Delta Q+\Delta W+\Delta A.
+V_m
+=
+\sum_r
+P_p(r\mid B_m)\,
+V_{m,r},
 ```
 
-For each displayed response, the decomposition compares the same player's shallow local landscapes
+where \(V_{m,r}\) is the branch value assigned by the adaptive search.
+
+The candidate's expected change relative to the current shallow landscape is
+
+```math
+\langle\Delta U^*\rangle_m
+=
+V_m-U_p^{1/2}(B).
+```
+
+The simulator stores \(V_m\) as
+
+```text
+expected_next_U
+```
+
+and the move-selection score as
+
+```text
+expected_delta_u_star
+```
+
+with
+
+```math
+expected_delta_u_star
+=
+expected_next_U
+-
+U_p^{1/2}(B).
+```
+
+Final move selection is
+
+```math
+m_W^*
+=
+\arg\max_m
+\langle\Delta U^*\rangle_m
+```
+
+for White, and
+
+```math
+m_B^*
+=
+\arg\min_m
+\langle\Delta U^*\rangle_m
+```
+
+for Black.
+
+Because both players use the same sign convention for \(E(B)\), White always prefers larger expected values and Black always prefers smaller expected values.
+
+---
+
+# 7. Thermodynamic Diagnostics
+
+The simulator exposes two related but distinct Q/W/A decompositions.
+
+1. **Candidate-cycle diagnostics** compare hypothetical shallow landscapes across a candidate move-response cycle.
+2. **Same-player transition diagnostics** compare two actual saved decision states for the same player.
+
+These diagnostics do not determine the basic definitions of the move probabilities or board evaluator. They are derived after those quantities have been defined.
+
+## 7.1 Candidate-cycle Q/W/A
+
+Consider a candidate cycle
+
+```text
+B -> B_m -> B_mr.
+```
+
+The realized shallow landscape change is
+
+```math
+\Delta U^*_{m,r}
+=
+U_p^{1/2}(B_{mr})
+-
+U_p^{1/2}(B).
+```
+
+For the two shallow landscapes
 
 ```math
 \{P_p(a\mid B),E(B_a)\}
-\quad\text{and}\quad
-\{P_p(a\mid B_{mr}),E(B_{mra})\}.
 ```
 
-`Delta Q` is the redistribution of probability among action labels common to both landscapes. `Delta W` is the change in objective values attached to those common labels. `Delta A` is the contribution from legal actions entering or leaving the action space. Even at `cdepth = 1`, detailed diagnostics construct the shallow `U_p^{1/2}` landscape at `B_{mr}`, so search truncation does not create artificial accessibility.
-
-Candidate rows may also store the response-probability averages `candidate_delta_q`, `candidate_delta_w`, `candidate_delta_a`, and `shallow_expected_delta_u_star` for the exact shallow diagnostic transitions. These satisfy
+and
 
 ```math
-\texttt{shallow\_expected\_delta\_u\_star}
-=\texttt{candidate\_delta\_q}+\texttt{candidate\_delta\_w}+\texttt{candidate\_delta\_a}.
+\{P_p(a\mid B_{mr}),E(B_{mra})\},
 ```
 
-The decision field `expected_delta_u_star` is `expected_next_U - U_p^{1/2}(B)`. For deeper searches it can include recursive adaptive values on refined branches, while Q/W/A remains the shallow realized-cycle diagnostic for `B -> B_m -> B_{mr}`.
+the decomposition is
 
-For performance, candidate scoring is split from detailed thermodynamic diagnostics. The `candidate_thermo_mode` option controls which candidates receive response-level `delta_Q`, `delta_W`, and `delta_A` records:
+```math
+\Delta U^*_{m,r}
+=
+\Delta Q+\Delta W+\Delta A.
+```
+
+Interpretation:
+
+- \(\Delta Q\): redistribution of probability among action labels that exist in both landscapes;
+- \(\Delta W\): change in the values associated with common action labels;
+- \(\Delta A\): contribution from actions entering or leaving the legal action space.
+
+This is a diagnostic decomposition of the exact shallow transition. At larger `cdepth`, the move-selection score may use recursively refined values, so the shallow Q/W/A diagnostic need not equal the deeper decision quantity.
+
+## 7.2 Candidate diagnostic coverage
+
+The option `candidate_thermo_mode` controls which candidate moves receive response-level Q/W/A diagnostics.
 
 | Mode | Meaning |
 |---|---|
-| `selected` | Only the final chosen move is enriched. Fastest mode. |
-| `refined` | Root top-`K` candidates plus the final chosen move are enriched. This is the default. |
-| `all` | Every legal candidate is enriched for debugging/research. |
+| `selected` | Compute detailed diagnostics only for the final chosen move. |
+| `refined` | Compute them for root top-\(K\) candidates and the final chosen move. |
+| `all` | Compute them for every legal candidate. |
 
-Non-enriched candidates still have `expected_next_U` and `expected_delta_u_star`, but their detailed `candidate_delta_q`, `candidate_delta_w`, `candidate_delta_a`, `shallow_expected_delta_u_star`, and response records may be null/empty. Detailed enrichment is diagnostic and does not change the selected move. The command-line flag is `--candidate-thermo-mode selected|refined|all`.
+The default is
 
-Final move selection is:
-
-```math
-m_W^*=\arg\max_m \langle\Delta U^*\rangle_m,
+```text
+candidate_thermo_mode = refined
 ```
 
+Changing this option affects diagnostic cost only. It does not change the selected move.
+
+## 7.3 Same-player transition Q/W/A
+
+A same-player transition compares two consecutive decision states of the same player.
+
+For White, this means comparing one White-to-move position with the next White-to-move position two plies later. Black is treated analogously.
+
+Suppose the stored adaptive observable associated with legal move \(m\) is \(O_m(B)\). Then
+
 ```math
-m_B^*=\arg\min_m \langle\Delta U^*\rangle_m.
+\widetilde U(B)
+=
+\sum_m p_m O_m.
 ```
 
-### Terminal Positions
+For the common action support \(\mathcal L_\cap\) of two consecutive same-player states, define the midpoint heat-like term
 
-If a candidate move directly produces a terminal board, its branch value is `E(B_m)`. If a response reaches a terminal board, the response value is `E(B_{m,r})`. For thermodynamic bookkeeping only, a terminal same-player state is represented as an absorbing pseudo-branch `__terminal__` with probability `1`.
+```math
+\Delta\widetilde Q
+=
+\sum_{m\in\mathcal L_\cap}
+\frac{O_m+O'_m}{2}
+(p'_m-p_m),
+```
 
-### Caching and Stored Results
+and the midpoint work-like term
 
-Each observer search caches static evaluations, move landscapes, shallow future landscapes, selected branch metadata, and the serializable `SearchResult` for an evaluated decision state. `SearchResult` is the single source of truth for an actual decision. It stores `U = U_p^{1/2}(B)`, entropy, `N_eff`, `K`, selected depth, every move probability, every branch value, `expected_delta_u_star`, compatibility aliases, and response diagnostics that were actually computed. Move choice, CSV/JSON logging, thermodynamic cycles, and the normal viewer consume this stored result instead of rerunning search.
+```math
+\Delta\widetilde W
+=
+\sum_{m\in\mathcal L_\cap}
+\frac{p_m+p'_m}{2}
+(O'_m-O_m).
+```
 
-Caches belong to a fixed style, beta, kappa, and `cdepth`, so values from different observers cannot mix. Process workers use process-local caches; those caches are not shared with the parent process, but each worker reuses its own cache while evaluating its assigned branch.
+If \(\mathcal L_+\) contains newly available actions and \(\mathcal L_-\) contains actions that disappeared, the accessibility term is
 
-### Observer Convention
+```math
+\Delta\widetilde A
+=
+\sum_{m\in\mathcal L_+}
+p'_mO'_m
+-
+\sum_{m\in\mathcal L_-}
+p_mO_m.
+```
 
-One adaptive search object belongs to one observer. Its style and beta are used at every node, including nodes where the opponent is to move. Move features remain mover-relative. This distinction lets White and Black produce different expectations for the same board without changing the universal evaluator.
+The decomposition satisfies
 
-The viewer ranks each observer's estimate of the side-to-move's best action:
+```math
+\Delta\widetilde U
+=
+\Delta\widetilde Q
++
+\Delta\widetilde W
++
+\Delta\widetilde A
+```
 
-- on White's turn, both panels rank larger `expected_delta_u_star` first;
-- on Black's turn, both panels rank smaller `expected_delta_u_star` first;
-- each panel may assign `#1` to a different move because the observers use different probability measures.
+up to floating-point tolerance.
 
-The shared table columns contain the move and $E(B_m)$. A light-grey outline marks White observer's `#1`, a black outline marks Black observer's `#1`, and light blue marks the move actually played.
+At terminal same-player states, thermodynamic bookkeeping uses an absorbing pseudo-branch with probability `1`. This bookkeeping device does not create an ordinary chess move.
 
-### Prediction error
+## 7.4 Prediction error
 
-After a player moves, the simulator stores that player's expected value for the resulting reply position. After the opponent replies, it records
+After a player chooses move \(m\), the simulator stores that player's expected value for the subsequent response position.
+
+After the opponent actually chooses response \(r^*\), the prediction error is
 
 ```math
 \epsilon
 =
 E(B_{m,r^*})
 -
-\widetilde U_\lambda^{(D)}(B_m).
+\widetilde U_p^{(D)}(B_m),
 ```
 
-This compares the realized static board after the reply with the observer's earlier probability-weighted prediction.
+where \(\widetilde U_p^{(D)}(B_m)\) is the adaptive prediction previously made by the observer.
 
-## Heat, Work, and Accessibility
+The error therefore compares the realized static board after the reply with the observer's earlier probability-weighted forecast.
 
-This section describes the **adaptive same-player transition Q/W/A** diagnostic. It is separate from the candidate-cycle Q/W/A above. Candidate-cycle Q/W/A compares shallow landscapes across a hypothetical `B -> B_m -> B_mr` cycle. The game-level diagnostic below compares two actual saved decision states for the same player.
+---
 
-The transition accounting compares the same observer on consecutive turns by that same player, not adjacent plies. For White, a transition compares one White-to-move position with the next White-to-move position two plies later; Black is handled analogously. The first turn for each player has no previous same-player state and therefore no same-player transition delta.
+# 8. Default Parameters and Strategy Presets
 
-For each same-player state, the accounting reuses the adaptive branch observables already produced by that player's search. For each legal move $m$, the stored observable $O_m(B)$ is the branch value used in the saved decision state. Consequently,
+## 8.1 Simulation defaults
 
-```math
-\widetilde U(B)=\sum_m p_mO_m
-```
-
-is the adaptive same-player observable, not a shallow candidate-cycle diagnostic. Each saved branch records its UCI identity, probability, `adaptive_branch_value`, `was_deepened`, and `depth_used`.
-
-For the common support $\mathcal L_\cap$ of two same-player positions, the adaptive same-player heat and work use the finite midpoint formulas
-
-```math
-\Delta\widetilde Q=\sum_{m\in\mathcal L_\cap}
-\frac{O_m+O'_m}{2}(p'_m-p_m),
-```
-
-```math
-\Delta\widetilde W=\sum_{m\in\mathcal L_\cap}
-\frac{p_m+p'_m}{2}(O'_m-O_m).
-```
-
-Moves that appear or disappear contribute
-
-```math
-\Delta\widetilde A=\sum_{m\in\mathcal L_+}p'_mO'_m
--\sum_{m\in\mathcal L_-}p_mO_m.
-```
-
-Thus $\Delta\widetilde U=\Delta\widetilde Q+\Delta\widetilde W+\Delta\widetilde A$ to floating-point tolerance. Saved transition records use names such as `adaptive_same_player_delta_Q` and compatibility aliases such as `delta_Q_tilde`; older untilded fields remain only for backward compatibility. At terminal same-player states, thermodynamic bookkeeping uses an absorbing pseudo-branch `__terminal__` with probability `1`, so the identity is preserved without adding a pseudo-move to ordinary chess move generation.
-
-## Default Model Parameters
-
-### CLI simulation defaults
+The command-line simulator uses the following defaults.
 
 | Parameter | Default |
 |---|---:|
@@ -866,21 +1220,29 @@ Thus $\Delta\widetilde U=\Delta\widetilde Q+\Delta\widetilde W+\Delta\widetilde 
 | Kappa | `1.0` |
 | White strategy | `material_conservative` |
 | Black strategy | `activity_aggressive` |
+| White solidness | preset value |
+| Black solidness | preset value |
 | Cycle depth (`cdepth`) | `1` |
-| Adaptive breadth `c` | `0.3` |
+| Adaptive breadth (`adaptive_c`) | `0.3` |
+| Search workers | `1` |
+| Parallel minimum branches | `8` |
 | Candidate thermo mode | `refined` |
 | Refinement policy | `static_eval` |
-| Match name | Generated from strategies, beta, solidness, and `cdepth` |
-| Stop on checkmate/stalemate | Yes |
-| Stop on insufficient material | Yes |
-| Stop on automatic fivefold/75-move draws | Yes |
-| Stop on actual threefold repetition | Yes |
+| Match name | generated automatically |
+| Stop on checkmate | yes |
+| Stop on stalemate | yes |
+| Stop on insufficient material | yes |
+| Stop on automatic fivefold repetition | yes |
+| Stop on automatic 75-move draw | yes |
+| Stop on actual threefold repetition | yes |
+| Stop on claimable fifty-move draw | no |
+| Stop on claimable threefold repetition | no |
 
-`MatchConfig` itself defaults to `max_plies=120`; the `run_match.py` command-line launcher intentionally overrides that with `80`.
+When constructing `MatchConfig` directly in Python, `max_plies` defaults to `120`. The command-line launcher overrides this to `80`.
 
-### Built-in strategy presets
+## 8.2 Built-in strategy presets
 
-The command-line simulator provides four fixed presets. The first two remain the defaults, while the tactical and positional presets provide additional matchups.
+Four strategy presets are available from the command line.
 
 | Style coefficient | `material_conservative` | `activity_aggressive` | `tactical_attacker` | `positional_controller` |
 |---|---:|---:|---:|---:|
@@ -902,38 +1264,53 @@ The command-line simulator provides four fixed presets. The first two remain the
 | `phase_attack` | `0.4` | `1.1` | `1.4` | `0.6` |
 | `solidness` | `0.75` | `0.35` | `0.25` | `0.8` |
 
-`tactical_attacker` favors forcing play around the enemy king and accepts more material exposure. `positional_controller` favors center control, preservation, king safety, and balanced activity. Presets can be selected through CLI flags; arbitrary coefficient combinations remain available through Python.
+`tactical_attacker` emphasizes forcing play near the opponent king and accepts more material exposure.
 
-## Installation
+`positional_controller` emphasizes center control, preservation, king safety, and balanced activity.
 
-All project commands should run in the `chess` conda environment.
+Arbitrary coefficient combinations can be supplied through Python configuration.
 
-Create the environment if needed:
+---
+
+# 9. Installation
+
+Run all commands from the repository root.
+
+The documented environment name is `chess`.
+
+Create the environment and install dependencies with
 
 ```bash
 conda create -n chess python pip
 conda run -n chess pip install -r requirements.txt
 ```
 
-The direct dependencies are `python-chess>=1.999` and `pytest>=8.0`.
+The direct dependencies are:
 
-Commands need the package source directory on `PYTHONPATH`:
+```text
+python-chess>=1.999
+pytest>=8.0
+```
+
+The package source directory must be available on `PYTHONPATH`.
+
+A simple import test is
 
 ```bash
 conda run -n chess env PYTHONPATH=src python -c "import thermo_chess; print(thermo_chess.__name__)"
 ```
 
-Run commands from the repository root.
+---
 
-## Running Simulations
+# 10. Running Simulations
 
-### Run with all CLI defaults
+## 10.1 Run with all defaults
 
 ```bash
 conda run -n chess env PYTHONPATH=src python scripts/run_match.py
 ```
 
-This creates:
+With the default match name, this writes
 
 ```text
 data/results/thermo_match.csv
@@ -941,9 +1318,9 @@ data/results/thermo_match.json
 data/games/thermo_match.pgn
 ```
 
-Files with the same match name are overwritten. Use a distinct `--name` to preserve earlier games.
+Files with the same match name are overwritten. Use `--name` to preserve previous runs.
 
-### Example with explicit search parameters
+## 10.2 Example with explicit options
 
 ```bash
 conda run -n chess env PYTHONPATH=src python scripts/run_match.py \
@@ -952,71 +1329,93 @@ conda run -n chess env PYTHONPATH=src python scripts/run_match.py \
   --seed 23 \
   --beta-white 5.5 \
   --beta-black 5.5 \
+  --kappa 1.0 \
   --white-strategy tactical_attacker \
   --black-strategy positional_controller \
   --solidness-white 0.3 \
   --solidness-black 0.85 \
   --cdepth 1 \
   --adaptive-c 0.3 \
+  --search-workers 1 \
+  --parallel-min-branches 8 \
+  --candidate-thermo-mode refined \
   --refinement-policy probability
 ```
 
-Use `--refinement-policy probability` to spend refinement on the most probable root `K` moves and response `K'` replies. Omit it, or pass `--refinement-policy static_eval`, to keep the default side-aware immediate-evaluation ordering. Because refined branches receive `U^{1/2}` at `cdepth=1` and recursive adaptive values at larger depths, the refinement policy can affect both diagnostics and move choice.
+## 10.3 Simulation command-line options
 
-### Simulation flags
-
-| Flag | Default | Effect |
+| Flag | Default | Meaning |
 |---|---:|---|
-| `--max-plies N` | `80` | Safety cap on the number of half-moves. |
-| `--seed N` | `1` | Initializes Python's random generator. Current move selection is deterministic, so this is mainly a reproducibility hook for future stochastic behavior. |
+| `--max-plies N` | `80` | Maximum number of half-moves before the simulation stops. |
+| `--seed N` | `1` | Initializes Python's random generator. Current move selection is deterministic, so this mainly provides reproducibility for future stochastic extensions. |
 | `--beta-white X` | `4.0` | White observer's inverse temperature. Larger values concentrate White's move probabilities. |
 | `--beta-black X` | `4.0` | Black observer's inverse temperature. Larger values concentrate Black's move probabilities. |
-| `--kappa X` | `1.0` | Boltzmann-like constant in pawn units. The effective temperature is `1 / (kappa * beta)`. |
-| `--white-strategy NAME` | `material_conservative` | White preset. Choices: `material_conservative`, `activity_aggressive`, `tactical_attacker`, `positional_controller`. |
-| `--black-strategy NAME` | `activity_aggressive` | Black preset. Uses the same four choices. |
-| `--solidness-white X` | Preset value | Override White's solidness $\sigma$. Must be between `0` and `1`. |
-| `--solidness-black X` | Preset value | Override Black's solidness $\sigma$. Must be between `0` and `1`. |
-| `--cdepth N` | `1` | Cycle depth. One unit is own move plus opponent response. At `0`, values reduce to static `E(B)`. |
-| `--depth N` | None | Deprecated alias for `--cdepth`. |
-| `--adaptive-c X` | `0.3` | Breadth fraction in $K=\lceil cN_{\mathrm{eff}}\rceil$. Must be positive. `K` is still clipped to legal moves and at least one. |
-| `--search-workers N` | `1` | Process workers for independent root own-move branches. Use `1` for fully serial search or `auto` for CPU-based worker count. |
-| `--parallel-min-branches N` | `8` | Minimum root branch count before worker parallelism activates. |
-| `--candidate-thermo-mode MODE` | `refined` | Detailed Q/W/A diagnostics. Choices: `selected`, `refined`, `all`. |
-| `--refinement-policy POLICY` | `static_eval` | Selects which root `K` moves and response `K'` replies receive refined evaluation. Choices: `static_eval`, `probability`. |
-| `--name TEXT` | Generated | Base filename for CSV, JSON, and PGN outputs. By default it includes both strategy names, beta values, effective solidness values, and `cdepth`. |
-| `--ignore-threefold` | Off | Continue through actual threefold repetition instead of stopping there. |
-| `--allow-draw-claims` | Off | Also stop when a fifty-move or threefold-repetition draw can be claimed. Automatic draw rules still stop regardless of this flag. |
-| `-h`, `--help` | | Print command help. |
+| `--kappa X` | `1.0` | Boltzmann-like scale in pawn units. Effective temperature satisfies \(T=1/(\kappa\beta)\). |
+| `--white-strategy NAME` | `material_conservative` | White strategy preset. Choices: `material_conservative`, `activity_aggressive`, `tactical_attacker`, `positional_controller`. |
+| `--black-strategy NAME` | `activity_aggressive` | Black strategy preset. Same four choices as White. |
+| `--solidness-white X` | selected preset's value | Overrides White's `solidness`. Must satisfy `0 <= X <= 1`. |
+| `--solidness-black X` | selected preset's value | Overrides Black's `solidness`. Must satisfy `0 <= X <= 1`. |
+| `--cdepth N` | `1` | Maximum search depth in complete move-response cycles. Must satisfy `N >= 0`. |
+| `--depth N` | none | Deprecated command-line synonym for `--cdepth`. |
+| `--adaptive-c X` | `0.3` | Breadth coefficient in \(K=\lceil cN_{\mathrm{eff}}\rceil\). Must be positive. |
+| `--search-workers N` | `1` | Number of process workers for independent root branches. Use `1` for serial search or `auto` for CPU-based selection. |
+| `--parallel-min-branches N` | `8` | Minimum number of root branches required before process-based parallelism is used. |
+| `--candidate-thermo-mode MODE` | `refined` | Q/W/A diagnostic coverage. Choices: `selected`, `refined`, `all`. |
+| `--refinement-policy POLICY` | `static_eval` | Branch-refinement ranking. Choices: `static_eval`, `probability`. |
+| `--name TEXT` | generated | Base filename used for CSV, JSON, and PGN output. The generated name includes strategy names, beta values, effective solidness values, and `cdepth`. |
+| `--ignore-threefold` | off | Do not stop when an actual threefold repetition occurs. |
+| `--allow-draw-claims` | off | Also stop when a fifty-move or threefold-repetition draw is claimable. |
+| `-h`, `--help` | n/a | Print command help and exit. |
 
-Normal stopping conditions are checkmate, stalemate, insufficient material, automatic fivefold repetition, automatic 75-move draw, actual threefold repetition, or `--max-plies`. Use `--ignore-threefold` to continue through actual threefold repetition. Use `--allow-draw-claims` to also stop on claimable fifty-move and threefold-repetition draws; merely claimable draws are not treated as terminal by the search itself.
+Normal stopping conditions are:
 
-`cdepth > 1` can still be expensive in low-entropy positions because those positions are explicitly allowed to retain deeper search. The simulator also precomputes both observers' viewer panels at every saved position.
+- checkmate;
+- stalemate;
+- insufficient material;
+- automatic fivefold repetition;
+- automatic 75-move draw;
+- actual threefold repetition;
+- reaching `--max-plies`.
 
-## Viewer
+`--ignore-threefold` disables the actual-threefold stopping condition.
 
-Start the dynamic viewer:
+`--allow-draw-claims` additionally stops on claimable fifty-move and threefold-repetition draws.
+
+Claimable draws are not treated as terminal by the search unless this simulation-level stopping option is enabled.
+
+## 10.4 Search-cost note
+
+`cdepth > 1` can be expensive, especially in low-entropy positions. Low entropy intentionally permits deeper local refinement.
+
+The simulation also prepares both observers' viewer panels for every saved position, which adds additional search work.
+
+---
+
+# 11. Viewer
+
+Start the dynamic viewer with
 
 ```bash
 conda run -n chess env PYTHONPATH=src python scripts/view_match.py
 ```
 
-Default address:
+The default address is
 
 ```text
 http://127.0.0.1:8765/
 ```
 
-### Viewer flags
+## 11.1 Viewer options
 
-| Flag | Default | Effect |
+| Flag | Default | Meaning |
 |---|---:|---|
 | `--results-dir PATH` | `data/results` | Directory containing match JSON files. |
 | `--host HOST` | `127.0.0.1` | Interface on which the HTTP server listens. |
-| `--port N` | `8765` | HTTP port. Use another value if the default port is occupied. |
-| `--open` | Off | Ask Python to open the viewer URL in the default browser. |
-| `-h`, `--help` | | Print command help. |
+| `--port N` | `8765` | HTTP port. |
+| `--open` | off | Ask Python to open the viewer URL in the default browser. |
+| `-h`, `--help` | n/a | Print command help and exit. |
 
-Example on another port:
+Example:
 
 ```bash
 conda run -n chess env PYTHONPATH=src python scripts/view_match.py \
@@ -1026,73 +1425,87 @@ conda run -n chess env PYTHONPATH=src python scripts/view_match.py \
   --open
 ```
 
-The server reads JSON files dynamically. The game list refreshes every ten seconds, and the browser requests raw saved data rather than rebuilding a static HTML bundle. A game appears after simulation serialization completes.
+The server reads JSON files dynamically. The game list refreshes every ten seconds.
 
-The viewer performs no chess or expected-value calculations. New JSON files should contain `viewer_states`; older files without them are marked as requiring regeneration.
+The viewer performs no chess search or expected-value calculation. It displays precomputed data contained in the saved JSON.
 
-For each position the viewer shows:
+For each position, the viewer can display:
 
-- board, FEN, side to move, move history, and static `E(B)`;
-- configured `cdepth` and `c`;
-- adaptive `U(B)`, entropy, $N_{\mathrm{eff}}$, `K`, response `K'`, and branch values for the actual decision side;
-- actual-side ranks, probabilities, `expected_next_U`, selection score `expected_delta_u_star`, and diagnostic `deltaQ/deltaW/deltaA`; the opposite counterfactual side is marked unavailable unless generated separately;
-- shared move and $E(B_m)$ columns aligned across both observers;
-- completed same-player cycle cards for realized game-level cycle $\Delta U^*$, $\Delta Q$, $\Delta W$, and $\Delta A$;
-- old/new effective move counts, old/new `K`, common support data, and common probability mass.
+- board, FEN, side to move, move history, and static \(E(B)\);
+- configured `cdepth` and `adaptive_c`;
+- adaptive expected value, entropy, \(N_{\mathrm{eff}}\), \(K\), response \(K'\), and branch values;
+- move ranks, probabilities, `expected_next_U`, and `expected_delta_u_star`;
+- candidate Q/W/A diagnostics when they were requested by `candidate_thermo_mode`;
+- aligned move and \(E(B_m)\) columns for both observers;
+- completed same-player transition diagnostics;
+- old/new effective move counts, support changes, and common probability mass.
 
-## Saved Data
+---
 
-### CSV
+# 12. Saved Data
 
-The CSV contains one row per played ply. Important fields include:
+## 12.1 CSV
+
+The CSV contains one row per played ply.
+
+Important fields include:
 
 | Field | Meaning |
 |---|---|
 | `E_before`, `E_after` | Universal static evaluations before and after the move. |
-| `U_current` | Moving observer's shallow decision-landscape value `U_p^{1/2}(B)`. |
-| `U_after_move` | Selected candidate's response-averaged approximation `expected_next_U`. |
-| `expected_delta_u_star`, `delta_u`, `candidate_delta_u` | Move-selection quantity `expected_next_U - U_p^{1/2}(B)`; legacy names are aliases. |
-| `U_before`, `U_after`, `adaptive_same_player_delta_U`, `cycle_delta_U` | Adaptive same-player transition values, aligned to the later decision state. Null for the first state of each player. |
-| `adaptive_same_player_delta_Q`, `adaptive_same_player_delta_W`, `adaptive_same_player_delta_A` | Adaptive same-player transition Q/W/A. Compatibility aliases include `delta_Q_tilde`, `delta_W_tilde`, `delta_A_tilde`, and older untilded fields. |
-| `decomposition_error` | `adaptive_same_player_delta_U - (adaptive_same_player_delta_Q + adaptive_same_player_delta_W + adaptive_same_player_delta_A)`. |
-| `N_eff_before`, `N_eff_after` | Effective move counts for the current state and, when present, the completed same-player cycle. |
-| `adaptive_cdepth`, `adaptive_depth_before`, `adaptive_depth_after` | Selected local cycle-depth diagnostics. Legacy names are retained for compatibility. |
-| support and mass fields | Old, new, common, old-only, and new-only support diagnostics. |
+| `U_current` | Moving observer's shallow landscape \(U_p^{1/2}(B)\). |
+| `U_after_move` | Selected candidate's response-averaged `expected_next_U`. |
+| `expected_delta_u_star` | Move-selection quantity `expected_next_U - U_current`. |
+| `U_before`, `U_after` | Consecutive same-player adaptive expected values when such a transition exists. |
+| `adaptive_same_player_delta_U` | Change in adaptive same-player expected value. |
+| `adaptive_same_player_delta_Q` | Probability-redistribution contribution. |
+| `adaptive_same_player_delta_W` | Observable-change contribution. |
+| `adaptive_same_player_delta_A` | Action-accessibility contribution. |
+| `decomposition_error` | Numerical residual between \(\Delta U\) and \(\Delta Q+\Delta W+\Delta A\). |
+| `N_eff_before`, `N_eff_after` | Effective move counts for consecutive same-player states. |
 | `entropy_current` | Root move-distribution entropy. |
 | `N_eff` | Root effective number of moves. |
-| `selected_depth` | Entropy-selected local `cdepth` after applying the global cap. |
-| `K_expanded` | Number of root branches selected for deeper recursion. |
-| `nodes_evaluated` | Adaptive value nodes computed for the saved analysis. |
+| `selected_depth` | Local entropy-limited `cdepth`. |
+| `K_expanded` | Number of root branches selected for refinement. |
+| `nodes_evaluated` | Adaptive value nodes computed. |
 | `static_evaluations` | Uncached static evaluations. |
-| `recursive_nodes` | Selected recursive child traversals. |
-| `maximum_depth_reached` | Deepest level actually reached. |
-| `average_K` | Mean selected breadth over recursively expanded nodes. |
+| `recursive_nodes` | Refined recursive child traversals. |
+| `maximum_depth_reached` | Deepest search level reached. |
+| `average_K` | Mean selected breadth across recursively expanded nodes. |
 | `cache_hits` | Reused cached values and landscapes. |
 | `search_elapsed_time` | Search time in seconds. |
-| `prediction_error` | Realized static reply value minus the earlier predicted adaptive value. |
-| repetition fields | Twofold, threefold, fivefold, and claim metadata. |
+| `prediction_error` | Realized static reply value minus the earlier adaptive prediction. |
+| repetition fields | Twofold, threefold, fivefold, and draw-claim metadata. |
 
-### JSON
+## 12.2 JSON
 
-The JSON is the complete result and contains:
+The JSON contains the complete simulation result, including:
 
-- `config`: match, search, threshold, directory, and stopping configuration;
-- `white_style`, `black_style`: serialized style coefficients;
-- `evaluation_weights`: serialized static feature coefficients;
+- match and search configuration;
+- serialized White and Black style coefficients;
+- static evaluation weights;
 - result, terminal reason, final FEN, and repetition metadata;
-- `plies`: row data, candidate scores, the actual decision `search_result`, and exact adaptive branch observations for completed same-player cycles;
-- `thermodynamic_transitions`: adaptive same-player transition Q/W/A records aligned to the later turn;
-- `viewer_states`: ready-to-render panels for every board position, including the completed same-player cycle transition visible at that state when available.
+- one record per played ply;
+- candidate scores and branch diagnostics;
+- adaptive search summaries;
+- same-player thermodynamic transitions;
+- viewer-ready states for every saved position.
 
-Candidate diagnostics include whether each move belonged to the root top-$K$ set, plus `response_N_eff`, `response_K`, and, when that candidate was enriched by `candidate_thermo_mode`, the response records used for candidate-cycle `deltaQ/deltaW/deltaA`. `viewer_states` duplicate stored search-result summary values intentionally so browser navigation requires no model computation.
+Candidate records also indicate whether a move belonged to the root top-\(K\) refinement set.
 
-### PGN
+When candidate thermodynamic diagnostics are enabled for that move, response-level data include response \(N_{\mathrm{eff}}\), response \(K'\), and Q/W/A-related records.
 
-The PGN contains the played move sequence and result headers. It does not contain the full thermodynamic diagnostics; use JSON or CSV for analysis.
+## 12.3 PGN
 
-## Analysis and Tests
+The PGN stores the played move sequence and standard result headers.
 
-### Inspect one saved ply
+It does not contain the full thermodynamic or adaptive-search diagnostics. Use the CSV or JSON files for quantitative analysis.
+
+---
+
+# 13. Analysis, Tests, and Benchmark
+
+## 13.1 Inspect a saved ply
 
 ```bash
 conda run -n chess env PYTHONPATH=src python scripts/analyze_match.py \
@@ -1102,26 +1515,26 @@ conda run -n chess env PYTHONPATH=src python scripts/analyze_match.py \
   --limit 20
 ```
 
-Analysis options:
+Options:
 
-| Argument | Default | Effect |
+| Argument | Default | Meaning |
 |---|---:|---|
 | `match_json` | `data/results/thermo_match.json` | JSON file to inspect. |
-| `--ply N` | `1` | Played ply whose current shallow landscape is printed. |
-| `--sort probability` | `probability` | Sort by `probability`, `static_after`, or `phi`. |
-| `--limit N` | `20` | Maximum moves printed. |
+| `--ply N` | `1` | Played ply whose saved move landscape is printed. |
+| `--sort MODE` | `probability` | Sort key. Choices: `probability`, `static_after`, `phi`. |
+| `--limit N` | `20` | Maximum number of moves printed. |
 
-The analysis script prints the saved shallow move landscape. It does not rerun adaptive search.
+The script reads saved results. It does not rerun adaptive search.
 
-### Run tests
+## 13.2 Run tests
 
 ```bash
 conda run -n chess env PYTHONPATH=src pytest -q
 ```
 
-The tests cover probability normalization, entropy, effective move counts, adaptive breadth and depth, full fallback probability mass, terminal handling, move selection, feature conventions, logging, and viewer-ready serialization.
+The tests cover probability normalization, entropy, effective move counts, adaptive breadth and depth, full fallback probability mass, terminal handling, move selection, feature conventions, serialization, and viewer-ready output.
 
-### Optional benchmark
+## 13.3 Optional benchmark
 
 ```bash
 conda run -n chess env PYTHONPATH=src python scripts/benchmark_adaptive.py
@@ -1129,17 +1542,19 @@ conda run -n chess env PYTHONPATH=src python scripts/benchmark_adaptive.py
 
 Benchmark options:
 
-| Flag | Default | Effect |
+| Flag | Default | Meaning |
 |---|---:|---|
-| `--fen FEN` | Built-in middlegame | Replace the representative benchmark position. Quote FEN strings in the shell. |
-| `--beta X` | `4.0` | Probability-distribution beta used for every benchmark depth. |
-| `--adaptive-c X` | `0.3` | Adaptive breadth parameter used for every benchmark depth. |
+| `--fen FEN` | built-in middlegame position | Replace the benchmark board. Quote FEN strings in the shell. |
+| `--beta X` | `4.0` | Inverse temperature used for every benchmark depth. |
+| `--adaptive-c X` | `0.3` | Adaptive breadth coefficient used for every benchmark depth. |
 
-The script is a legacy benchmark for adaptive depth aliases and does not change or regenerate match files.
+The benchmark does not modify or regenerate saved match files.
 
-## Python Configuration
+---
 
-CLI flags expose the common simulation controls. Styles, threshold values, evaluator weights, and output directories can be configured directly in Python:
+# 14. Python Configuration
+
+Command-line flags expose the common simulation controls. For custom style coefficients, evaluator weights, adaptive thresholds, and output directories, configure the simulation directly in Python.
 
 ```python
 from pathlib import Path
@@ -1196,16 +1611,33 @@ simulate_match(
 )
 ```
 
-When `white_style` or `black_style` is passed directly, that custom object overrides the corresponding preset in `MatchConfig`. Omit the custom style arguments to use `white_strategy` and `black_strategy`.
+When a `Style` object is passed directly for a player, that object determines the player's coefficients. If no custom style object is supplied, the corresponding strategy preset in `MatchConfig` is used.
 
-Validation rules:
+The documented validation rules are:
 
-- `cdepth >= 0`;
-- `adaptive_c > 0`;
-- adaptive cdepth thresholds must be positive and strictly increasing.
-- `0 <= solidness <= 1`.
+```text
+cdepth >= 0
+adaptive_c > 0
+0 <= solidness <= 1
+```
 
-## Project Structure
+The adaptive-depth thresholds must be positive and strictly increasing:
+
+```text
+depth4_max_neff < depth3_max_neff < depth2_max_neff
+```
+
+The default threshold values are:
+
+```text
+depth4_max_neff = 4.0
+depth3_max_neff = 8.0
+depth2_max_neff = 15.0
+```
+
+---
+
+# 15. Project Structure
 
 ```text
 src/thermo_chess/
@@ -1213,52 +1645,56 @@ src/thermo_chess/
   features.py        board features, move features, exchange exposure
   measure.py         style potential, softmax, entropy, move landscapes
   metrics.py         entropy and effective-number utilities
-  search.py          cached adaptive expected-value recursion
-  player.py          observer analysis and White-max/Black-min choice
+  search.py          adaptive expected-value recursion and caching
+  player.py          observer analysis and White-max/Black-min move choice
   simulation.py      match loop and CSV/JSON/PGN serialization
-  live_viewer.py     dynamic HTTP viewer and browser application
+  live_viewer.py     dynamic HTTP viewer
 
 scripts/
-  run_match.py             simulation CLI
-  view_match.py            viewer CLI
-  analyze_match.py         saved-landscape inspection CLI
-  benchmark_adaptive.py    optional cdepth benchmark
+  run_match.py           simulation CLI
+  view_match.py          viewer CLI
+  analyze_match.py       saved-landscape inspection CLI
+  benchmark_adaptive.py  optional adaptive-search benchmark
 
-data/games/          generated PGN files
-data/results/        generated CSV and JSON files
-tests/               mathematical and regression tests
-match_viewer.html   legacy static viewer artifact
+data/games/              generated PGN files
+data/results/            generated CSV and JSON files
+tests/                   mathematical and regression tests
+match_viewer.html        legacy static viewer artifact
 ```
 
-## Performance and Limitations
+---
 
-- Adaptive search reduces tree growth but does not make high `cdepth` free. Low-entropy nodes are deliberately allowed to search more deeply.
-- Every legal root candidate receives an adaptive value before final move selection. A complete decision is therefore more expensive than one call to `U(B)`.
-- Saving viewer-ready panels evaluates both observers at every match position. This increases simulation time but makes later browsing fast.
-- The model is designed for interpretability and experimentation, not competitive playing strength.
+# 16. Performance and Limitations
+
+- Adaptive search reduces tree growth but does not make large `cdepth` values inexpensive.
+- Low-entropy positions are deliberately allowed to retain deeper search.
+- Every legal root candidate contributes to the final expected-value calculation, even when only a subset receives refined evaluation.
+- Viewer-state generation evaluates both observers at every saved position and therefore increases simulation time.
+- The model is designed for interpretability and experimentation, not competitive chess strength.
 - Static evaluation and move-style features are intentionally compact and hand-designed.
-- The local exchange-exposure feature is a shallow capture-sequence calculation, not a general tactical engine.
-- Search is CPU-bound. Viewer panel generation can use process workers, but high `cdepth` can still be expensive.
-- JSON files can become large because they contain complete viewer states and candidate diagnostics.
+- Exchange exposure is a local capture-sequence calculation, not a general tactical engine.
+- Search is CPU-bound.
+- Process workers can parallelize independent root branches, but deep searches can still be expensive.
+- JSON files can become large because they contain viewer-ready states and candidate diagnostics.
 
-The main scientific interpretation is:
+The central computational idea is
 
 ```math
 \text{low entropy}
 \Rightarrow
 \text{few effective moves}
 \Rightarrow
-\text{narrower and potentially deeper computation},
+\text{narrower and potentially deeper refinement},
 ```
 
-while
+whereas
 
 ```math
 \text{high entropy}
 \Rightarrow
 \text{many comparable moves}
 \Rightarrow
-\text{broader but locally shallower computation}.
+\text{broader but locally shallower refinement}.
 ```
 
-The observer's own move measure therefore controls not only predicted behavior, but also how computational attention is allocated through the tree.
+The observer-dependent move measure therefore controls both predicted behavior and the allocation of computational attention through the search tree.
