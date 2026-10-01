@@ -34,6 +34,7 @@ from thermo_chess.search import (
 from thermo_chess.simulation import (
     STRATEGY_NAMES,
     MatchConfig,
+    _realized_cycle_payload,
     _terminal_result,
     _thermodynamic_transition_record,
     _termination_reason,
@@ -275,9 +276,9 @@ def test_player_choice_uses_stored_search_result_branch_value() -> None:
     chosen = next(move for move in result.moves if move.uci == choice.uci)
     assert choice.value == pytest.approx(chosen.expected_next_U)
     assert choice.delta_u == pytest.approx(chosen.expected_delta_u_star)
-    if chosen.candidate_delta_q is not None:
-        assert chosen.shallow_expected_delta_u_star == pytest.approx(
-            chosen.candidate_delta_q + chosen.candidate_delta_w + chosen.candidate_delta_a
+    if chosen.predicted_delta_q_star is not None:
+        assert chosen.predicted_delta_u_star == pytest.approx(
+            chosen.predicted_delta_q_star + chosen.predicted_delta_w_star + chosen.predicted_delta_a_star
         )
     assert result.U == pytest.approx(move_distribution(board, player.style, player.beta, evaluator).expected_value)
 
@@ -332,13 +333,35 @@ def test_serial_and_parallel_search_results_match() -> None:
     board = chess.Board("7k/8/8/8/8/8/6K1/7R w - - 0 1")
     evaluator = StaticEvaluator()
     serial = AdaptiveExpectedValue(Style(), 1.0, evaluator, cdepth=1, search_workers=1).search_result(board)
-    parallel = AdaptiveExpectedValue(Style(), 1.0, evaluator, cdepth=1, search_workers=2, parallel_min_branches=1).search_result(board)
-    assert parallel.diagnostics["parallel_branches"] >= len(parallel.moves)
+    search = AdaptiveExpectedValue(Style(), 1.0, evaluator, cdepth=1, search_workers=2, parallel_min_branches=1)
+    parallel = search.search_result(board)
+    assert parallel.diagnostics["parallel_branches"] == len(parallel.moves)
+    assert parallel.diagnostics["parallel_branches"] > parallel.K
     assert serial.U == pytest.approx(parallel.U)
     for a, b in zip(serial.moves, parallel.moves):
         assert a.uci == b.uci
         assert a.probability == pytest.approx(b.probability)
         assert a.branch_value == pytest.approx(b.branch_value)
+
+
+def test_parallel_search_uses_scoped_pools_across_consecutive_searches() -> None:
+    evaluator = StaticEvaluator()
+    search = AdaptiveExpectedValue(Style(), 1.0, evaluator, cdepth=1, search_workers=2, parallel_min_branches=1)
+    board = chess.Board("7k/8/8/8/8/8/6K1/7R w - - 0 1")
+    first = search.search_result(board)
+    assert not hasattr(search, "_executor")
+    board.push(next(iter(board.legal_moves)))
+    second = search.search_result(board)
+    assert first.diagnostics["parallel_branches"] == len(first.moves)
+    assert second.diagnostics["parallel_branches"] == len(first.moves) + len(second.moves)
+
+
+def test_parallel_workers_do_not_spawn_nested_pools() -> None:
+    board = chess.Board("4k3/8/8/8/8/8/4R3/4K3 w - - 0 1")
+    search = AdaptiveExpectedValue(_quiet_style(), 1.0, StaticEvaluator(), cdepth=2, search_workers=2, parallel_min_branches=1, adaptive_c=0.1)
+    result = search.search_result(board)
+    assert result.diagnostics["parallel_branches"] == len(result.moves)
+    assert result.diagnostics["parallel_branches"] > result.K
 
 
 def test_search_workers_one_is_serial() -> None:
@@ -761,12 +784,13 @@ def test_candidate_thermodynamics_averages_all_replies_after_consuming_cycle() -
     selected = {reply.uci for reply in ranked}
 
     expected_response_values = []
-    expected_diagnostic_values = []
+    expected_selected_values = {}
     for reply in reply_landscape.records:
         child = after.copy(stack=False)
         child.push(reply.move)
         shallow = search._future_subjective_value(child, 0, 1)
-        expected_diagnostic_values.append(shallow)
+        if reply.uci in selected:
+            expected_selected_values[reply.uci] = shallow
         expected_response_values.append(shallow if reply.uci in selected else reply.static_after)
     expected_next_u = sum(
         reply.probability * value
@@ -776,30 +800,32 @@ def test_candidate_thermodynamics_averages_all_replies_after_consuming_cycle() -
     assert candidate.response_entropy is None
     assert candidate.response_N_eff == pytest.approx(reply_landscape.effective_moves)
     assert candidate.response_K == expected_k
-    assert len(candidate.responses) == len(reply_landscape.records)
-    assert [response.uci for response in candidate.responses] == [
-        reply.uci for reply in reply_landscape.records
-    ]
-    assert sum(response.probability for response in candidate.responses) == pytest.approx(1.0)
-    assert [response.probability for response in candidate.responses] == pytest.approx(
-        [reply.probability for reply in reply_landscape.records]
-    )
-    assert {
-        response.uci for response in candidate.responses if response.selected_for_refinement
-    } == selected
+    assert len(candidate.responses) == expected_k
+    assert {response.uci for response in candidate.responses} == selected
+    refined_mass = sum(reply.probability for reply in reply_landscape.records if reply.uci in selected)
+    assert candidate.predicted_refined_probability_mass == pytest.approx(refined_mass)
+    assert candidate.predicted_refined_response_count == expected_k
+    assert sum(response.refined_conditional_probability for response in candidate.responses) == pytest.approx(1.0)
+    assert all(response.selected_for_refinement for response in candidate.responses)
     assert all(response.depth_used == 0 for response in candidate.responses)
     assert [response.value for response in candidate.responses] == pytest.approx(
-        expected_response_values
+        [expected_selected_values[response.uci] for response in candidate.responses]
     )
     assert [response.next_state_U for response in candidate.responses] == pytest.approx(
-        expected_diagnostic_values
+        [response.value for response in candidate.responses]
     )
     assert all(response.used_shallow_landscape for response in candidate.responses)
+    for response in candidate.responses:
+        assert response.branch_delta_u_star == pytest.approx(
+            response.branch_delta_q_star + response.branch_delta_w_star + response.branch_delta_a_star
+        )
+        assert response.branch_decomposition_error == pytest.approx(0.0, abs=1e-9)
     assert candidate.expected_next_U == pytest.approx(expected_next_u)
     assert candidate.expected_delta_u_star == pytest.approx(candidate.expected_next_U - result.U)
-    assert candidate.shallow_expected_delta_u_star == pytest.approx(
-        candidate.candidate_delta_q + candidate.candidate_delta_w + candidate.candidate_delta_a
+    assert candidate.predicted_delta_u_star == pytest.approx(
+        candidate.predicted_delta_q_star + candidate.predicted_delta_w_star + candidate.predicted_delta_a_star
     )
+    assert candidate.shallow_expected_delta_u_star == pytest.approx(candidate.predicted_delta_u_star)
 
 
 def test_cdepth_one_response_diagnostics_match_decision_values() -> None:
@@ -828,8 +854,13 @@ def test_cdepth_one_response_diagnostics_match_decision_values() -> None:
         [response.value for response in selected_responses]
     )
     assert all(response.used_shallow_landscape for response in selected_responses)
-    assert candidate.expected_next_U == pytest.approx(
-        sum(response.probability * response.value for response in candidate.responses)
+    assert sum(response.refined_conditional_probability for response in selected_responses) == pytest.approx(1.0)
+    for response in selected_responses:
+        assert response.branch_delta_u_star == pytest.approx(
+            response.branch_delta_q_star + response.branch_delta_w_star + response.branch_delta_a_star
+        )
+    assert candidate.predicted_delta_u_star == pytest.approx(
+        candidate.predicted_delta_q_star + candidate.predicted_delta_w_star + candidate.predicted_delta_a_star
     )
     assert candidate.expected_delta_u_star == pytest.approx(candidate.expected_next_U - result.U)
 
@@ -856,8 +887,8 @@ def test_selected_candidate_thermo_mode_only_enriches_chosen_move() -> None:
     ]
 
     assert chosen.candidate_delta_q is not None
-    assert chosen.shallow_expected_delta_u_star == pytest.approx(
-        chosen.candidate_delta_q + chosen.candidate_delta_w + chosen.candidate_delta_a
+    assert chosen.predicted_delta_u_star == pytest.approx(
+        chosen.predicted_delta_q_star + chosen.predicted_delta_w_star + chosen.predicted_delta_a_star
     )
     assert all(move.candidate_delta_q is None for move in nonchosen)
 
@@ -911,8 +942,8 @@ def test_refined_candidate_thermo_mode_enriches_selected_top_k_moves() -> None:
     for move in result.moves:
         if move.uci in selected:
             assert move.candidate_delta_q is not None
-            assert move.shallow_expected_delta_u_star == pytest.approx(
-                move.candidate_delta_q + move.candidate_delta_w + move.candidate_delta_a
+            assert move.predicted_delta_u_star == pytest.approx(
+                move.predicted_delta_q_star + move.predicted_delta_w_star + move.predicted_delta_a_star
             )
         else:
             assert move.candidate_delta_q is None
@@ -1486,7 +1517,75 @@ def test_same_player_transition_serializes_distinct_adaptive_qwa_names() -> None
     assert record["adaptive_same_player_delta_W"] == pytest.approx(record["delta_W_tilde"])
     assert record["adaptive_same_player_delta_A"] == pytest.approx(record["delta_A_tilde"])
     assert record["delta_U"] == pytest.approx(record["adaptive_same_player_delta_U"])
+    assert record["realized_delta_u"] == pytest.approx(record["adaptive_same_player_delta_U"])
+    assert record["realized_delta_u"] == pytest.approx(
+        record["realized_delta_q"] + record["realized_delta_w"] + record["realized_delta_a"]
+    )
 
+
+
+def test_realized_cycle_payload_serializes_white_and_black_orientations() -> None:
+    white_transition = {
+        "side": "white",
+        "realized_action_side": "white",
+        "realized_action_san": "d4",
+        "realized_action_uci": "d2d4",
+        "realized_response_side": "black",
+        "realized_response_san": "d5",
+        "realized_response_uci": "d7d5",
+        "realized_action_delta_u": 0.24,
+        "realized_response_delta_u": -0.11,
+        "realized_delta_u": 0.13,
+        "realized_delta_q": 0.08,
+        "realized_delta_w": 0.03,
+        "realized_delta_a": 0.02,
+        "decomposition_error": 0.0,
+        "old_ply": 1,
+        "new_ply": 3,
+    }
+    black_transition = {
+        "side": "black",
+        "realized_action_side": "black",
+        "realized_action_san": "d5",
+        "realized_action_uci": "d7d5",
+        "realized_response_side": "white",
+        "realized_response_san": "e4",
+        "realized_response_uci": "e2e4",
+        "realized_action_delta_u": -0.17,
+        "realized_response_delta_u": 0.06,
+        "realized_delta_u": -0.11,
+        "realized_delta_q": -0.04,
+        "realized_delta_w": -0.05,
+        "realized_delta_a": -0.02,
+        "decomposition_error": 0.0,
+        "old_ply": 2,
+        "new_ply": 4,
+    }
+
+    white = _realized_cycle_payload(white_transition, "white", "e4", "e2e4")
+    black = _realized_cycle_payload(black_transition, "black", "e5", "e7e5")
+
+    assert [move["san"] for move in white["moves"]] == ["d4", "d5", "e4"]
+    assert [move["color"] for move in white["moves"]] == ["white", "black", "white"]
+    assert white["delta_u_first"] == pytest.approx(0.24)
+    assert white["delta_u_second"] == pytest.approx(-0.11)
+    assert white["delta_u_cycle"] == pytest.approx(
+        white["delta_q_cycle"] + white["delta_w_cycle"] + white["delta_a_cycle"]
+    )
+
+    assert [move["san"] for move in black["moves"]] == ["d5", "e4", "e5"]
+    assert [move["color"] for move in black["moves"]] == ["black", "white", "black"]
+    assert black["delta_u_first"] == pytest.approx(-0.17)
+    assert black["delta_u_second"] == pytest.approx(0.06)
+    assert black["delta_u_cycle"] == pytest.approx(
+        black["delta_q_cycle"] + black["delta_w_cycle"] + black["delta_a_cycle"]
+    )
+
+
+def test_realized_cycle_payload_does_not_fabricate_incomplete_cycles() -> None:
+    assert _realized_cycle_payload(None, "white", "d4", "d2d4") is None
+    assert _realized_cycle_payload({"side": "white"}, "black", "d5", "d7d5") is None
+    assert _realized_cycle_payload({"side": "white"}, "white", "", "") is None
 
 def test_simulation_saves_viewer_ready_panels(tmp_path: Path) -> None:
     config = MatchConfig(
@@ -1522,7 +1621,12 @@ def test_simulation_saves_viewer_ready_panels(tmp_path: Path) -> None:
     assert first_move["expected_delta_u_star"] == pytest.approx(first_move["delta_u_star"])
     assert first_move["expected_delta_u_star"] == pytest.approx(first_move["candidate_delta_u"])
     assert first_move["expected_delta_u_star"] == pytest.approx(first_move["delta_u"])
-    assert first_move["shallow_expected_delta_u_star"] == pytest.approx(first_move["delta_q"] + first_move["delta_w"] + first_move["delta_a"])
+    assert first_move["predicted_delta_u_star"] == pytest.approx(
+        first_move["predicted_delta_q_star"]
+        + first_move["predicted_delta_w_star"]
+        + first_move["predicted_delta_a_star"]
+    )
+    assert first_move["shallow_expected_delta_u_star"] == pytest.approx(first_move["predicted_delta_u_star"])
     assert first_move["thermo_decomposition_error"] == pytest.approx(0.0, abs=1e-9)
     assert "reply_landscape" not in first_move
     assert states[0]["actual_search_result"]["side"] == "white"

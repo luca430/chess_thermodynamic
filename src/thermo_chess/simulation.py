@@ -371,6 +371,14 @@ def _thermodynamic_transition_record(
         "adaptive_same_player_delta_Q": decomposition.delta_q,
         "adaptive_same_player_delta_W": decomposition.delta_w,
         "adaptive_same_player_delta_A": decomposition.delta_a,
+        "realized_delta_u": decomposition.delta_u,
+        "realized_delta_q": decomposition.delta_q,
+        "realized_delta_w": decomposition.delta_w,
+        "realized_delta_a": decomposition.delta_a,
+        "delta_U_real": decomposition.delta_u,
+        "delta_Q_real": decomposition.delta_q,
+        "delta_W_real": decomposition.delta_w,
+        "delta_A_real": decomposition.delta_a,
         "delta_U_tilde": decomposition.delta_u,
         "delta_Q_tilde": decomposition.delta_q,
         "delta_W_tilde": decomposition.delta_w,
@@ -397,6 +405,62 @@ def _thermodynamic_transition_record(
         "old_only_mass": decomposition.old_only_probability_mass,
         "new_only_mass": decomposition.new_only_probability_mass,
         "decomposition_error": decomposition.decomposition_error,
+    }
+
+
+def _realized_cycle_payload(
+    transition: Dict[str, object] | None,
+    next_side: str,
+    next_san: str,
+    next_uci: str,
+) -> Dict[str, object] | None:
+    """Viewer-ready completed same-player cycle.
+
+    The first two one-ply deltas are the realized static board-value changes
+    stored on the transition: E(B_m)-E(B) and E(B_mr)-E(B_m). The Q/W/A
+    terms are the realized same-player adaptive transition for ``next_side``.
+    """
+
+    if transition is None:
+        return None
+    side = str(transition.get("side", ""))
+    if side != next_side:
+        return None
+    action_side = str(transition.get("realized_action_side", ""))
+    response_side = str(transition.get("realized_response_side", ""))
+    if not action_side or not response_side or not next_san:
+        return None
+    return {
+        "side": side,
+        "label": f"{side.capitalize()} cycle",
+        "moves": [
+            {
+                "san": transition.get("realized_action_san", ""),
+                "uci": transition.get("realized_action_uci", ""),
+                "color": action_side,
+            },
+            {
+                "san": transition.get("realized_response_san", ""),
+                "uci": transition.get("realized_response_uci", ""),
+                "color": response_side,
+            },
+            {"san": next_san, "uci": next_uci, "color": next_side},
+        ],
+        "first_side": action_side,
+        "second_side": response_side,
+        "delta_u_first": transition.get("realized_action_delta_u"),
+        "delta_u_second": transition.get("realized_response_delta_u"),
+        "delta_u_by_color": {
+            action_side: transition.get("realized_action_delta_u"),
+            response_side: transition.get("realized_response_delta_u"),
+        },
+        "delta_u_cycle": transition.get("realized_delta_u", transition.get("adaptive_same_player_delta_U")),
+        "delta_q_cycle": transition.get("realized_delta_q", transition.get("adaptive_same_player_delta_Q")),
+        "delta_w_cycle": transition.get("realized_delta_w", transition.get("adaptive_same_player_delta_W")),
+        "delta_a_cycle": transition.get("realized_delta_a", transition.get("adaptive_same_player_delta_A")),
+        "decomposition_error": transition.get("decomposition_error"),
+        "old_ply": transition.get("old_ply"),
+        "new_ply": transition.get("new_ply"),
     }
 
 def _viewer_state(
@@ -435,6 +499,8 @@ def _viewer_state(
         "result": board.result(claim_draw=False) if is_game_over else "*",
         "actual_search_result": actual_result.as_dict() if actual_result is not None else None,
         "actual_side": actual_result.side if actual_result is not None else None,
+        "white_realized_cycle": None,
+        "black_realized_cycle": None,
         "white_panel": white_panel,
         "black_panel": black_panel,
         "order": order,
@@ -548,6 +614,24 @@ def simulate_match(
         previous_thermo = last_thermo_state.get(player.color)
         if previous_thermo is not None:
             thermo_transition = _thermodynamic_transition_record(player, previous_thermo, ply, search_result)
+            if len(rows) >= 2:
+                action_row = rows[-2]
+                response_row = rows[-1]
+                if action_row.get("side") == _side_name(player.color):
+                    action_delta = float(action_row["E_after"]) - float(action_row["E_before"])
+                    response_delta = float(response_row["E_after"]) - float(response_row["E_before"])
+                    thermo_transition.update({
+                        "realized_action_side": action_row.get("side"),
+                        "realized_action_san": action_row.get("san"),
+                        "realized_action_uci": action_row.get("uci"),
+                        "realized_response_side": response_row.get("side"),
+                        "realized_response_san": response_row.get("san"),
+                        "realized_response_uci": response_row.get("uci"),
+                        "realized_action_delta_u": action_delta,
+                        "realized_response_delta_u": response_delta,
+                        "white_action_delta_u": action_delta if action_row.get("side") == "white" else response_delta if response_row.get("side") == "white" else None,
+                        "black_response_delta_u": response_delta if response_row.get("side") == "black" else action_delta if action_row.get("side") == "black" else None,
+                    })
             thermodynamic_transitions.append(thermo_transition)
         if viewer_states:
             viewer_states[-1] = _viewer_state(
@@ -566,6 +650,15 @@ def simulate_match(
         candidate_scores = _candidate_scores_from_result(search_result, player.color == chess.WHITE)
         if choice.move is None:
             break
+        if thermo_transition is not None and viewer_states:
+            cycle_payload = _realized_cycle_payload(
+                thermo_transition,
+                _side_name(player.color),
+                choice.san,
+                choice.uci,
+            )
+            if cycle_payload is not None:
+                viewer_states[-1][f"{_side_name(player.color)}_realized_cycle"] = cycle_payload
 
         board.push(choice.move)
         node = node.add_variation(choice.move)
@@ -577,6 +670,8 @@ def simulate_match(
         cycle_delta_w = thermo_transition.get("adaptive_same_player_delta_W") if thermo_transition else None
         cycle_delta_a = thermo_transition.get("adaptive_same_player_delta_A") if thermo_transition else None
         cycle_error = thermo_transition.get("decomposition_error") if thermo_transition else None
+        realized_action_delta_u = thermo_transition.get("realized_action_delta_u") if thermo_transition else None
+        realized_response_delta_u = thermo_transition.get("realized_response_delta_u") if thermo_transition else None
         cycle_old_branches = previous_thermo.branch_observations() if previous_thermo else ()
         cycle_new_branches = search_result.branch_observations() if previous_thermo else ()
 
@@ -616,6 +711,12 @@ def simulate_match(
             "adaptive_same_player_delta_Q": cycle_delta_q,
             "adaptive_same_player_delta_W": cycle_delta_w,
             "adaptive_same_player_delta_A": cycle_delta_a,
+            "realized_delta_u": cycle_delta_u,
+            "realized_delta_q": cycle_delta_q,
+            "realized_delta_w": cycle_delta_w,
+            "realized_delta_a": cycle_delta_a,
+            "realized_action_delta_u": realized_action_delta_u,
+            "realized_response_delta_u": realized_response_delta_u,
             "cycle_delta_U": cycle_delta_u,
             "delta_U_tilde": cycle_delta_u,
             "delta_Q_tilde": cycle_delta_q,

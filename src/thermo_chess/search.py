@@ -211,6 +211,12 @@ class ResponseEvaluation:
     delta_W: float | None = None
     delta_A: float | None = None
     thermo_decomposition_error: float | None = None
+    branch_delta_u_star: float | None = None
+    branch_delta_q_star: float | None = None
+    branch_delta_w_star: float | None = None
+    branch_delta_a_star: float | None = None
+    branch_decomposition_error: float | None = None
+    refined_conditional_probability: float | None = None
     used_shallow_landscape: bool = False
 
     def as_observation(self) -> ResponseObservation:
@@ -236,6 +242,16 @@ class ResponseEvaluation:
             "delta_W": self.delta_W,
             "delta_A": self.delta_A,
             "thermo_decomposition_error": self.thermo_decomposition_error,
+            "branch_delta_u_star": self.branch_delta_u_star,
+            "branch_delta_U_star": self.branch_delta_u_star,
+            "branch_delta_q_star": self.branch_delta_q_star,
+            "branch_delta_Q_star": self.branch_delta_q_star,
+            "branch_delta_w_star": self.branch_delta_w_star,
+            "branch_delta_W_star": self.branch_delta_w_star,
+            "branch_delta_a_star": self.branch_delta_a_star,
+            "branch_delta_A_star": self.branch_delta_a_star,
+            "branch_decomposition_error": self.branch_decomposition_error,
+            "refined_conditional_probability": self.refined_conditional_probability,
         })
         return data
 
@@ -258,6 +274,12 @@ class ResponseEvaluation:
             delta_W=None if data.get("delta_W") is None else float(data["delta_W"]),
             delta_A=None if data.get("delta_A") is None else float(data["delta_A"]),
             thermo_decomposition_error=None if data.get("thermo_decomposition_error") is None else float(data["thermo_decomposition_error"]),
+            branch_delta_u_star=None if data.get("branch_delta_u_star", data.get("branch_delta_U_star")) is None else float(data.get("branch_delta_u_star", data.get("branch_delta_U_star"))),
+            branch_delta_q_star=None if data.get("branch_delta_q_star", data.get("branch_delta_Q_star")) is None else float(data.get("branch_delta_q_star", data.get("branch_delta_Q_star"))),
+            branch_delta_w_star=None if data.get("branch_delta_w_star", data.get("branch_delta_W_star")) is None else float(data.get("branch_delta_w_star", data.get("branch_delta_W_star"))),
+            branch_delta_a_star=None if data.get("branch_delta_a_star", data.get("branch_delta_A_star")) is None else float(data.get("branch_delta_a_star", data.get("branch_delta_A_star"))),
+            branch_decomposition_error=None if data.get("branch_decomposition_error") is None else float(data["branch_decomposition_error"]),
+            refined_conditional_probability=None if data.get("refined_conditional_probability") is None else float(data["refined_conditional_probability"]),
             used_shallow_landscape=bool(data.get("used_shallow_landscape", False)),
         )
 
@@ -283,6 +305,12 @@ class MoveEvaluation:
     candidate_delta_a: float | None = None
     candidate_delta_u_star: float | None = None
     shallow_expected_delta_u_star: float | None = None
+    predicted_delta_u_star: float | None = None
+    predicted_delta_q_star: float | None = None
+    predicted_delta_w_star: float | None = None
+    predicted_delta_a_star: float | None = None
+    predicted_refined_probability_mass: float | None = None
+    predicted_refined_response_count: int | None = None
     thermo_decomposition_error: float | None = None
     response_entropy: float | None = None
     response_N_eff: float | None = None
@@ -337,6 +365,16 @@ class MoveEvaluation:
             "candidate_delta_U_star": expected_delta,
             "delta_u_star": expected_delta,
             "shallow_expected_delta_u_star": self.shallow_expected_delta_u_star,
+            "predicted_delta_u_star": self.predicted_delta_u_star,
+            "predicted_delta_U_star": self.predicted_delta_u_star,
+            "predicted_delta_q_star": self.predicted_delta_q_star,
+            "predicted_delta_Q_star": self.predicted_delta_q_star,
+            "predicted_delta_w_star": self.predicted_delta_w_star,
+            "predicted_delta_W_star": self.predicted_delta_w_star,
+            "predicted_delta_a_star": self.predicted_delta_a_star,
+            "predicted_delta_A_star": self.predicted_delta_a_star,
+            "predicted_refined_probability_mass": self.predicted_refined_probability_mass,
+            "predicted_refined_response_count": self.predicted_refined_response_count,
             "thermo_decomposition_error": self.thermo_decomposition_error,
             "selected_for_refinement": self.selected_for_refinement,
             "selected_for_deeper_analysis": self.selected_for_refinement,
@@ -377,6 +415,12 @@ class MoveEvaluation:
             candidate_delta_a=None if data.get("candidate_delta_a", data.get("candidate_delta_A", data.get("delta_a"))) is None else float(data.get("candidate_delta_a", data.get("candidate_delta_A", data.get("delta_a")))),
             candidate_delta_u_star=None if data.get("candidate_delta_u_star", data.get("candidate_delta_U_star", data.get("delta_u_star"))) is None else float(data.get("candidate_delta_u_star", data.get("candidate_delta_U_star", data.get("delta_u_star")))),
             shallow_expected_delta_u_star=None if data.get("shallow_expected_delta_u_star") is None else float(data["shallow_expected_delta_u_star"]),
+            predicted_delta_u_star=None if data.get("predicted_delta_u_star", data.get("predicted_delta_U_star")) is None else float(data.get("predicted_delta_u_star", data.get("predicted_delta_U_star"))),
+            predicted_delta_q_star=None if data.get("predicted_delta_q_star", data.get("predicted_delta_Q_star")) is None else float(data.get("predicted_delta_q_star", data.get("predicted_delta_Q_star"))),
+            predicted_delta_w_star=None if data.get("predicted_delta_w_star", data.get("predicted_delta_W_star")) is None else float(data.get("predicted_delta_w_star", data.get("predicted_delta_W_star"))),
+            predicted_delta_a_star=None if data.get("predicted_delta_a_star", data.get("predicted_delta_A_star")) is None else float(data.get("predicted_delta_a_star", data.get("predicted_delta_A_star"))),
+            predicted_refined_probability_mass=None if data.get("predicted_refined_probability_mass") is None else float(data["predicted_refined_probability_mass"]),
+            predicted_refined_response_count=None if data.get("predicted_refined_response_count") is None else int(data["predicted_refined_response_count"]),
             thermo_decomposition_error=None if data.get("thermo_decomposition_error") is None else float(data["thermo_decomposition_error"]),
             response_entropy=None if data.get("response_entropy") is None else float(data["response_entropy"]),
             response_N_eff=None if data.get("response_N_eff", data.get("response_neff")) is None else float(data.get("response_N_eff", data.get("response_neff"))),
@@ -957,6 +1001,12 @@ class AdaptiveExpectedValue:
                         candidate_delta_a=thermo["candidate_delta_a"],
                         candidate_delta_u_star=thermo["candidate_delta_u_star"],
                         shallow_expected_delta_u_star=thermo["shallow_expected_delta_u_star"],
+                        predicted_delta_u_star=thermo["predicted_delta_u_star"],
+                        predicted_delta_q_star=thermo["predicted_delta_q_star"],
+                        predicted_delta_w_star=thermo["predicted_delta_w_star"],
+                        predicted_delta_a_star=thermo["predicted_delta_a_star"],
+                        predicted_refined_probability_mass=thermo["predicted_refined_probability_mass"],
+                        predicted_refined_response_count=thermo["predicted_refined_response_count"],
                         thermo_decomposition_error=thermo["thermo_decomposition_error"],
                         response_entropy=thermo["response_entropy"],
                         response_N_eff=thermo["response_N_eff"],
@@ -1014,6 +1064,12 @@ class AdaptiveExpectedValue:
                 "candidate_delta_u": delta,
                 "candidate_delta_u_star": delta,
                 "shallow_expected_delta_u_star": delta if detailed else None,
+                "predicted_delta_u_star": None,
+                "predicted_delta_q_star": None,
+                "predicted_delta_w_star": None,
+                "predicted_delta_a_star": None,
+                "predicted_refined_probability_mass": None,
+                "predicted_refined_response_count": 0 if detailed else None,
                 "candidate_delta_q": 0.0 if detailed else None,
                 "candidate_delta_w": 0.0 if detailed else None,
                 "candidate_delta_a": delta if detailed else None,
@@ -1036,6 +1092,12 @@ class AdaptiveExpectedValue:
                 "candidate_delta_u": delta,
                 "candidate_delta_u_star": delta,
                 "shallow_expected_delta_u_star": None,
+                "predicted_delta_u_star": None,
+                "predicted_delta_q_star": None,
+                "predicted_delta_w_star": None,
+                "predicted_delta_a_star": None,
+                "predicted_refined_probability_mass": None,
+                "predicted_refined_response_count": None,
                 "candidate_delta_q": None,
                 "candidate_delta_w": None,
                 "candidate_delta_a": None,
@@ -1047,36 +1109,41 @@ class AdaptiveExpectedValue:
             }
 
         response_records = branch.response_branches
-        selected_uci = {
-            response.uci for response in response_records if response.selected_for_refinement
-        }
+        selected_responses = tuple(
+            response for response in response_records if response.selected_for_refinement
+        )
+        selected_probability_mass = sum(response.probability for response in selected_responses)
 
         response_evaluations: list[ResponseEvaluation] = []
         expected_next_u = 0.0
-        candidate_delta_q = 0.0
-        candidate_delta_w = 0.0
-        candidate_delta_a = 0.0
-        candidate_delta_u_star = 0.0
+        predicted_delta_u_star = None
+        predicted_delta_q_star = None
+        predicted_delta_w_star = None
+        predicted_delta_a_star = None
+        decomposition_error = None
         for response in response_records:
-            response_selected = response.uci in selected_uci
             next_u = response.response_value
             expected_next_u += response.probability * next_u
 
-            if detailed:
+            if detailed and response.selected_for_refinement:
                 next_board = after.copy(stack=False)
                 next_board.push(response.move)
-                diagnostic_next_u = self._future_subjective_value(next_board, 0, level=1)
-                next_branches = self._future_branch_observations(next_board, 0, level=1)
+                next_branches = self._future_branch_observations(
+                    next_board, response.depth_used, level=1
+                )
+                # Predicted branch diagnostics use the exact adaptive branch value
+                # already used in the search, not an extra shallow approximation.
                 decomposition = decompose_transition(
                     current_branches,
                     next_branches,
                     u_before=current_u,
-                    u_after=diagnostic_next_u,
+                    u_after=next_u,
                 )
-                candidate_delta_u_star += response.probability * decomposition.delta_u
-                candidate_delta_q += response.probability * decomposition.delta_q
-                candidate_delta_w += response.probability * decomposition.delta_w
-                candidate_delta_a += response.probability * decomposition.delta_a
+                conditional_probability = (
+                    response.probability / selected_probability_mass
+                    if selected_probability_mass > 0.0
+                    else None
+                )
                 response_evaluations.append(
                     ResponseEvaluation(
                         move=response.move,
@@ -1084,43 +1151,71 @@ class AdaptiveExpectedValue:
                         san=response.san,
                         probability=response.probability,
                         value=next_u,
-                        selected_for_refinement=response_selected,
+                        selected_for_refinement=True,
                         static_value=response.static_value,
                         refinement_rank=response.refinement_rank,
-                        depth_used=response.depth_used if response_selected else 0,
-                        next_state_U=diagnostic_next_u,
+                        depth_used=response.depth_used,
+                        next_state_U=next_u,
                         delta_U=decomposition.delta_u,
                         delta_Q=decomposition.delta_q,
                         delta_W=decomposition.delta_w,
                         delta_A=decomposition.delta_a,
                         thermo_decomposition_error=decomposition.decomposition_error,
-                        used_shallow_landscape=True,
+                        branch_delta_u_star=decomposition.delta_u,
+                        branch_delta_q_star=decomposition.delta_q,
+                        branch_delta_w_star=decomposition.delta_w,
+                        branch_delta_a_star=decomposition.delta_a,
+                        branch_decomposition_error=decomposition.decomposition_error,
+                        refined_conditional_probability=conditional_probability,
+                        used_shallow_landscape=response.used_shallow_landscape,
                     )
                 )
 
         expected_delta_u_star = expected_next_u - current_u
-        if detailed:
-            error = candidate_delta_u_star - (candidate_delta_q + candidate_delta_w + candidate_delta_a)
-            delta_q = candidate_delta_q
-            delta_w = candidate_delta_w
-            delta_a = candidate_delta_a
-            shallow_delta_u_star = candidate_delta_u_star
-        else:
-            error = None
-            delta_q = None
-            delta_w = None
-            delta_a = None
-            shallow_delta_u_star = None
+        if detailed and response_evaluations and selected_probability_mass > 0.0:
+            predicted_delta_u_star = sum(
+                response.refined_conditional_probability * response.branch_delta_u_star
+                for response in response_evaluations
+                if response.refined_conditional_probability is not None
+                and response.branch_delta_u_star is not None
+            )
+            predicted_delta_q_star = sum(
+                response.refined_conditional_probability * response.branch_delta_q_star
+                for response in response_evaluations
+                if response.refined_conditional_probability is not None
+                and response.branch_delta_q_star is not None
+            )
+            predicted_delta_w_star = sum(
+                response.refined_conditional_probability * response.branch_delta_w_star
+                for response in response_evaluations
+                if response.refined_conditional_probability is not None
+                and response.branch_delta_w_star is not None
+            )
+            predicted_delta_a_star = sum(
+                response.refined_conditional_probability * response.branch_delta_a_star
+                for response in response_evaluations
+                if response.refined_conditional_probability is not None
+                and response.branch_delta_a_star is not None
+            )
+            decomposition_error = predicted_delta_u_star - (
+                predicted_delta_q_star + predicted_delta_w_star + predicted_delta_a_star
+            )
         return {
             "expected_next_U": expected_next_u,
             "expected_delta_u_star": expected_delta_u_star,
             "candidate_delta_u": expected_delta_u_star,
             "candidate_delta_u_star": expected_delta_u_star,
-            "shallow_expected_delta_u_star": shallow_delta_u_star,
-            "candidate_delta_q": delta_q,
-            "candidate_delta_w": delta_w,
-            "candidate_delta_a": delta_a,
-            "thermo_decomposition_error": error,
+            "shallow_expected_delta_u_star": predicted_delta_u_star,
+            "predicted_delta_u_star": predicted_delta_u_star,
+            "predicted_delta_q_star": predicted_delta_q_star,
+            "predicted_delta_w_star": predicted_delta_w_star,
+            "predicted_delta_a_star": predicted_delta_a_star,
+            "predicted_refined_probability_mass": selected_probability_mass if detailed else None,
+            "predicted_refined_response_count": len(selected_responses) if detailed else None,
+            "candidate_delta_q": predicted_delta_q_star,
+            "candidate_delta_w": predicted_delta_w_star,
+            "candidate_delta_a": predicted_delta_a_star,
+            "thermo_decomposition_error": decomposition_error,
             "response_entropy": None,
             "response_N_eff": branch.response_neff,
             "response_K": branch.response_k,
@@ -1202,6 +1297,7 @@ class AdaptiveExpectedValue:
                 self._evaluate_branch(board, record, selected, selected_depth, cdepth, level)
                 for record in records
             )
+
         args = [
             {
                 "fen": board.fen(),
@@ -1225,7 +1321,7 @@ class AdaptiveExpectedValue:
         self.diagnostics.parallel_branches += len(records)
         with ProcessPoolExecutor(max_workers=self.search_workers) as executor:
             results = list(executor.map(_branch_worker, args))
-        branches = []
+        branches: list[AdaptiveBranchObservation] = []
         for branch, child_diag in results:
             branches.append(branch)
             child = SearchDiagnostics(
