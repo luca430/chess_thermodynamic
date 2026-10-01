@@ -358,6 +358,7 @@ def _thermodynamic_transition_record(
         u_after=new_result.U,
     )
     return {
+        "decomposition_type": "adaptive_same_player_transition",
         "player": player.name,
         "side": _side_name(player.color),
         "old_ply": old_result.diagnostics.get("ply", None),
@@ -366,6 +367,14 @@ def _thermodynamic_transition_record(
         "fen_new": new_result.board_fen,
         "U_old": decomposition.u_before,
         "U_new": decomposition.u_after,
+        "adaptive_same_player_delta_U": decomposition.delta_u,
+        "adaptive_same_player_delta_Q": decomposition.delta_q,
+        "adaptive_same_player_delta_W": decomposition.delta_w,
+        "adaptive_same_player_delta_A": decomposition.delta_a,
+        "delta_U_tilde": decomposition.delta_u,
+        "delta_Q_tilde": decomposition.delta_q,
+        "delta_W_tilde": decomposition.delta_w,
+        "delta_A_tilde": decomposition.delta_a,
         "delta_U": decomposition.delta_u,
         "delta_Q": decomposition.delta_q,
         "delta_W": decomposition.delta_w,
@@ -563,10 +572,10 @@ def simulate_match(
         static_after = evaluator.evaluate(board)
         repetition_count = _repetition_count(board)
 
-        cycle_delta_u = thermo_transition.get("delta_U") if thermo_transition else None
-        cycle_delta_q = thermo_transition.get("delta_Q") if thermo_transition else None
-        cycle_delta_w = thermo_transition.get("delta_W") if thermo_transition else None
-        cycle_delta_a = thermo_transition.get("delta_A") if thermo_transition else None
+        cycle_delta_u = thermo_transition.get("adaptive_same_player_delta_U") if thermo_transition else None
+        cycle_delta_q = thermo_transition.get("adaptive_same_player_delta_Q") if thermo_transition else None
+        cycle_delta_w = thermo_transition.get("adaptive_same_player_delta_W") if thermo_transition else None
+        cycle_delta_a = thermo_transition.get("adaptive_same_player_delta_A") if thermo_transition else None
         cycle_error = thermo_transition.get("decomposition_error") if thermo_transition else None
         cycle_old_branches = previous_thermo.branch_observations() if previous_thermo else ()
         cycle_new_branches = search_result.branch_observations() if previous_thermo else ()
@@ -596,12 +605,22 @@ def simulate_match(
             "refinement_policy": config.refinement_policy,
             "U_current": search_result.U,
             "U_after_move": choice.value,
+            "expected_delta_u_star": choice.delta_u,
             "candidate_delta_u": choice.delta_u,
             "delta_u": choice.delta_u,
+            "delta_u_star": choice.delta_u,
             "U_player_current": search_result.U,
             "U_before": thermo_transition.get("U_old") if thermo_transition else None,
             "U_after": thermo_transition.get("U_new") if thermo_transition else None,
+            "adaptive_same_player_delta_U": cycle_delta_u,
+            "adaptive_same_player_delta_Q": cycle_delta_q,
+            "adaptive_same_player_delta_W": cycle_delta_w,
+            "adaptive_same_player_delta_A": cycle_delta_a,
             "cycle_delta_U": cycle_delta_u,
+            "delta_U_tilde": cycle_delta_u,
+            "delta_Q_tilde": cycle_delta_q,
+            "delta_W_tilde": cycle_delta_w,
+            "delta_A_tilde": cycle_delta_a,
             "delta_U": cycle_delta_u,
             "delta_Q": cycle_delta_q,
             "delta_W": cycle_delta_w,

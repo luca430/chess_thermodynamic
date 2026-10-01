@@ -36,7 +36,7 @@ class CandidateScore:
             probability=move.probability,
             static_after=move.static_value_after_move,
             value=move.expected_next_U if move.expected_next_U is not None else move.branch_value,
-            delta_u=move.candidate_delta_u,
+            delta_u=move.expected_delta_u_star if move.expected_delta_u_star is not None else move.candidate_delta_u,
             selected_for_deeper_analysis=move.selected_for_refinement,
             response_neff=move.response_N_eff,
             response_k=move.response_K,
@@ -52,8 +52,10 @@ class CandidateScore:
             "static_after": self.static_after,
             "selection_value": self.value,
             "branch_value": self.value,
+            "expected_delta_u_star": self.delta_u,
             "candidate_delta_u": self.delta_u,
             "delta_u": self.delta_u,
+            "delta_u_star": self.delta_u,
             "selected_for_deeper_analysis": self.selected_for_deeper_analysis,
             "response_neff": self.response_neff,
             "response_k": self.response_k,
@@ -232,14 +234,14 @@ class ThermoPlayer:
         if not result.moves:
             return Choice(None, "", "", result.U, result.U, 0.0, None, None, analysis, result)
         chooser = max if self.color == chess.WHITE else min
-        best = chooser(result.moves, key=lambda move: move.candidate_delta_u)
+        best = chooser(result.moves, key=lambda move: move.expected_delta_u_star if move.expected_delta_u_star is not None else move.candidate_delta_u)
         return Choice(
             move=best.move,
             san=best.san,
             uci=best.uci,
             value=best.expected_next_U if best.expected_next_U is not None else best.branch_value,
             current_value=result.U,
-            delta_u=best.candidate_delta_u,
+            delta_u=best.expected_delta_u_star if best.expected_delta_u_star is not None else best.candidate_delta_u,
             current_landscape=None,
             reply_landscape=None,
             analysis=analysis,
