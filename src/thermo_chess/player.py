@@ -9,7 +9,7 @@ import chess
 
 from .evaluation import StaticEvaluator
 from .measure import KAPPA, MoveLandscape, Style
-from .search import AdaptiveDepthThresholds, AdaptiveExpectedValue, CandidateThermoMode, MoveEvaluation, PositionKey, RefinementPolicy, SearchMode, SearchResult
+from .search import AdaptiveExpectedValue, MoveEvaluation, PositionKey, SearchMode, SearchResult, validate_depth
 
 
 @dataclass(frozen=True)
@@ -20,12 +20,12 @@ class CandidateScore:
     probability: float
     static_after: float
     value: float
-    delta_u: float
-    selected_for_deeper_analysis: bool
+    g_tilde: float | None
+    selected_for_refinement: bool
     response_neff: float | None = None
     response_k: int | None = None
     search_mode: SearchMode = "accurate"
-    cdepth: int = 0
+    depth: int = 0
 
     @classmethod
     def from_move_evaluation(cls, move: MoveEvaluation, result: SearchResult) -> "CandidateScore":
@@ -35,13 +35,13 @@ class CandidateScore:
             uci=move.uci,
             probability=move.probability,
             static_after=move.static_value_after_move,
-            value=move.expected_next_U if move.expected_next_U is not None else move.branch_value,
-            delta_u=move.expected_delta_u_star if move.expected_delta_u_star is not None else move.candidate_delta_u,
-            selected_for_deeper_analysis=move.selected_for_refinement,
+            value=move.terminal_u if move.terminal_u is not None else move.branch_value,
+            g_tilde=move.g_tilde,
+            selected_for_refinement=move.selected_for_refinement,
             response_neff=move.response_N_eff,
             response_k=move.response_K,
             search_mode=result.search_mode,
-            cdepth=result.cdepth,
+            depth=result.depth,
         )
 
     def as_dict(self) -> Dict[str, object]:
@@ -52,15 +52,13 @@ class CandidateScore:
             "static_after": self.static_after,
             "selection_value": self.value,
             "branch_value": self.value,
-            "expected_delta_u_star": self.delta_u,
-            "candidate_delta_u": self.delta_u,
-            "delta_u": self.delta_u,
-            "delta_u_star": self.delta_u,
-            "selected_for_deeper_analysis": self.selected_for_deeper_analysis,
+            "terminal_u": self.value,
+            "g_tilde": self.g_tilde,
+            "selected_for_refinement": self.selected_for_refinement,
             "response_neff": self.response_neff,
             "response_k": self.response_k,
             "search_mode": self.search_mode,
-            "cdepth": self.cdepth,
+            "depth": self.depth,
         }
 
 
@@ -71,7 +69,6 @@ class PositionAnalysis:
     candidates: tuple[CandidateScore, ...]
     entropy: float
     effective_moves: float
-    selected_depth: int
     expanded_count: int
     selected_uci: tuple[str, ...]
     diagnostics: Dict[str, float | int | str]
@@ -98,28 +95,20 @@ class ThermoPlayer:
     color: chess.Color
     style: Style
     beta: float = 4.0
-    cdepth: int = 1
+    depth: int = 3
     adaptive_c: float = 0.3
-    depth_thresholds: AdaptiveDepthThresholds = field(default_factory=AdaptiveDepthThresholds)
     search_mode: SearchMode = "accurate"
     search_workers: int | None = 1
     parallel_min_branches: int = 8
-    candidate_thermo_mode: CandidateThermoMode = "refined"
-    refinement_policy: RefinementPolicy = "static_eval"
     kappa: float = KAPPA
-    depth: int | None = None
     _search: AdaptiveExpectedValue | None = field(default=None, init=False, repr=False, compare=False)
     _evaluator_id: int | None = field(default=None, init=False, repr=False, compare=False)
     _analysis_cache: Dict[PositionKey, PositionAnalysis] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if self.depth is not None:
-            self.cdepth = self.depth
-        self.depth = self.cdepth
+        self.depth = validate_depth(self.depth)
         if self.kappa <= 0.0:
             raise ValueError("kappa must be greater than 0")
-        if self.cdepth < 0:
-            raise ValueError("cdepth must be at least 0")
         if self.adaptive_c <= 0.0:
             raise ValueError("adaptive_c must be greater than 0")
         if self.search_mode != "accurate":
@@ -128,10 +117,6 @@ class ThermoPlayer:
             raise ValueError("search_workers must be at least 1")
         if self.parallel_min_branches < 1:
             raise ValueError("parallel_min_branches must be at least 1")
-        if self.candidate_thermo_mode not in {"selected", "refined", "all"}:
-            raise ValueError("candidate_thermo_mode must be 'selected', 'refined', or 'all'")
-        if self.refinement_policy not in {"static_eval", "probability"}:
-            raise ValueError("refinement_policy must be 'static_eval' or 'probability'")
 
     def search(self, evaluator: StaticEvaluator) -> AdaptiveExpectedValue:
         if self._search is None or self._evaluator_id != id(evaluator):
@@ -140,14 +125,11 @@ class ThermoPlayer:
                 self.beta,
                 evaluator,
                 kappa=self.kappa,
-                cdepth=self.cdepth,
+                depth=self.depth,
                 adaptive_c=self.adaptive_c,
-                depth_thresholds=self.depth_thresholds,
                 search_mode=self.search_mode,
                 search_workers=self.search_workers,
                 parallel_min_branches=self.parallel_min_branches,
-                candidate_thermo_mode=self.candidate_thermo_mode,
-                refinement_policy=self.refinement_policy,
             )
             self._evaluator_id = id(evaluator)
             self._analysis_cache.clear()
@@ -177,22 +159,21 @@ class ThermoPlayer:
             board_fen=result.board_fen,
             player=result.player,
             side=result.side,
-            cdepth=result.cdepth,
+            depth=result.depth,
             search_mode=result.search_mode,
             beta=result.beta,
             adaptive_c=result.adaptive_c,
-            refinement_policy=result.refinement_policy,
+            kappa=result.kappa,
             U=result.U,
             entropy=result.entropy,
             N_eff=result.N_eff,
             K=result.K,
-            selected_depth=result.selected_depth,
             selected_uci=result.selected_uci,
             moves=result.moves,
             diagnostics=diagnostics,
         )
         # Keep the cache authoritative for later consumers in this turn.
-        search._result_cache[(key, self.cdepth, result.side)] = result  # noqa: SLF001
+        search._result_cache[(key, self.depth, result.side)] = result  # noqa: SLF001
         candidates = tuple(CandidateScore.from_move_evaluation(move, result) for move in result.moves)
         analysis = PositionAnalysis(
             current_value=result.U,
@@ -200,7 +181,6 @@ class ThermoPlayer:
             candidates=candidates,
             entropy=result.entropy,
             effective_moves=result.N_eff,
-            selected_depth=result.selected_depth,
             expanded_count=result.K,
             selected_uci=result.selected_uci,
             diagnostics=diagnostics,
@@ -225,7 +205,6 @@ class ThermoPlayer:
             candidates=candidates,
             entropy=result.entropy,
             effective_moves=result.N_eff,
-            selected_depth=result.selected_depth,
             expanded_count=result.K,
             selected_uci=result.selected_uci,
             diagnostics=result.diagnostics,
@@ -233,15 +212,22 @@ class ThermoPlayer:
         )
         if not result.moves:
             return Choice(None, "", "", result.U, result.U, 0.0, None, None, analysis, result)
+        selectable = tuple(
+            move
+            for move in result.moves
+            if move.selected_for_refinement and move.g_tilde is not None
+        )
+        if not selectable:
+            return Choice(None, "", "", result.U, result.U, 0.0, None, None, analysis, result)
         chooser = max if self.color == chess.WHITE else min
-        best = chooser(result.moves, key=lambda move: move.expected_delta_u_star if move.expected_delta_u_star is not None else move.candidate_delta_u)
+        best = chooser(selectable, key=lambda move: move.g_tilde)
         return Choice(
             move=best.move,
             san=best.san,
             uci=best.uci,
-            value=best.expected_next_U if best.expected_next_U is not None else best.branch_value,
+            value=best.terminal_u if best.terminal_u is not None else best.branch_value,
             current_value=result.U,
-            delta_u=best.expected_delta_u_star if best.expected_delta_u_star is not None else best.candidate_delta_u,
+            delta_u=best.g_tilde,
             current_landscape=None,
             reply_landscape=None,
             analysis=analysis,

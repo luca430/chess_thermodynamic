@@ -14,17 +14,14 @@ from .measure import (
 )
 from .player import ThermoPlayer
 from .search import (
-    AdaptiveBranchObservation,
-    AdaptiveDepthThresholds,
+    LandscapeObservation,
     AdaptiveExpectedValue,
     SearchDiagnostics,
     SearchResult,
     MoveEvaluation,
     ResponseEvaluation,
-    RefinementPolicy,
     adaptive_breadth,
-    depth_from_effective_moves,
-    local_search_depth,
+    validate_depth,
 )
 from .thermodynamics import TransitionDecomposition, decompose_transition
 from .simulation import STRATEGY_NAMES, MatchConfig, simulate_match, strategy_style
@@ -32,8 +29,7 @@ from .simulation import STRATEGY_NAMES, MatchConfig, simulate_match, strategy_st
 __all__ = [
     "EvaluationWeights",
     "AdaptiveExpectedValue",
-    "AdaptiveBranchObservation",
-    "AdaptiveDepthThresholds",
+    "LandscapeObservation",
     "MatchConfig",
     "KAPPA",
     "MoveLandscape",
@@ -44,16 +40,14 @@ __all__ = [
     "SearchResult",
     "MoveEvaluation",
     "ResponseEvaluation",
-    "RefinementPolicy",
     "ThermoPlayer",
     "TransitionDecomposition",
     "beta_from_temperature",
     "entropy",
     "game_phase",
     "adaptive_breadth",
-    "depth_from_effective_moves",
     "decompose_transition",
-    "local_search_depth",
+    "validate_depth",
     "move_distribution",
     "phase_weights",
     "simulate_match",

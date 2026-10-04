@@ -9,12 +9,11 @@ from pathlib import Path
 
 FEATURE_COLUMNS = [
     "material",
-    "preservation",
-    "king_restriction",
-    "check",
-    "mate",
-    "activity",
     "center",
+    "development",
+    "castling",
+    "king_safety",
+    "king_pressure",
 ]
 
 

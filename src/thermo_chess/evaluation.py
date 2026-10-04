@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict
 
 import chess
@@ -13,23 +13,20 @@ from .features import BoardFeatureContext, white_minus_black_features
 @dataclass(frozen=True)
 class EvaluationWeights:
     material: float = 1.0
-    exposure: float = 0.5
-    mobility: float = 0.25
-    king_safety: float = 0.6
-    center: float = 0.35
+    pawn_structure: float = 1.0
+    mobility: float = 1.0
+    center: float = 1.0
+    king_safety: float = 1.0
     checkmate: float = 10_000.0
-    extra: Dict[str, float] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, float]:
-        weights = {
+        return {
             "material": self.material,
-            "exposure": self.exposure,
+            "pawn_structure": self.pawn_structure,
             "mobility": self.mobility,
-            "king_safety": self.king_safety,
             "center": self.center,
+            "king_safety": self.king_safety,
         }
-        weights.update(self.extra)
-        return weights
 
 
 class StaticEvaluator:

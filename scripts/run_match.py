@@ -4,16 +4,17 @@
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
 from thermo_chess.simulation import STRATEGY_NAMES, MatchConfig, simulate_match
 
 
-def nonnegative_int(value: str) -> int:
+def odd_depth(value: str) -> int:
     parsed = int(value)
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("must be at least 0")
+    if parsed < 3:
+        raise argparse.ArgumentTypeError("must be at least 3")
+    if parsed % 2 == 0:
+        raise argparse.ArgumentTypeError("must be odd")
     return parsed
 
 
@@ -40,13 +41,6 @@ def positive_float(value: str) -> float:
     return parsed
 
 
-def unit_float(value: str) -> float:
-    parsed = float(value)
-    if not 0.0 <= parsed <= 1.0:
-        raise argparse.ArgumentTypeError("must be between 0 and 1")
-    return parsed
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--max-plies", type=int, default=80)
@@ -63,41 +57,18 @@ def main() -> None:
     parser.add_argument(
         "--black-strategy",
         choices=STRATEGY_NAMES,
-        default="activity_aggressive",
-        help="Style preset used by Black (default: activity_aggressive).",
+        default="pressure_aggressive",
+        help="Style preset used by Black (default: pressure_aggressive).",
     )
-    parser.add_argument(
-        "--solidness-white",
-        type=unit_float,
-        default=None,
-        help="Override White's preset solidness sigma in [0, 1].",
-    )
-    parser.add_argument(
-        "--solidness-black",
-        type=unit_float,
-        default=None,
-        help="Override Black's preset solidness sigma in [0, 1].",
-    )
-    parser.add_argument("--cdepth", type=nonnegative_int, default=1, help="Cycle depth: one unit is own move plus opponent response.")
-    parser.add_argument("--depth", type=nonnegative_int, default=None, help="Deprecated alias for --cdepth.")
+    parser.add_argument("--depth", type=odd_depth, default=3, help="Odd ply depth for probability-truncated search (default: 3).")
     parser.add_argument("--adaptive-c", type=positive_float, default=0.3)
     parser.add_argument("--viewer-workers", type=positive_int, default=1, help="Deprecated for normal saved-data viewer generation; retained for compatibility.")
     parser.add_argument("--search-workers", type=optional_workers, default=1, help="Process workers for root own-move branches; use 1 for serial or auto for CPU count.")
     parser.add_argument("--parallel-min-branches", type=positive_int, default=8, help="Minimum root branch count before search worker parallelism activates.")
-    parser.add_argument("--candidate-thermo-mode", choices=("selected", "refined", "all"), default="refined", help="Which candidates receive detailed Q/W/A diagnostics (default: refined).")
-    parser.add_argument("--refinement-policy", choices=("static_eval", "probability"), default="static_eval", help="How root K and response K-prime branches are selected for deepening (default: static_eval). At cdepth 1 this affects diagnostics, not move choice.")
-    parser.add_argument("--name", default=None, help="Base filename for outputs; generated from strategies, betas, solidness, and cdepth by default.")
+    parser.add_argument("--name", default=None, help="Base filename for outputs; generated from strategies, betas, and depth by default.")
     parser.add_argument("--ignore-threefold", action="store_true", help="Continue through threefold repetition until mate/stalemate or max-plies.")
     parser.add_argument("--allow-draw-claims", action="store_true", help="Stop on other claimable/automatic draw rules as well.")
     args = parser.parse_args()
-    resolved_cdepth = args.depth if args.depth is not None else args.cdepth
-    if args.refinement_policy != "static_eval" and resolved_cdepth < 2:
-        print(
-            "Note: --refinement-policy changes move decisions only when local selected_depth exceeds 1; "
-            "with cdepth 1 it changes saved K/K-prime diagnostics but not played moves.",
-            file=sys.stderr,
-        )
-
     result = simulate_match(
         config=MatchConfig(
             max_plies=args.max_plies,
@@ -107,15 +78,11 @@ def main() -> None:
             kappa=args.kappa,
             white_strategy=args.white_strategy,
             black_strategy=args.black_strategy,
-            white_solidness=args.solidness_white,
-            black_solidness=args.solidness_black,
-            cdepth=resolved_cdepth,
+            depth=args.depth,
             adaptive_c=args.adaptive_c,
             viewer_workers=args.viewer_workers,
             search_workers=args.search_workers,
             parallel_min_branches=args.parallel_min_branches,
-            candidate_thermo_mode=args.candidate_thermo_mode,
-            refinement_policy=args.refinement_policy,
             match_name=args.name,
             stop_only_on_mate_or_stalemate=not args.allow_draw_claims,
             stop_on_threefold_repetition=not args.ignore_threefold,
