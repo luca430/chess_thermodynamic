@@ -1,7 +1,11 @@
 .pytest_cache/
 __pycache__
-data/games/*
-data/results/*
+data/games/csv/*
+data/games/json/*
+data/games/pgn/*
+data/analysis/covariance/*
+data/analysis/deep_search_divergence/*
+data/results/
 .agents/
 .aws/
 .codex/

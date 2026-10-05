@@ -72,6 +72,10 @@ class ResponseObservation:
     branch_w_tilde: float | None = None
     branch_a_tilde: float | None = None
     branch_decomposition_error: float | None = None
+    static_components: Dict[str, float] | None = None
+    board_fen: str | None = None
+    static_terminal: bool = False
+    static_terminal_reason: str | None = None
 
     def as_dict(self) -> Dict[str, object]:
         return {
@@ -92,6 +96,10 @@ class ResponseObservation:
             "branch_w_tilde": self.branch_w_tilde,
             "branch_a_tilde": self.branch_a_tilde,
             "branch_decomposition_error": self.branch_decomposition_error,
+            "static_components": self.static_components,
+            "board_fen": self.board_fen,
+            "static_terminal": self.static_terminal,
+            "static_terminal_reason": self.static_terminal_reason,
         }
 
     @classmethod
@@ -114,6 +122,10 @@ class ResponseObservation:
             branch_w_tilde=None if data.get("branch_w_tilde") is None else float(data["branch_w_tilde"]),
             branch_a_tilde=None if data.get("branch_a_tilde") is None else float(data["branch_a_tilde"]),
             branch_decomposition_error=None if data.get("branch_decomposition_error") is None else float(data["branch_decomposition_error"]),
+            static_components=None if data.get("static_components") is None else {str(key): float(value) for key, value in dict(data["static_components"]).items()},
+            board_fen=None if data.get("board_fen") is None else str(data["board_fen"]),
+            static_terminal=bool(data.get("static_terminal", False)),
+            static_terminal_reason=None if data.get("static_terminal_reason") is None else str(data["static_terminal_reason"]),
         )
 
 
@@ -168,6 +180,10 @@ class ResponseEvaluation:
     branch_decomposition_error: float | None = None
     conditional_probability: float | None = None
     used_shallow_landscape: bool = False
+    static_components: Dict[str, float] | None = None
+    board_fen: str | None = None
+    static_terminal: bool = False
+    static_terminal_reason: str | None = None
 
     def as_observation(self) -> ResponseObservation:
         return ResponseObservation(
@@ -187,6 +203,10 @@ class ResponseEvaluation:
             branch_w_tilde=self.branch_w_tilde,
             branch_a_tilde=self.branch_a_tilde,
             branch_decomposition_error=self.branch_decomposition_error,
+            static_components=self.static_components,
+            board_fen=self.board_fen,
+            static_terminal=self.static_terminal,
+            static_terminal_reason=self.static_terminal_reason,
         )
 
     def as_dict(self) -> Dict[str, object]:
@@ -223,6 +243,10 @@ class ResponseEvaluation:
             branch_decomposition_error=obs.branch_decomposition_error,
             conditional_probability=obs.conditional_probability,
             used_shallow_landscape=obs.used_shallow_landscape,
+            static_components=obs.static_components,
+            board_fen=obs.board_fen,
+            static_terminal=obs.static_terminal,
+            static_terminal_reason=obs.static_terminal_reason,
         )
 
 
@@ -240,6 +264,9 @@ class MoveEvaluation:
     base_potential: float
     phase_potential: float
     features: Dict[str, float]
+    static_components_after_move: Dict[str, float] | None = None
+    static_terminal_after_move: bool = False
+    static_terminal_reason_after_move: str | None = None
     terminal_u: float | None = None
     q_tilde: float | None = None
     w_tilde: float | None = None
@@ -277,6 +304,9 @@ class MoveEvaluation:
             "potential": self.potential,
             "static_after": self.static_value_after_move,
             "static_value_after_move": self.static_value_after_move,
+            "static_components_after_move": self.static_components_after_move,
+            "static_terminal_after_move": self.static_terminal_after_move,
+            "static_terminal_reason_after_move": self.static_terminal_reason_after_move,
             "terminal_u": self.terminal_u,
             "branch_value": self.branch_value,
             "g_tilde": self.g_tilde,
@@ -315,6 +345,9 @@ class MoveEvaluation:
             base_potential=float(data.get("base_potential", 0.0)),
             phase_potential=float(data.get("phase_potential", 0.0)),
             features=dict(data.get("features", {})),
+            static_components_after_move=None if data.get("static_components_after_move") is None else {str(key): float(value) for key, value in dict(data["static_components_after_move"]).items()},
+            static_terminal_after_move=bool(data.get("static_terminal_after_move", False)),
+            static_terminal_reason_after_move=None if data.get("static_terminal_reason_after_move") is None else str(data["static_terminal_reason_after_move"]),
             terminal_u=None if data.get("terminal_u") is None else float(data["terminal_u"]),
             q_tilde=None if data.get("q_tilde") is None else float(data["q_tilde"]),
             w_tilde=None if data.get("w_tilde") is None else float(data["w_tilde"]),
@@ -347,6 +380,7 @@ class SearchResult:
     moves: Tuple[MoveEvaluation, ...]
     diagnostics: Dict[str, float | int | str]
     kappa: float = KAPPA
+    evaluation_weights: Dict[str, float] | None = None
 
     def branch_observations(self) -> Tuple[LandscapeObservation, ...]:
         return tuple(
@@ -406,6 +440,7 @@ class SearchResult:
             "selected_uci": list(self.selected_uci),
             "moves": [move.as_dict() for move in self.moves],
             "diagnostics": self.diagnostics,
+            "evaluation_weights": self.evaluation_weights,
         }
 
     @classmethod
@@ -426,6 +461,7 @@ class SearchResult:
             selected_uci=tuple(str(uci) for uci in data.get("selected_uci", [])),
             moves=tuple(MoveEvaluation.from_dict(item) for item in data.get("moves", [])),
             diagnostics=dict(data.get("diagnostics", {})),
+            evaluation_weights=None if data.get("evaluation_weights") is None else {str(key): float(value) for key, value in dict(data["evaluation_weights"]).items()},
         )
 
 
@@ -499,6 +535,14 @@ class _CachedEvaluator:
 
     def evaluate(self, board: chess.Board, context: BoardFeatureContext | None = None) -> float:
         return self.search.static_value(board, context=context)
+
+    def components(
+        self, board: chess.Board, context: BoardFeatureContext | None = None
+    ) -> Dict[str, float] | None:
+        return self.search.evaluator.components(board, context=context)
+
+    def terminal_reason(self, board: chess.Board) -> str | None:
+        return self.search.evaluator.terminal_reason(board)
 
 
 def _terminal_observation(value: float, depth: int, search_mode: SearchMode) -> NodeSelection:
@@ -829,6 +873,7 @@ class AdaptiveExpectedValue:
                     selected_uci=selected_uci,
                     moves=moves,
                     diagnostics=self.diagnostics.as_dict(),
+                    evaluation_weights=self.evaluator.weights.as_dict(),
                 )
             detailed_uci = set(selection.selected_uci)
 
@@ -857,6 +902,9 @@ class AdaptiveExpectedValue:
                         base_potential=record.base_potential,
                         phase_potential=record.phase_potential,
                         features=record.features,
+                        static_components_after_move=record.static_components_after,
+                        static_terminal_after_move=record.static_terminal_after,
+                        static_terminal_reason_after_move=record.static_terminal_reason_after,
                         terminal_u=thermo["terminal_u"],
                         g_tilde=thermo["g_tilde"],
                         q_tilde=thermo["q_tilde"],
@@ -892,6 +940,7 @@ class AdaptiveExpectedValue:
             selected_uci=selected_uci,
             moves=moves,
             diagnostics=self.diagnostics.as_dict(),
+            evaluation_weights=self.evaluator.weights.as_dict(),
         )
         self._result_cache[key] = result
         return result
@@ -997,6 +1046,10 @@ class AdaptiveExpectedValue:
                         branch_decomposition_error=branch_error,
                         conditional_probability=conditional,
                         used_shallow_landscape=response.used_shallow_landscape,
+                        static_components=response.static_components,
+                        board_fen=response.board_fen,
+                        static_terminal=response.static_terminal,
+                        static_terminal_reason=response.static_terminal_reason,
                     )
                 )
 
@@ -1264,6 +1317,10 @@ class AdaptiveExpectedValue:
                             branch_w_tilde=dw,
                             branch_a_tilde=da,
                             branch_decomposition_error=err,
+                            static_components=reply.static_components_after,
+                            board_fen=child.fen(),
+                            static_terminal=reply.static_terminal_after,
+                            static_terminal_reason=reply.static_terminal_reason_after,
                         )
                     )
         return LandscapeObservation(

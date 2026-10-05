@@ -254,7 +254,7 @@ def build_game_payload(match_json: Path) -> Dict[str, Any]:
     }
 
 
-def build_platform_payload(results_dir: Path = Path("data/results")) -> Dict[str, Any]:
+def build_platform_payload(results_dir: Path = Path("data/games/json")) -> Dict[str, Any]:
     games = []
     for match_json in sorted(results_dir.glob("*.json")):
         try:
@@ -373,7 +373,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 
 
 def write_match_viewer(
-    results_dir: Path = Path("data/results"),
+    results_dir: Path = Path("data/games/json"),
     output_html: Path = Path("match_viewer.html"),
 ) -> Path:
     payload = build_platform_payload(results_dir)
@@ -386,7 +386,7 @@ def write_match_viewer(
 
 
 def write_interactive_viewer(
-    match_json: Path = Path("data/results/thermo_match.json"),
+    match_json: Path = Path("data/games/json/thermo_match.json"),
     output_html: Path = Path("match_viewer.html"),
 ) -> Path:
     """Backward-compatible wrapper for older callers.

@@ -86,7 +86,6 @@ def main() -> None:
             match_name=args.name,
             stop_only_on_mate_or_stalemate=not args.allow_draw_claims,
             stop_on_threefold_repetition=not args.ignore_threefold,
-            results_dir=Path("data/results"),
             games_dir=Path("data/games"),
         )
     )

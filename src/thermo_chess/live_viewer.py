@@ -221,7 +221,7 @@ LIVE_VIEWER_HTML = r"""<!doctype html>
 
 @dataclass(frozen=True)
 class LiveViewerConfig:
-    results_dir: Path = Path("data/results")
+    results_dir: Path = Path("data/games/json")
     host: str = "127.0.0.1"
     port: int = 8765
     open_browser: bool = False
@@ -329,7 +329,7 @@ def serve_match_viewer(config: LiveViewerConfig) -> None:
     server = LiveViewerServer(config)
     url = f"http://{config.host}:{server.server_address[1]}/"
     print(f"Live viewer: {url}")
-    print(f"Results dir: {config.results_dir}")
+    print(f"Games JSON dir: {config.results_dir}")
     print("Press Ctrl+C to stop.")
     if config.open_browser:
         webbrowser.open(url)
@@ -343,7 +343,7 @@ def serve_match_viewer(config: LiveViewerConfig) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Serve a live viewer for saved match JSON files.")
-    parser.add_argument("--results-dir", default="data/results")
+    parser.add_argument("--results-dir", default="data/games/json")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--open", action="store_true", help="Open the viewer in a browser.")

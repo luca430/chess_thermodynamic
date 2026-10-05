@@ -70,7 +70,6 @@ class MatchConfig:
     depth: int = 3
     search_mode: SearchMode = "accurate"
     adaptive_c: float = 0.3
-    results_dir: Path = Path("data/results")
     games_dir: Path = Path("data/games")
     match_name: str | None = None
     stop_only_on_mate_or_stalemate: bool = False
@@ -464,8 +463,12 @@ def simulate_match(
     )
     players = {chess.WHITE: white, chess.BLACK: black}
 
-    config.results_dir.mkdir(parents=True, exist_ok=True)
-    config.games_dir.mkdir(parents=True, exist_ok=True)
+    csv_dir = config.games_dir / "csv"
+    json_dir = config.games_dir / "json"
+    pgn_dir = config.games_dir / "pgn"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    json_dir.mkdir(parents=True, exist_ok=True)
+    pgn_dir.mkdir(parents=True, exist_ok=True)
 
     board = chess.Board()
     game = chess.pgn.Game()
@@ -509,6 +512,7 @@ def simulate_match(
             selected_uci=search_result.selected_uci,
             moves=search_result.moves,
             diagnostics=result_diag,
+            evaluation_weights=search_result.evaluation_weights,
         )
         current_landscape = current_analysis.landscape
         thermo_transition = None
@@ -673,9 +677,9 @@ def simulate_match(
         if _termination_reason(board, config) is not None:
             break
 
-    csv_path = config.results_dir / f"{config.match_name}.csv"
-    json_path = config.results_dir / f"{config.match_name}.json"
-    pgn_path = config.games_dir / f"{config.match_name}.pgn"
+    csv_path = csv_dir / f"{config.match_name}.csv"
+    json_path = json_dir / f"{config.match_name}.json"
+    pgn_path = pgn_dir / f"{config.match_name}.pgn"
 
     if rows:
         fieldnames = list(rows[0].keys())
@@ -689,8 +693,10 @@ def simulate_match(
     payload = {
         "config": {
             **asdict(config),
-            "results_dir": str(config.results_dir),
             "games_dir": str(config.games_dir),
+            "csv_dir": str(csv_dir),
+            "json_dir": str(json_dir),
+            "pgn_dir": str(pgn_dir),
         },
         "white_style": white.style.as_dict(),
         "black_style": black.style.as_dict(),

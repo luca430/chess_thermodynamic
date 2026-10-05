@@ -19,7 +19,7 @@ FEATURE_COLUMNS = [
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("match_json", nargs="?", default="data/results/thermo_match.json")
+    parser.add_argument("match_json", nargs="?", default="data/games/json/thermo_match.json")
     parser.add_argument("--ply", type=int, default=1)
     parser.add_argument(
         "--sort", choices=["probability", "static_after", "phi"], default="probability"

@@ -1662,9 +1662,9 @@ conda run -n chess env PYTHONPATH=src python scripts/run_match.py
 The default match writes
 
 ```text
-data/results/thermo_match.csv
-data/results/thermo_match.json
-data/games/thermo_match.pgn
+data/games/csv/thermo_match.csv
+data/games/json/thermo_match.json
+data/games/pgn/thermo_match.pgn
 ```
 
 Files with the same match name are overwritten. Use `--name` to preserve previous runs.
@@ -1772,7 +1772,7 @@ http://127.0.0.1:8765/
 
 | Flag | Default | Meaning |
 |---|---:|---|
-| `--results-dir PATH` | `data/results` | Directory containing match JSON files. |
+| `--results-dir PATH` | `data/games/json` | Directory containing match JSON files. |
 | `--host HOST` | `127.0.0.1` | Interface used by the HTTP server. |
 | `--port N` | `8765` | HTTP port. |
 | `--open` | off | Open the viewer URL in the default browser. |
@@ -1782,7 +1782,7 @@ Example:
 
 ```bash
 conda run -n chess env PYTHONPATH=src python scripts/view_match.py \
-  --results-dir data/results \
+  --results-dir data/games/json \
   --host 127.0.0.1 \
   --port 8877 \
   --open
@@ -1887,7 +1887,7 @@ It does not contain the thermodynamic/search diagnostics. Use JSON or CSV for qu
 
 ```bash
 conda run -n chess env PYTHONPATH=src python scripts/analyze_match.py \
-  data/results/thermo_match.json \
+  data/games/json/thermo_match.json \
   --ply 8 \
   --sort probability \
   --limit 20
@@ -1897,14 +1897,137 @@ Options:
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `match_json` | `data/results/thermo_match.json` | Match file to inspect. |
+| `match_json` | `data/games/json/thermo_match.json` | Match file to inspect. |
 | `--ply N` | `1` | Saved ply to print. |
 | `--sort MODE` | `probability` | Sort by `probability`, `static_after`, or `phi`. |
 | `--limit N` | `20` | Maximum number of moves printed. |
 
 The analysis script reads saved results and does not rerun search.
 
-## 18.2 Run tests
+## 18.2 Static covariance analysis
+
+For every deepened candidate move $m$, the retained opponent responses define a conditional ensemble
+
+$$
+\{B_{mr},P(r|m)\}.
+$$
+
+The covariance-analysis script computes the covariance matrix of the ordinary static-evaluation observables
+
+$$
+X=(M,P,L,C,K)
+$$
+
+as
+
+$$
+\Sigma_{ij}^{(m)}
+=
+\sum_rP(r|m)
+\left(X_i-\langle X_i\rangle_m\right)
+\left(X_j-\langle X_j\rangle_m\right).
+$$
+
+This covariance matrix concerns the observables entering the universal static board evaluator, not the observer-dependent move-potential features.
+
+Analyze one game:
+
+```bash
+conda run -n chess env PYTHONPATH=src python scripts/analyze_static_covariances.py \
+  data/games/json/thermo_match.json
+```
+
+This writes:
+
+```text
+data/analysis/covariance/thermo_match.csv
+```
+
+Analyze a directory of games:
+
+```bash
+conda run -n chess env PYTHONPATH=src python scripts/analyze_static_covariances.py \
+  data/games/json \
+  --json-output data/analysis/covariance
+```
+
+This writes one CSV per source game, and one optional JSON detail file per source game, under `data/analysis/covariance/`.
+
+Inspect one ply in a readable diagnostic view:
+
+```bash
+conda run -n chess env PYTHONPATH=src python scripts/analyze_static_covariances.py \
+  data/games/json/thermo_match.json \
+  --ply 7
+```
+
+The CSV contains one row per deepened candidate move. It includes candidate identity, actual-move matching, response probability checks, component means, component variances, independent off-diagonal covariances, $\alpha^T\Sigma\alpha$, direct weighted variance of `static_value`, and their consistency error when terminal boards do not make that comparison unavailable.
+
+## 18.3 Deep-search divergence analysis
+
+The deep-search divergence script compares the immediate retained-response static value
+
+$$
+\langle E\rangle_m
+=
+\sum_r P(r|m)E(B_{mr})
+$$
+
+from the covariance CSV with the corresponding deep-search terminal value saved in the detailed game JSON. It computes
+
+$$
+\Delta_{\mathrm{deep}}(m)
+=
+U_{\mathrm{terminal}}(m)-\langle E\rangle_m.
+$$
+
+In the output CSV this is named `terminal_minus_mean_static`, with `abs_terminal_minus_mean_static` used for anomaly ranking. Large absolute values are not automatically errors; they identify candidate branches where the recursive search changes the assessment substantially relative to the immediate response ensemble.
+
+Analyze one game:
+
+```bash
+conda run -n chess env PYTHONPATH=src python scripts/analyze_deep_search_divergence.py \
+  data/games/json/thermo_match.json
+```
+
+This expects the matching covariance CSV at:
+
+```text
+data/analysis/covariance/thermo_match.csv
+```
+
+and writes:
+
+```text
+data/analysis/deep_search_divergence/thermo_match.csv
+```
+
+Inspect one ply:
+
+```bash
+conda run -n chess env PYTHONPATH=src python scripts/analyze_deep_search_divergence.py \
+  data/games/json/thermo_match.json \
+  --ply 7
+```
+
+Print the top 20 largest divergences:
+
+```bash
+conda run -n chess env PYTHONPATH=src python scripts/analyze_deep_search_divergence.py \
+  data/games/json/thermo_match.json \
+  --top 20
+```
+
+For multiple games, pass a directory of JSON files:
+
+```bash
+conda run -n chess env PYTHONPATH=src python scripts/analyze_deep_search_divergence.py \
+  data/games/json
+```
+
+The script matches records by `(ply, candidate_uci)`, verifies SAN/probability/retained-response consistency where available, and fails clearly on ambiguous or missing deep-search records.
+
+## 18.4 Run tests
 
 ```bash
 conda run -n chess env PYTHONPATH=src pytest -q
@@ -1925,7 +2048,7 @@ The test suite covers the mathematical and serialization behavior of the model, 
 - serialization;
 - viewer-ready output.
 
-## 18.3 Optional benchmark
+## 18.5 Optional benchmark
 
 ```bash
 conda run -n chess env PYTHONPATH=src python scripts/benchmark_adaptive.py
@@ -1982,7 +2105,6 @@ config = MatchConfig(
     depth=3,
     adaptive_c=0.3,
     match_name="custom_adaptive_match",
-    results_dir=Path("data/results"),
     games_dir=Path("data/games"),
 )
 
@@ -2012,13 +2134,18 @@ src/thermo_chess/
   live_viewer.py     dynamic HTTP viewer
 
 scripts/
-  run_match.py           simulation CLI
-  view_match.py          viewer CLI
-  analyze_match.py       saved-landscape inspection CLI
-  benchmark_adaptive.py  optional search benchmark
+  run_match.py                       simulation CLI
+  view_match.py                      viewer CLI
+  analyze_match.py                   saved-landscape inspection CLI
+  analyze_static_covariances.py      static-component covariance analysis
+  analyze_deep_search_divergence.py  deep-search divergence analysis
+  benchmark_adaptive.py              optional search benchmark
 
-data/games/              generated PGN files
-data/results/            generated CSV and JSON files
+data/games/pgn/          generated PGN files
+data/games/csv/          generated compact CSV files
+data/games/json/         generated detailed JSON files
+data/analysis/covariance/ covariance-analysis outputs
+data/analysis/deep_search_divergence/ deep-search divergence outputs
 tests/                   mathematical and regression tests
 match_viewer.html        legacy static viewer artifact
 ```

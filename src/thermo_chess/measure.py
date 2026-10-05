@@ -59,6 +59,9 @@ class MoveRecord:
     features: Dict[str, object]
     base_potential: float
     phase_potential: float
+    static_components_after: Dict[str, float] | None = None
+    static_terminal_after: bool = False
+    static_terminal_reason_after: str | None = None
 
     def as_dict(self) -> Dict[str, object]:
         return {
@@ -67,6 +70,9 @@ class MoveRecord:
             "phi": self.phi,
             "probability": self.probability,
             "static_after": self.static_after,
+            "static_components_after": self.static_components_after,
+            "static_terminal_after": self.static_terminal_after,
+            "static_terminal_reason_after": self.static_terminal_reason_after,
             "features": self.features,
             "base_potential": self.base_potential,
             "phase_potential": self.phase_potential,
@@ -296,13 +302,18 @@ def move_distribution(
         evaluator.evaluate(after, context=after_values)
         for after, after_values in zip(after_boards, after_contexts)
     ]
+    static_components = [
+        evaluator.components(after, context=after_values)
+        for after, after_values in zip(after_boards, after_contexts)
+    ]
+    terminal_reasons = [evaluator.terminal_reason(after) for after in after_boards]
     phis = [total for _, _, total in components]
     probabilities = boltzmann_probabilities(phis, beta=beta, kappa=kappa)
 
     records: List[MoveRecord] = []
     expected = 0.0
-    for move, features, breakdown, (base_phi, phase_phi, _style_phi), phi, probability, static_after in zip(
-        legal_moves, features_by_move, feature_breakdowns, components, phis, probabilities, static_values
+    for move, features, breakdown, (base_phi, phase_phi, _style_phi), phi, probability, static_after, components_after, terminal_reason in zip(
+        legal_moves, features_by_move, feature_breakdowns, components, phis, probabilities, static_values, static_components, terminal_reasons
     ):
         san = board.san(move)
         expected += probability * static_after
@@ -324,6 +335,9 @@ def move_distribution(
                 ),
                 base_potential=base_phi,
                 phase_potential=phase_phi,
+                static_components_after=components_after,
+                static_terminal_after=terminal_reason is not None,
+                static_terminal_reason_after=terminal_reason,
             )
         )
 
