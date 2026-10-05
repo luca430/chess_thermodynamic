@@ -140,7 +140,7 @@ def _validate_match(row: dict[str, Any], move: dict[str, Any]) -> None:
         )
 
     row_count = row.get("number_of_responses")
-    json_count = move.get("retained_response_count")
+    json_count = len(move.get("responses") or []) or move.get("retained_response_count")
     if row_count not in (None, "") and json_count not in (None, ""):
         if int(row_count) != int(json_count):
             raise DivergenceAnalysisError(

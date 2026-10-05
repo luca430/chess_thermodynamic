@@ -31,9 +31,9 @@ def full_expected_value(
     style: Style,
     beta: float,
     evaluator: CountingEvaluator,
-    depth: int,
+    plies: int,
 ) -> tuple[float, int]:
-    if depth == 0 or board.is_game_over(claim_draw=True):
+    if plies == 0 or board.is_game_over(claim_draw=True):
         return evaluator.evaluate(board), 1
     landscape = move_distribution(board, style, beta, evaluator)
     nodes = 1
@@ -42,7 +42,7 @@ def full_expected_value(
         child = board.copy(stack=False)
         child.push(record.move)
         child_value, child_nodes = full_expected_value(
-            child, style, beta, evaluator, depth - 1
+            child, style, beta, evaluator, plies - 1
         )
         value += record.probability * child_value
         nodes += child_nodes
@@ -58,20 +58,20 @@ def main() -> None:
 
     board = chess.Board(args.fen)
     style = Style()
-    print("depth  seconds    nodes   static   recursive   avg_K   cache_hits   value")
-    for depth in range(1, 5):
+    print("cdepth seconds    nodes   static   recursive   avg_K   cache_hits   value")
+    for cdepth in range(1, 5):
         search = AdaptiveExpectedValue(
             style,
             args.beta,
             StaticEvaluator(),
-            depth=depth,
+            cdepth=cdepth,
             adaptive_c=args.adaptive_c,
         )
         search.begin_diagnostics()
         value = search.expected_value(board)
         diagnostics = search.finish_diagnostics()
         print(
-            f"{depth:>5}  {diagnostics['elapsed_time']:>7.3f}  "
+            f"{cdepth:>6}  {diagnostics['elapsed_time']:>7.3f}  "
             f"{diagnostics['nodes_evaluated']:>7}  "
             f"{diagnostics['static_evaluations']:>7}  "
             f"{diagnostics['recursive_nodes']:>9}  "
@@ -81,7 +81,7 @@ def main() -> None:
 
     evaluator = CountingEvaluator()
     started = time.perf_counter()
-    value, nodes = full_expected_value(board, style, args.beta, evaluator, depth=2)
+    value, nodes = full_expected_value(board, style, args.beta, evaluator, plies=2)
     elapsed = time.perf_counter() - started
     print(
         f"full2  {elapsed:>7.3f}  {nodes:>7}  {evaluator.calls:>7}  "

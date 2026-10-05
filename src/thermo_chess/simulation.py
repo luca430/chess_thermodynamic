@@ -16,7 +16,7 @@ from .evaluation import EvaluationWeights, StaticEvaluator
 from .features import PIECE_VALUES, material_balance
 from .measure import KAPPA, Style
 from .player import ThermoPlayer
-from .search import LandscapeObservation, SearchMode, SearchResult, validate_depth
+from .search import LandscapeObservation, SearchMode, SearchResult, requested_recursive_plies_for_cdepth, validate_cdepth
 from .thermodynamics import decompose_transition
 
 
@@ -67,7 +67,7 @@ class MatchConfig:
     kappa: float = KAPPA
     white_strategy: str = "material_conservative"
     black_strategy: str = "pressure_aggressive"
-    depth: int = 3
+    cdepth: int = 2
     search_mode: SearchMode = "accurate"
     adaptive_c: float = 0.3
     games_dir: Path = Path("data/games")
@@ -80,7 +80,7 @@ class MatchConfig:
     profile: bool = False
 
     def __post_init__(self) -> None:
-        self.depth = validate_depth(self.depth)
+        self.cdepth = validate_cdepth(self.cdepth)
         if self.kappa <= 0.0:
             raise ValueError("kappa must be greater than 0")
         if self.search_mode != "accurate":
@@ -170,7 +170,7 @@ def default_match_name(config: MatchConfig) -> str:
     black = (
         f"{config.black_strategy}_b{_filename_number(config.beta_black)}"
     )
-    return f"{white}_vs_{black}_depth{config.depth}"
+    return f"{white}_vs_{black}_cdepth{config.cdepth}"
 
 
 
@@ -287,7 +287,7 @@ def _thermodynamic_transition_record(
                 was_deepened=False,
                 depth_used=0,
                 search_mode=player.search_mode,
-                depth=0,
+                remaining_plies=0,
             )
             for record in landscape.records
         )
@@ -315,7 +315,7 @@ def _thermodynamic_transition_record(
         "realized_delta_a": decomposition.delta_a,
         "N_eff_old": old_landscape.effective_moves,
         "N_eff_new": new_landscape.effective_moves,
-        "depth": player.depth,
+        "cdepth": player.cdepth,
         "search_mode": player.search_mode,
         "old_support_size": decomposition.old_support_size,
         "new_support_size": decomposition.new_support_size,
@@ -442,7 +442,7 @@ def simulate_match(
         color=chess.WHITE,
         style=resolved_white_style,
         beta=config.beta_white,
-        depth=config.depth,
+        cdepth=config.cdepth,
         adaptive_c=config.adaptive_c,
         search_mode=config.search_mode,
         search_workers=config.search_workers,
@@ -454,7 +454,7 @@ def simulate_match(
         color=chess.BLACK,
         style=resolved_black_style,
         beta=config.beta_black,
-        depth=config.depth,
+        cdepth=config.cdepth,
         adaptive_c=config.adaptive_c,
         search_mode=config.search_mode,
         search_workers=config.search_workers,
@@ -500,7 +500,8 @@ def simulate_match(
             board_fen=search_result.board_fen,
             player=search_result.player,
             side=search_result.side,
-            depth=search_result.depth,
+            cdepth=search_result.cdepth,
+            requested_recursive_plies=search_result.requested_recursive_plies,
             search_mode=search_result.search_mode,
             beta=search_result.beta,
             adaptive_c=search_result.adaptive_c,
@@ -579,6 +580,10 @@ def simulate_match(
         cycle_error = thermo_transition.get("decomposition_error") if thermo_transition else None
         realized_action_delta_u = thermo_transition.get("realized_action_delta_u") if thermo_transition else None
         realized_response_delta_u = thermo_transition.get("realized_response_delta_u") if thermo_transition else None
+        selected_evaluation = next(
+            (move for move in search_result.moves if move.uci == choice.uci),
+            None,
+        )
 
         if _termination_reason(board, config) is not None:
             reached_ply_limit = False
@@ -598,12 +603,21 @@ def simulate_match(
             "fen_after": board.fen(),
             "E_before": static_before,
             "E_after": static_after,
-            "depth": config.depth,
+            "cdepth": config.cdepth,
+            "requested_recursive_plies": requested_recursive_plies_for_cdepth(config.cdepth),
             "search_mode": config.search_mode,
             "adaptive_c": config.adaptive_c,
             "U_current": search_result.U,
             "terminal_u": choice.value,
             "g_tilde": choice.delta_u,
+            "requested_cycles": selected_evaluation.requested_cycles if selected_evaluation else config.cdepth,
+            "deepened_cycles": selected_evaluation.deepened_cycles if selected_evaluation else None,
+            "thermo_g_tilde": selected_evaluation.thermo_g_tilde if selected_evaluation else None,
+            "q_tilde": selected_evaluation.q_tilde if selected_evaluation else None,
+            "w_tilde": selected_evaluation.w_tilde if selected_evaluation else None,
+            "a_tilde": selected_evaluation.a_tilde if selected_evaluation else None,
+            "search_endpoint_fen": selected_evaluation.search_endpoint_fen if selected_evaluation else None,
+            "thermodynamic_endpoint_fen": selected_evaluation.thermodynamic_endpoint_fen if selected_evaluation else None,
             "U_player_current": search_result.U,
             "U_before": thermo_transition.get("U_old") if thermo_transition else None,
             "U_after": thermo_transition.get("U_new") if thermo_transition else None,

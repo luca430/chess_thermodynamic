@@ -144,7 +144,7 @@ def candidate_covariance_record(
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     responses = list(move.get("responses") or [])
     if not responses:
-        return None, {"reason": "no retained responses"}
+        return None, {"reason": "no saved responses"}
 
     missing = [
         response.get("uci", f"response_{index}")

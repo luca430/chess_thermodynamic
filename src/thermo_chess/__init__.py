@@ -21,7 +21,8 @@ from .search import (
     MoveEvaluation,
     ResponseEvaluation,
     adaptive_breadth,
-    validate_depth,
+    requested_recursive_plies_for_cdepth,
+    validate_cdepth,
 )
 from .thermodynamics import TransitionDecomposition, decompose_transition
 from .simulation import STRATEGY_NAMES, MatchConfig, simulate_match, strategy_style
@@ -47,7 +48,8 @@ __all__ = [
     "game_phase",
     "adaptive_breadth",
     "decompose_transition",
-    "validate_depth",
+    "requested_recursive_plies_for_cdepth",
+    "validate_cdepth",
     "move_distribution",
     "phase_weights",
     "simulate_match",

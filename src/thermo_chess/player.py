@@ -9,7 +9,7 @@ import chess
 
 from .evaluation import StaticEvaluator
 from .measure import KAPPA, MoveLandscape, Style
-from .search import AdaptiveExpectedValue, MoveEvaluation, PositionKey, SearchMode, SearchResult, validate_depth
+from .search import AdaptiveExpectedValue, MoveEvaluation, PositionKey, SearchMode, SearchResult, validate_cdepth
 
 
 @dataclass(frozen=True)
@@ -25,7 +25,7 @@ class CandidateScore:
     response_neff: float | None = None
     response_k: int | None = None
     search_mode: SearchMode = "accurate"
-    depth: int = 0
+    cdepth: int = 0
 
     @classmethod
     def from_move_evaluation(cls, move: MoveEvaluation, result: SearchResult) -> "CandidateScore":
@@ -41,7 +41,7 @@ class CandidateScore:
             response_neff=move.response_N_eff,
             response_k=move.response_K,
             search_mode=result.search_mode,
-            depth=result.depth,
+            cdepth=result.cdepth,
         )
 
     def as_dict(self) -> Dict[str, object]:
@@ -58,7 +58,7 @@ class CandidateScore:
             "response_neff": self.response_neff,
             "response_k": self.response_k,
             "search_mode": self.search_mode,
-            "depth": self.depth,
+            "cdepth": self.cdepth,
         }
 
 
@@ -95,7 +95,7 @@ class ThermoPlayer:
     color: chess.Color
     style: Style
     beta: float = 4.0
-    depth: int = 3
+    cdepth: int = 2
     adaptive_c: float = 0.3
     search_mode: SearchMode = "accurate"
     search_workers: int | None = 1
@@ -106,7 +106,7 @@ class ThermoPlayer:
     _analysis_cache: Dict[PositionKey, PositionAnalysis] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        self.depth = validate_depth(self.depth)
+        self.cdepth = validate_cdepth(self.cdepth)
         if self.kappa <= 0.0:
             raise ValueError("kappa must be greater than 0")
         if self.adaptive_c <= 0.0:
@@ -125,7 +125,7 @@ class ThermoPlayer:
                 self.beta,
                 evaluator,
                 kappa=self.kappa,
-                depth=self.depth,
+                cdepth=self.cdepth,
                 adaptive_c=self.adaptive_c,
                 search_mode=self.search_mode,
                 search_workers=self.search_workers,
@@ -159,7 +159,8 @@ class ThermoPlayer:
             board_fen=result.board_fen,
             player=result.player,
             side=result.side,
-            depth=result.depth,
+            cdepth=result.cdepth,
+            requested_recursive_plies=result.requested_recursive_plies,
             search_mode=result.search_mode,
             beta=result.beta,
             adaptive_c=result.adaptive_c,
@@ -173,7 +174,7 @@ class ThermoPlayer:
             diagnostics=diagnostics,
         )
         # Keep the cache authoritative for later consumers in this turn.
-        search._result_cache[(key, self.depth, result.side)] = result  # noqa: SLF001
+        search._result_cache[(key, search.requested_recursive_plies, result.side)] = result  # noqa: SLF001
         candidates = tuple(CandidateScore.from_move_evaluation(move, result) for move in result.moves)
         analysis = PositionAnalysis(
             current_value=result.U,
@@ -215,7 +216,7 @@ class ThermoPlayer:
         selectable = tuple(
             move
             for move in result.moves
-            if move.selected_for_refinement and move.g_tilde is not None
+            if move.g_tilde is not None
         )
         if not selectable:
             return Choice(None, "", "", result.U, result.U, 0.0, None, None, analysis, result)

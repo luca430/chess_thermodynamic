@@ -48,7 +48,7 @@ from thermo_chess.measure import (
 )
 from thermo_chess.metrics import effective_number, entropy
 from thermo_chess.player import ThermoPlayer
-from thermo_chess.search import AdaptiveExpectedValue, LandscapeObservation, SearchResult, adaptive_breadth, validate_depth
+from thermo_chess.search import AdaptiveExpectedValue, LandscapeObservation, SearchResult, adaptive_breadth, mass_preserving_expectation, requested_recursive_plies_for_cdepth, side_to_move_backup, validate_cdepth
 from thermo_chess.simulation import (
     STRATEGY_NAMES,
     MatchConfig,
@@ -417,24 +417,215 @@ def test_adaptive_breadth_rule(effective_moves: float, adaptive_c: float, legal_
     assert adaptive_breadth(effective_moves, adaptive_c, legal_moves) == expected
 
 
+def test_mass_preserving_expectation_synthetic_limits_and_partial_case() -> None:
+    no_deep = (
+        LandscapeObservation(chess.Move.from_uci("a2a3"), "a2a3", 0.2, 1.0, False, 0),
+        LandscapeObservation(chess.Move.from_uci("b2b3"), "b2b3", 0.8, 3.0, False, 0),
+    )
+    all_deep = (
+        LandscapeObservation(chess.Move.from_uci("a2a3"), "a2a3", 0.2, 5.0, True, 1),
+        LandscapeObservation(chess.Move.from_uci("b2b3"), "b2b3", 0.8, 7.0, True, 1),
+    )
+    partial = (
+        LandscapeObservation(chess.Move.from_uci("a2a3"), "a2a3", 0.2, 5.0, True, 1),
+        LandscapeObservation(chess.Move.from_uci("b2b3"), "b2b3", 0.3, 11.0, True, 1),
+        LandscapeObservation(chess.Move.from_uci("c2c3"), "c2c3", 0.5, -2.0, False, 0),
+    )
+
+    assert mass_preserving_expectation(no_deep) == pytest.approx(0.2 * 1.0 + 0.8 * 3.0)
+    assert mass_preserving_expectation(all_deep) == pytest.approx(0.2 * 5.0 + 0.8 * 7.0)
+    assert mass_preserving_expectation(partial) == pytest.approx(0.2 * 5.0 + 0.3 * 11.0 + 0.5 * -2.0)
+
+
 def test_search_result_serialization_and_parallel_match() -> None:
     board = chess.Board("7k/8/8/8/8/8/6K1/7R w - - 0 1")
     evaluator = StaticEvaluator()
-    result = AdaptiveExpectedValue(Style(), 1.0, evaluator, depth=3).search_result(board, player="white", side="white")
+    result = AdaptiveExpectedValue(Style(), 1.0, evaluator, cdepth=2).search_result(board, player="white", side="white")
     restored = SearchResult.from_dict(result.as_dict())
     assert restored.U == pytest.approx(result.U)
     assert [move.uci for move in restored.moves] == [move.uci for move in result.moves]
     assert restored.evaluation_weights == result.evaluation_weights
 
-    serial = AdaptiveExpectedValue(Style(), 1.0, evaluator, depth=3, search_workers=1).search_result(board)
-    parallel = AdaptiveExpectedValue(Style(), 1.0, evaluator, depth=3, search_workers=2, parallel_min_branches=1).search_result(board)
+    serial = AdaptiveExpectedValue(Style(), 1.0, evaluator, cdepth=2, search_workers=1).search_result(board)
+    parallel = AdaptiveExpectedValue(Style(), 1.0, evaluator, cdepth=2, search_workers=2, parallel_min_branches=1).search_result(board)
     assert serial.U == pytest.approx(parallel.U)
+
+
+def test_recursive_backup_uses_side_to_move_minimax_over_available_endpoints() -> None:
+    board = chess.Board()
+    evaluator = StaticEvaluator()
+    search = AdaptiveExpectedValue(
+        Style(center=1.5, development=1.0),
+        2.0,
+        evaluator,
+        cdepth=1,
+        adaptive_c=0.2,
+    )
+    value = search.expected_value(board)
+    selection = search.node_selection(board)
+    assert selection is not None
+    branches = selection.branches
+    deepened_mass = sum(branch.probability for branch in branches if branch.was_deepened)
+
+    assert sum(branch.probability for branch in branches) == pytest.approx(1.0)
+    assert 0.0 < deepened_mass < 1.0
+    assert value == pytest.approx(side_to_move_backup(board.turn, branches))
+    assert value != pytest.approx(mass_preserving_expectation(branches))
+
+
+def test_root_adaptive_g_tilde_does_not_deepen_unselected_moves() -> None:
+    board = chess.Board()
+    evaluator = StaticEvaluator()
+    search = AdaptiveExpectedValue(
+        Style(center=1.5, development=1.0),
+        2.0,
+        evaluator,
+        cdepth=2,
+        adaptive_c=0.05,
+    )
+    result = search.search_result(board)
+    selected = {move.uci for move in result.moves if move.selected_for_refinement}
+    unselected = [move for move in result.moves if not move.selected_for_refinement]
+
+    assert selected
+    assert unselected
+    for move in result.moves:
+        after = board.copy(stack=False)
+        after.push(move.move)
+        shallow = search._future_subjective_value(after, 0, 1)
+        if move.uci in selected:
+            assert move.depth_used == 3
+        else:
+            assert move.depth_used == 0
+            assert move.deepened_cycles == 0
+            assert move.thermo_g_tilde is None
+            assert move.q_tilde is None
+            assert move.w_tilde is None
+            assert move.a_tilde is None
+            assert move.terminal_u == pytest.approx(shallow)
+            assert move.g_tilde == pytest.approx(shallow - result.U)
+
+
+def test_internal_adaptive_backup_uses_minimax_not_weighted_sum() -> None:
+    board = chess.Board()
+    evaluator = StaticEvaluator()
+    search = AdaptiveExpectedValue(
+        Style(center=1.5, development=1.0),
+        2.0,
+        evaluator,
+        cdepth=2,
+        adaptive_c=0.2,
+    )
+    root_result = search.search_result(board)
+    selected = next(move for move in root_result.moves if move.selected_for_refinement)
+    after = board.copy(stack=False)
+    after.push(selected.move)
+    selection = search.node_selection(after, 3)
+
+    assert selection is not None
+    assert any(branch.was_deepened for branch in selection.branches)
+    assert any(not branch.was_deepened for branch in selection.branches)
+    value = search._future_subjective_value(after, 3, 1)
+    assert value == pytest.approx(side_to_move_backup(after.turn, selection.branches))
+    assert value != pytest.approx(mass_preserving_expectation(selection.branches))
+
+
+def test_qwa_uses_selected_same_turn_endpoint_and_nontrivial_decomposition() -> None:
+    board = chess.Board()
+    evaluator = StaticEvaluator()
+    player = ThermoPlayer(
+        "white",
+        chess.WHITE,
+        Style(center=1.5, development=1.0),
+        beta=2.0,
+        cdepth=1,
+        adaptive_c=0.2,
+    )
+    result = player.evaluate_landscape(board, evaluator)
+    move = next(
+        candidate
+        for candidate in result.moves
+        if candidate.selected_for_refinement and candidate.qwa_unavailable_reason is None
+    )
+    endpoint = chess.Board(move.endpoint_fen)
+
+    assert endpoint.turn == board.turn
+    assert move.principal_variation
+    assert move.deepened_cycles == 1
+    assert move.thermo_g_tilde == pytest.approx(move.q_tilde + move.w_tilde + move.a_tilde)
+    assert move.thermo_decomposition_error == pytest.approx(0.0)
+    assert not (
+        move.q_tilde == pytest.approx(0.0)
+        and move.w_tilde == pytest.approx(0.0)
+        and move.a_tilde == pytest.approx(move.g_tilde)
+    )
+
+
+@pytest.mark.parametrize("cdepth", [1, 2, 3])
+def test_selected_principal_variation_endpoint_is_same_turn_for_cycle_depths(cdepth: int) -> None:
+    board = chess.Board("8/8/8/8/8/3k4/7P/4K3 w - - 0 1")
+    evaluator = StaticEvaluator()
+    result = AdaptiveExpectedValue(
+        Style(),
+        1.0,
+        evaluator,
+        cdepth=cdepth,
+        adaptive_c=0.2,
+    ).search_result(board)
+    move = next(candidate for candidate in result.moves if candidate.selected_for_refinement)
+    endpoint = chess.Board(move.endpoint_fen)
+
+    assert endpoint.turn == board.turn
+    assert move.qwa_unavailable_reason is None
+    assert move.thermo_g_tilde == pytest.approx(move.q_tilde + move.w_tilde + move.a_tilde)
+
+
+def test_partial_cycle_deepening_uses_thermodynamic_checkpoint() -> None:
+    board = chess.Board("8/8/8/8/8/8/P7/K1k5 w - - 0 1")
+    evaluator = StaticEvaluator()
+    result = AdaptiveExpectedValue(
+        Style(),
+        1.0,
+        evaluator,
+        cdepth=3,
+        adaptive_c=0.01,
+    ).search_result(board)
+    move = next(candidate for candidate in result.moves if candidate.selected_for_refinement)
+
+    assert move.requested_cycles == 3
+    assert move.deepened_cycles == 1
+    assert move.recursive_plies_used == 3
+    assert move.search_endpoint_fen != move.thermodynamic_endpoint_fen
+    assert chess.Board(move.thermodynamic_endpoint_fen).turn == board.turn
+    assert chess.Board(move.search_endpoint_fen).turn != board.turn
+    assert move.thermo_g_tilde == pytest.approx(move.q_tilde + move.w_tilde + move.a_tilde)
+    assert move.g_tilde != pytest.approx(move.thermo_g_tilde)
+
+
+def test_full_cycle_deepening_aligns_search_and_thermodynamic_endpoints() -> None:
+    board = chess.Board("8/8/8/8/8/8/P7/K1k5 w - - 0 1")
+    evaluator = StaticEvaluator()
+    result = AdaptiveExpectedValue(
+        Style(),
+        1.0,
+        evaluator,
+        cdepth=3,
+        adaptive_c=10.0,
+    ).search_result(board)
+
+    assert result.moves
+    for move in result.moves:
+        assert move.requested_cycles == 3
+        assert move.deepened_cycles == 3
+        assert move.search_endpoint_fen == move.thermodynamic_endpoint_fen
+        assert move.g_tilde == pytest.approx(move.thermo_g_tilde)
+        assert move.thermo_g_tilde == pytest.approx(move.q_tilde + move.w_tilde + move.a_tilde)
 
 
 def test_search_and_player_choice_identities() -> None:
     board = chess.Board("7k/8/8/8/8/8/6K1/7R w - - 0 1")
     evaluator = StaticEvaluator()
-    player = ThermoPlayer("white", chess.WHITE, Style(), beta=1.0, depth=3)
+    player = ThermoPlayer("white", chess.WHITE, Style(), beta=1.0, cdepth=2)
     result = player.evaluate_landscape(board, evaluator)
     choice = player.choose_from_result(result)
     chosen = next(move for move in result.moves if move.uci == choice.uci)
@@ -442,21 +633,42 @@ def test_search_and_player_choice_identities() -> None:
     assert choice.move in board.legal_moves
     assert choice.value == pytest.approx(chosen.terminal_u)
     assert choice.delta_u == pytest.approx(chosen.g_tilde)
-    assert chosen.g_tilde == pytest.approx(chosen.q_tilde + chosen.w_tilde + chosen.a_tilde)
+    assert chosen.thermo_g_tilde == pytest.approx(chosen.q_tilde + chosen.w_tilde + chosen.a_tilde)
     assert result.U == pytest.approx(move_distribution(board, player.style, player.beta, evaluator).expected_value)
 
 
-def test_depth_validation_and_future_depth_zero() -> None:
-    with pytest.raises(ValueError):
-        AdaptiveExpectedValue(Style(), 1.0, StaticEvaluator(), depth=0)
-    with pytest.raises(ValueError):
-        validate_depth(4)
+def test_black_still_selects_minimum_g_tilde() -> None:
+    board = chess.Board()
+    board.turn = chess.BLACK
+    evaluator = StaticEvaluator()
+    player = ThermoPlayer("black", chess.BLACK, Style(), beta=1.0, cdepth=1)
+    result = player.evaluate_landscape(board, evaluator)
+    choice = player.choose_from_result(result)
+    selectable = [move for move in result.moves if move.g_tilde is not None]
+
+    assert selectable
+    assert choice.uci == min(selectable, key=lambda move: move.g_tilde).uci
+
+
+@pytest.mark.parametrize("cdepth", [1, 2, 3, 4])
+def test_cdepth_validation_accepts_positive_complete_cycles(cdepth: int) -> None:
+    assert validate_cdepth(cdepth) == cdepth
+    assert requested_recursive_plies_for_cdepth(cdepth) == 2 * cdepth - 1
+
+
+@pytest.mark.parametrize("cdepth", [-2, -1, 0, 1.5, "3"])
+def test_cdepth_validation_rejects_non_cycle_depths(cdepth: object) -> None:
+    with pytest.raises(ValueError, match="complete move-response cycles"):
+        validate_cdepth(cdepth)  # type: ignore[arg-type]
+
+
+def test_future_depth_zero_remains_shallow_subjective_landscape() -> None:
     board = chess.Board()
     evaluator = StaticEvaluator()
-    search = AdaptiveExpectedValue(Style(center=1.5, development=1.0), 2.0, evaluator, depth=3)
+    search = AdaptiveExpectedValue(Style(center=1.5, development=1.0), 2.0, evaluator, cdepth=1)
     expected = move_distribution(board, search.style, 2.0, evaluator).expected_value
     assert search._future_subjective_value(board, 0, 0) == pytest.approx(expected)
-    assert search.expected_value(board, 0) == pytest.approx(evaluator.evaluate(board))
+    assert search.expected_value(board, 0) == pytest.approx(expected)
 
 
 def test_draw_rules_and_captured_material() -> None:
@@ -473,8 +685,8 @@ def test_draw_rules_and_captured_material() -> None:
 
 
 def test_adaptive_configuration_and_strategy_presets() -> None:
-    with pytest.raises(ValueError):
-        MatchConfig(depth=2)
+    with pytest.raises(ValueError, match="complete move-response cycles"):
+        MatchConfig(cdepth=0)
     with pytest.raises(ValueError):
         MatchConfig(adaptive_c=0.0)
     assert set(STRATEGY_NAMES) == {
@@ -489,26 +701,26 @@ def test_adaptive_configuration_and_strategy_presets() -> None:
     assert strategy_style("positional_controller").center > strategy_style("tactical_attacker").center
 
 
-def test_default_match_name_uses_strategy_beta_and_depth() -> None:
+def test_default_match_name_uses_strategy_beta_and_cdepth() -> None:
     config = MatchConfig(
         white_strategy="material_conservative",
         black_strategy="positional_controller",
         beta_white=4.0,
         beta_black=6.5,
-        depth=3,
+        cdepth=1,
     )
     assert config.match_name == default_match_name(config)
-    assert config.match_name == "material_conservative_b4_vs_positional_controller_b6p5_depth3"
+    assert config.match_name == "material_conservative_b4_vs_positional_controller_b6p5_cdepth1"
 
 
-def _branch(uci: str, probability: float, value: float, depth: int = 1) -> LandscapeObservation:
+def _branch(uci: str, probability: float, value: float, plies: int = 1) -> LandscapeObservation:
     return LandscapeObservation(
         move=chess.Move.from_uci(uci),
         uci=uci,
         probability=probability,
         observable_value=value,
-        was_deepened=depth > 0,
-        depth_used=depth,
+        was_deepened=plies > 0,
+        depth_used=plies,
     )
 
 
@@ -522,7 +734,7 @@ def test_thermodynamic_decomposition_identities() -> None:
 
 def test_same_player_transition_and_cycle_payload() -> None:
     evaluator = StaticEvaluator()
-    player = ThermoPlayer("white", chess.WHITE, _quiet_style(), beta=1.0, depth=3)
+    player = ThermoPlayer("white", chess.WHITE, _quiet_style(), beta=1.0, cdepth=1)
     board = chess.Board()
     old_result = player.evaluate_landscape(board, evaluator)
     board.push_san("e4")
@@ -539,7 +751,7 @@ def test_simulation_saves_viewer_ready_panels(tmp_path: Path) -> None:
     config = MatchConfig(
         max_plies=2,
         seed=1,
-        depth=3,
+        cdepth=1,
         games_dir=tmp_path / "games",
         match_name="viewer_payload",
     )
@@ -552,7 +764,7 @@ def test_simulation_saves_viewer_ready_panels(tmp_path: Path) -> None:
     states = data["viewer_states"]
     first_move = states[0]["white_panel"]["moves"][0]
 
-    assert data["config"]["depth"] == 3
+    assert data["config"]["cdepth"] == 1
     assert Path(result["csv"]).parent == tmp_path / "games" / "csv"
     assert Path(result["json"]).parent == tmp_path / "games" / "json"
     assert Path(result["pgn"]).parent == tmp_path / "games" / "pgn"
@@ -567,7 +779,7 @@ def test_simulation_saves_static_components_for_deepened_responses(tmp_path: Pat
     config = MatchConfig(
         max_plies=1,
         seed=1,
-        depth=3,
+        cdepth=1,
         adaptive_c=0.2,
         games_dir=tmp_path / "games",
         match_name="static_components",
@@ -578,6 +790,7 @@ def test_simulation_saves_static_components_for_deepened_responses(tmp_path: Pat
         config=config,
     )
     data = json.loads(Path(result["json"]).read_text(encoding="utf-8"))
+    csv_rows = list(csv.DictReader(Path(result["csv"]).open(newline="", encoding="utf-8")))
     move = next(
         move
         for move in data["plies"][0]["search_result"]["moves"]
@@ -589,6 +802,23 @@ def test_simulation_saves_static_components_for_deepened_responses(tmp_path: Pat
     assert set(response["static_components"]) == set(COMPONENT_ORDER)
     assert response["board_fen"]
     assert "evaluation_weights" in data["plies"][0]["search_result"]
+    assert "requested_cycles" in move
+    assert "deepened_cycles" in move
+    assert "thermo_g_tilde" in move
+    assert "search_endpoint_fen" in move
+    assert "thermodynamic_endpoint_fen" in move
+    assert "requested_cycles" in csv_rows[0]
+    assert "deepened_cycles" in csv_rows[0]
+    assert "thermo_g_tilde" in csv_rows[0]
+    assert move["total_probability_mass"] == pytest.approx(1.0)
+    assert (
+        move["deepened_probability_mass"] + move["nondeepened_probability_mass"]
+        == pytest.approx(1.0)
+    )
+    assert sum(reply["probability"] for reply in move["responses"]) == pytest.approx(1.0)
+    response_values = [reply["response_value"] for reply in move["responses"]]
+    assert move["terminal_u"] == pytest.approx(min(response_values))
+    assert any(not reply["selected_for_refinement"] for reply in move["responses"])
 
     output_dir = tmp_path / "analysis" / "covariance"
     subprocess.run(
@@ -833,7 +1063,7 @@ def test_deep_search_divergence_cli_with_generated_game(tmp_path: Path) -> None:
     config = MatchConfig(
         max_plies=1,
         seed=2,
-        depth=3,
+        cdepth=1,
         adaptive_c=0.2,
         games_dir=tmp_path / "games",
         match_name="divergence_game",

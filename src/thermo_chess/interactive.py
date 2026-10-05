@@ -11,7 +11,7 @@ import chess
 
 from .evaluation import EvaluationWeights, StaticEvaluator
 from .measure import Style, move_distribution
-from .search import AdaptiveExpectedValue
+from .search import AdaptiveExpectedValue, requested_recursive_plies_for_cdepth
 
 
 PIECE_GLYPHS = {
@@ -79,11 +79,11 @@ def _landscape_payload(
     beta: float,
     evaluator: StaticEvaluator,
     player_color: chess.Color,
-    depth: int = 1,
+    cdepth: int = 1,
     adaptive_c: float = 0.3,
     search_mode: str = "accurate",
 ) -> Dict[str, Any]:
-    search = AdaptiveExpectedValue(style, beta, evaluator, depth=depth, adaptive_c=adaptive_c, search_mode=search_mode)
+    search = AdaptiveExpectedValue(style, beta, evaluator, cdepth=cdepth, adaptive_c=adaptive_c, search_mode=search_mode)
     landscape = search.landscape(board)
     records_by_probability = sorted(
         landscape.records,
@@ -135,7 +135,9 @@ def _landscape_payload(
         "effective_moves": landscape.effective_moves,
         "best_advantage_move": best,
         "sort_direction": "max" if board.turn == chess.WHITE else "min",
-        "depth": depth,
+        "cdepth": cdepth,
+        "requested_cycles": cdepth,
+        "requested_recursive_plies": requested_recursive_plies_for_cdepth(cdepth),
         "search_mode": search_mode,
         "moves": moves,
     }
@@ -182,7 +184,7 @@ def build_game_payload(match_json: Path) -> Dict[str, Any]:
     black_style = _style_from_dict(source.get("black_style", {}))
     beta_white = float(config.get("beta_white", 4.0))
     beta_black = float(config.get("beta_black", 4.0))
-    depth = int(config.get("depth", config.get("depth", 1)))
+    cdepth = int(config.get("cdepth", config.get("depth", 1)))
     search_mode = str(config.get("search_mode", "accurate"))
     adaptive_c = float(config.get("adaptive_c", 0.3))
     plies = source.get("plies", [])
@@ -230,8 +232,8 @@ def build_game_payload(match_json: Path) -> Dict[str, Any]:
                 else "*",
                 "board": _board_matrix(spec["fen"]),
                 "static_evaluation": evaluator.evaluate(board),
-                "white_panel": _landscape_payload(board, white_style, beta_white, evaluator, chess.WHITE, depth, adaptive_c, search_mode),
-                "black_panel": _landscape_payload(board, black_style, beta_black, evaluator, chess.BLACK, depth, adaptive_c, search_mode),
+                "white_panel": _landscape_payload(board, white_style, beta_white, evaluator, chess.WHITE, cdepth, adaptive_c, search_mode),
+                "black_panel": _landscape_payload(board, black_style, beta_black, evaluator, chess.BLACK, cdepth, adaptive_c, search_mode),
             }
         )
 
