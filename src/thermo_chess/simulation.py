@@ -5,9 +5,10 @@ from __future__ import annotations
 import csv
 import json
 import random
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 import chess
 import chess.pgn
@@ -69,7 +70,7 @@ class MatchConfig:
     black_strategy: str = "pressure_aggressive"
     cdepth: int = 2
     search_mode: SearchMode = "accurate"
-    adaptive_c: float = 0.3
+    deepening_quantile: float = 0.8
     games_dir: Path = Path("data/games")
     match_name: str | None = None
     stop_only_on_mate_or_stalemate: bool = False
@@ -85,8 +86,8 @@ class MatchConfig:
             raise ValueError("kappa must be greater than 0")
         if self.search_mode != "accurate":
             raise ValueError("search_mode must be 'accurate'")
-        if self.adaptive_c <= 0.0:
-            raise ValueError("adaptive_c must be greater than 0")
+        if self.deepening_quantile <= 0.0 or self.deepening_quantile > 1.0:
+            raise ValueError("deepening_quantile must satisfy 0 < q <= 1")
         if self.viewer_workers < 1:
             raise ValueError("viewer_workers must be at least 1")
         if self.search_workers is not None and self.search_workers < 1:
@@ -221,6 +222,29 @@ def _side_name(color: chess.Color) -> str:
     return "white" if color == chess.WHITE else "black"
 
 
+def _format_seconds(seconds: float) -> str:
+    return f"{seconds:.1f}s"
+
+
+def _format_selected_move_progress(
+    ply: int,
+    side: str,
+    san: str,
+    uci: str,
+    g_tilde: float | None,
+    deepened_cycles: int | None,
+    cdepth: int,
+    elapsed_seconds: float,
+) -> str:
+    parts = [f"Ply {ply}", side.capitalize(), f"selected {san} ({uci})"]
+    if g_tilde is not None:
+        parts.append(f"G={g_tilde:.3f}")
+    if deepened_cycles is not None:
+        parts.append(f"cycles {deepened_cycles}/{cdepth}")
+    parts.append(_format_seconds(elapsed_seconds))
+    return " | ".join(parts)
+
+
 def _prediction_error_for_previous(
     rows: List[Dict[str, object]],
     board_after_actual_reply: chess.Board,
@@ -283,13 +307,13 @@ def _thermodynamic_transition_record(
                 move=record.move,
                 uci=record.uci,
                 probability=record.probability,
-                observable_value=record.static_after,
+                observable_value=float(record.static_after),
                 was_deepened=False,
                 depth_used=0,
                 search_mode=player.search_mode,
                 remaining_plies=0,
             )
-            for record in landscape.records
+            for record in landscape.considered_records
         )
         return landscape, branches
 
@@ -431,7 +455,8 @@ def simulate_match(
     black_style: Style | None = None,
     eval_weights: EvaluationWeights | None = None,
     config: MatchConfig | None = None,
-) -> Dict[str, Path | List[Dict[str, object]]]:
+    progress: Callable[[str], None] | None = None,
+) -> Dict[str, object]:
     config = config or MatchConfig()
     random.seed(config.seed)
     evaluator = StaticEvaluator(eval_weights)
@@ -443,7 +468,7 @@ def simulate_match(
         style=resolved_white_style,
         beta=config.beta_white,
         cdepth=config.cdepth,
-        adaptive_c=config.adaptive_c,
+        deepening_quantile=config.deepening_quantile,
         search_mode=config.search_mode,
         search_workers=config.search_workers,
         parallel_min_branches=config.parallel_min_branches,
@@ -455,7 +480,7 @@ def simulate_match(
         style=resolved_black_style,
         beta=config.beta_black,
         cdepth=config.cdepth,
-        adaptive_c=config.adaptive_c,
+        deepening_quantile=config.deepening_quantile,
         search_mode=config.search_mode,
         search_workers=config.search_workers,
         parallel_min_branches=config.parallel_min_branches,
@@ -491,6 +516,10 @@ def simulate_match(
             break
 
         player = players[board.turn]
+        side = _side_name(player.color)
+        if progress is not None:
+            progress(f"Ply {ply} | {side.capitalize()} to move | fullmove {board.fullmove_number}")
+        ply_started_at = time.perf_counter()
         fen_before = board.fen()
         static_before = evaluator.evaluate(board)
         current_analysis = player.analyze(board, evaluator)
@@ -504,7 +533,7 @@ def simulate_match(
             requested_recursive_plies=search_result.requested_recursive_plies,
             search_mode=search_result.search_mode,
             beta=search_result.beta,
-            adaptive_c=search_result.adaptive_c,
+            deepening_quantile=search_result.deepening_quantile,
             kappa=search_result.kappa,
             U=search_result.U,
             entropy=search_result.entropy,
@@ -557,16 +586,35 @@ def simulate_match(
         choice = player.choose_from_result(search_result)
         candidate_scores = _candidate_scores_from_result(search_result, player.color == chess.WHITE)
         if choice.move is None:
+            if progress is not None:
+                progress(f"Ply {ply} | {side.capitalize()} | no selectable move | {_format_seconds(time.perf_counter() - ply_started_at)}")
             break
+        selected_evaluation = next(
+            (move for move in search_result.moves if move.uci == choice.uci),
+            None,
+        )
+        if progress is not None:
+            progress(
+                _format_selected_move_progress(
+                    ply,
+                    side,
+                    choice.san,
+                    choice.uci,
+                    choice.delta_u,
+                    selected_evaluation.deepened_cycles if selected_evaluation else None,
+                    config.cdepth,
+                    time.perf_counter() - ply_started_at,
+                )
+            )
         if thermo_transition is not None and viewer_states:
             cycle_payload = _realized_cycle_payload(
                 thermo_transition,
-                _side_name(player.color),
+                side,
                 choice.san,
                 choice.uci,
             )
             if cycle_payload is not None:
-                viewer_states[-1][f"{_side_name(player.color)}_realized_cycle"] = cycle_payload
+                viewer_states[-1][f"{side}_realized_cycle"] = cycle_payload
 
         board.push(choice.move)
         node = node.add_variation(choice.move)
@@ -580,10 +628,6 @@ def simulate_match(
         cycle_error = thermo_transition.get("decomposition_error") if thermo_transition else None
         realized_action_delta_u = thermo_transition.get("realized_action_delta_u") if thermo_transition else None
         realized_response_delta_u = thermo_transition.get("realized_response_delta_u") if thermo_transition else None
-        selected_evaluation = next(
-            (move for move in search_result.moves if move.uci == choice.uci),
-            None,
-        )
 
         if _termination_reason(board, config) is not None:
             reached_ply_limit = False
@@ -595,7 +639,7 @@ def simulate_match(
         row = {
             "ply": ply,
             "move_number": board.fullmove_number if board.turn == chess.WHITE else board.fullmove_number,
-            "side": _side_name(player.color),
+            "side": side,
             "player": player.name,
             "san": choice.san,
             "uci": choice.uci,
@@ -606,7 +650,7 @@ def simulate_match(
             "cdepth": config.cdepth,
             "requested_recursive_plies": requested_recursive_plies_for_cdepth(config.cdepth),
             "search_mode": config.search_mode,
-            "adaptive_c": config.adaptive_c,
+            "deepening_quantile": config.deepening_quantile,
             "U_current": search_result.U,
             "terminal_u": choice.value,
             "g_tilde": choice.delta_u,
@@ -681,13 +725,14 @@ def simulate_match(
             _viewer_state(
                 board,
                 ply,
-                f"{ply}. {_side_name(player.color)} {choice.san}",
+                f"{ply}. {side} {choice.san}",
                 choice.san,
                 choice.uci,
                 row,
                 evaluator,
             )
         )
+        player.clear_transient_caches()
         if _termination_reason(board, config) is not None:
             break
 
@@ -740,4 +785,8 @@ def simulate_match(
         "csv": csv_path,
         "json": json_path,
         "pgn": pgn_path,
+        "result": result,
+        "terminal_reason": terminal_reason,
+        "plies_played": len(rows),
+        "full_moves_played": (len(rows) + 1) // 2,
     }

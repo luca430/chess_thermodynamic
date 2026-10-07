@@ -18,7 +18,7 @@ class CandidateScore:
     san: str
     uci: str
     probability: float
-    static_after: float
+    static_after: float | None
     value: float
     g_tilde: float | None
     selected_for_refinement: bool
@@ -96,7 +96,7 @@ class ThermoPlayer:
     style: Style
     beta: float = 4.0
     cdepth: int = 2
-    adaptive_c: float = 0.3
+    deepening_quantile: float = 0.8
     search_mode: SearchMode = "accurate"
     search_workers: int | None = 1
     parallel_min_branches: int = 8
@@ -109,8 +109,8 @@ class ThermoPlayer:
         self.cdepth = validate_cdepth(self.cdepth)
         if self.kappa <= 0.0:
             raise ValueError("kappa must be greater than 0")
-        if self.adaptive_c <= 0.0:
-            raise ValueError("adaptive_c must be greater than 0")
+        if self.deepening_quantile <= 0.0 or self.deepening_quantile > 1.0:
+            raise ValueError("deepening_quantile must satisfy 0 < q <= 1")
         if self.search_mode != "accurate":
             raise ValueError("search_mode must be 'accurate'")
         if self.search_workers is not None and self.search_workers < 1:
@@ -126,7 +126,7 @@ class ThermoPlayer:
                 evaluator,
                 kappa=self.kappa,
                 cdepth=self.cdepth,
-                adaptive_c=self.adaptive_c,
+                deepening_quantile=self.deepening_quantile,
                 search_mode=self.search_mode,
                 search_workers=self.search_workers,
                 parallel_min_branches=self.parallel_min_branches,
@@ -137,6 +137,11 @@ class ThermoPlayer:
 
     def landscape(self, board: chess.Board, evaluator: StaticEvaluator) -> MoveLandscape:
         return self.search(evaluator).landscape(board)
+
+    def clear_transient_caches(self) -> None:
+        if self._search is not None:
+            self._search.clear_transient_caches()
+        self._analysis_cache.clear()
 
     def evaluate_landscape(self, board: chess.Board, evaluator: StaticEvaluator) -> SearchResult:
         return self.search(evaluator).search_result(
@@ -163,7 +168,7 @@ class ThermoPlayer:
             requested_recursive_plies=result.requested_recursive_plies,
             search_mode=result.search_mode,
             beta=result.beta,
-            adaptive_c=result.adaptive_c,
+            deepening_quantile=result.deepening_quantile,
             kappa=result.kappa,
             U=result.U,
             entropy=result.entropy,

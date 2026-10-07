@@ -55,10 +55,14 @@ class MoveRecord:
     uci: str
     phi: float
     probability: float
-    static_after: float
+    static_after: float | None
     features: Dict[str, object]
     base_potential: float
     phase_potential: float
+    raw_probability: float | None = None
+    considered_probability: float | None = None
+    in_consideration_set: bool = True
+    consideration_rank: int | None = None
     static_components_after: Dict[str, float] | None = None
     static_terminal_after: bool = False
     static_terminal_reason_after: str | None = None
@@ -69,6 +73,10 @@ class MoveRecord:
             "uci": self.uci,
             "phi": self.phi,
             "probability": self.probability,
+            "raw_probability": self.raw_probability if self.raw_probability is not None else self.probability,
+            "considered_probability": self.considered_probability if self.considered_probability is not None else self.probability,
+            "in_consideration_set": self.in_consideration_set,
+            "consideration_rank": self.consideration_rank,
             "static_after": self.static_after,
             "static_components_after": self.static_components_after,
             "static_terminal_after": self.static_terminal_after,
@@ -89,7 +97,14 @@ class MoveLandscape:
     entropy: float
     effective_moves: float
     expected_value: float
+    legal_move_count: int = 0
+    consideration_count: int = 0
+    consideration_probability_mass_raw: float = 1.0
     kappa: float = KAPPA
+
+    @property
+    def considered_records(self) -> List[MoveRecord]:
+        return [record for record in self.records if record.in_consideration_set]
 
     def as_dict(self) -> Dict[str, object]:
         return {
@@ -99,6 +114,9 @@ class MoveLandscape:
             "entropy": self.entropy,
             "effective_moves": self.effective_moves,
             "expected_value": self.expected_value,
+            "legal_move_count": self.legal_move_count,
+            "consideration_count": self.consideration_count,
+            "consideration_probability_mass_raw": self.consideration_probability_mass_raw,
             "kappa": self.kappa,
             "temperature": temperature_from_beta(self.beta, self.kappa),
             "moves": [record.as_dict() for record in self.records],
@@ -218,6 +236,36 @@ def stable_softmax(values: Iterable[float], beta: float) -> List[float]:
     return boltzmann_probabilities(values, beta=beta, kappa=KAPPA)
 
 
+def effective_support_size(probabilities: Iterable[float], legal_moves: int | None = None) -> int:
+    values = list(probabilities)
+    limit = len(values) if legal_moves is None else legal_moves
+    if limit <= 0:
+        return 0
+    n_eff = effective_number(entropy(values))
+    return min(limit, max(1, math.ceil(n_eff)))
+
+
+def consideration_indices(probabilities: Iterable[float]) -> List[int]:
+    values = list(probabilities)
+    count = effective_support_size(values, len(values))
+    ranked = sorted(range(len(values)), key=lambda index: values[index], reverse=True)
+    return ranked[:count]
+
+
+def deepening_count_for_quantile(probabilities: Iterable[float], quantile: float) -> int:
+    if quantile <= 0.0 or quantile > 1.0:
+        raise ValueError("deepening_quantile must satisfy 0 < q <= 1")
+    values = sorted((float(value) for value in probabilities), reverse=True)
+    if not values:
+        return 0
+    total = 0.0
+    for index, value in enumerate(values, start=1):
+        total += value
+        if total >= quantile:
+            return index
+    return len(values)
+
+
 def _record_features(
     style: Style,
     pawn_features: Mapping[str, float],
@@ -298,25 +346,35 @@ def move_distribution(
         )
 
     components = [potential_components(style, features) for features in features_by_move]
-    static_values = [
-        evaluator.evaluate(after, context=after_values)
-        for after, after_values in zip(after_boards, after_contexts)
-    ]
-    static_components = [
-        evaluator.components(after, context=after_values)
-        for after, after_values in zip(after_boards, after_contexts)
-    ]
-    terminal_reasons = [evaluator.terminal_reason(after) for after in after_boards]
     phis = [total for _, _, total in components]
-    probabilities = boltzmann_probabilities(phis, beta=beta, kappa=kappa)
+    raw_probabilities = boltzmann_probabilities(phis, beta=beta, kappa=kappa)
+    s = entropy(raw_probabilities)
+    considered_indices = set(consideration_indices(raw_probabilities))
+    ranked_considered = sorted(considered_indices, key=lambda index: raw_probabilities[index], reverse=True)
+    consideration_rank = {index: rank for rank, index in enumerate(ranked_considered, start=1)}
+    consideration_mass = sum(raw_probabilities[index] for index in considered_indices)
+    considered_probabilities = [
+        (raw_probabilities[index] / consideration_mass if index in considered_indices and consideration_mass > 0.0 else 0.0)
+        for index in range(len(raw_probabilities))
+    ]
 
     records: List[MoveRecord] = []
     expected = 0.0
-    for move, features, breakdown, (base_phi, phase_phi, _style_phi), phi, probability, static_after, components_after, terminal_reason in zip(
-        legal_moves, features_by_move, feature_breakdowns, components, phis, probabilities, static_values, static_components, terminal_reasons
-    ):
+    for index, (move, features, breakdown, (base_phi, phase_phi, _style_phi), phi, raw_probability, probability) in enumerate(zip(
+        legal_moves, features_by_move, feature_breakdowns, components, phis, raw_probabilities, considered_probabilities
+    )):
         san = board.san(move)
-        expected += probability * static_after
+        in_consideration = index in considered_indices
+        static_after = None
+        components_after = None
+        terminal_reason = None
+        if in_consideration:
+            static_after, components_after = evaluator.evaluate_with_components(
+                after_boards[index],
+                context=after_contexts[index],
+            )
+            terminal_reason = evaluator.terminal_reason(after_boards[index])
+            expected += probability * static_after
         records.append(
             MoveRecord(
                 move=move,
@@ -335,13 +393,16 @@ def move_distribution(
                 ),
                 base_potential=base_phi,
                 phase_potential=phase_phi,
+                raw_probability=raw_probability,
+                considered_probability=probability,
+                in_consideration_set=in_consideration,
+                consideration_rank=consideration_rank.get(index),
                 static_components_after=components_after,
                 static_terminal_after=terminal_reason is not None,
                 static_terminal_reason_after=terminal_reason,
             )
         )
 
-    s = entropy(probabilities)
     return MoveLandscape(
         fen=board.fen(),
         turn="white" if board.turn == chess.WHITE else "black",
@@ -350,5 +411,8 @@ def move_distribution(
         entropy=s,
         effective_moves=effective_number(s),
         expected_value=expected,
+        legal_move_count=len(legal_moves),
+        consideration_count=len(considered_indices),
+        consideration_probability_mass_raw=consideration_mass,
         kappa=kappa,
     )

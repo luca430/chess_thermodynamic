@@ -31,13 +31,13 @@ def main() -> None:
     entry = next(item for item in data["plies"] if int(item["ply"]) == args.ply)
     moves = sorted(
         entry["current_landscape"]["moves"],
-        key=lambda item: item[args.sort],
+        key=lambda item: float("-inf") if item.get(args.sort) is None else item[args.sort],
         reverse=True,
     )
 
     print(f"Ply {args.ply}: {entry['row']['side']} played {entry['row']['san']}")
     header = (
-        f"{'move':<10} {'phi':>8} {'p(move|B)':>12} {'E(B_move)':>11} "
+        f"{'move':<10} {'phi':>8} {'raw p':>12} {'pbar':>12} {'E(B_move)':>11} "
         + " ".join(f"{name[:8]:>8}" for name in FEATURE_COLUMNS)
     )
     print(header)
@@ -47,11 +47,14 @@ def main() -> None:
         feature_values = " ".join(
             f"{float(features.get(name, 0.0)):>8.3f}" for name in FEATURE_COLUMNS
         )
+        static_after = move.get("static_after")
+        static_text = f"{float(static_after):>11.3f}" if static_after is not None else f"{'--':>11}"
         print(
             f"{move['san']:<10} "
             f"{move['phi']:>8.3f} "
+            f"{float(move.get('raw_probability', move['probability'])):>12.5f} "
             f"{move['probability']:>12.5f} "
-            f"{move['static_after']:>11.3f} "
+            f"{static_text} "
             f"{feature_values}"
         )
 

@@ -65,23 +65,32 @@ class StaticEvaluator:
         features = white_minus_black_features(board, context)
         return {name: float(features[name]) for name in STATIC_EVALUATION_COMPONENTS}
 
-    def evaluate(self, board: chess.Board, context: BoardFeatureContext | None = None) -> float:
+    def value_from_components(self, components: Dict[str, float] | None) -> float:
+        if components is None:
+            return 0.0
+        weights = self.weights.as_dict()
+        return sum(weights.get(name, 0.0) * value for name, value in components.items())
+
+    def evaluate_with_components(
+        self, board: chess.Board, context: BoardFeatureContext | None = None
+    ) -> tuple[float, Dict[str, float] | None]:
         if board.is_checkmate():
             # Side to move is checkmated.
-            return -self.weights.checkmate if board.turn == chess.WHITE else self.weights.checkmate
+            value = -self.weights.checkmate if board.turn == chess.WHITE else self.weights.checkmate
+            return value, None
         if (
             board.is_stalemate()
             or board.is_insufficient_material()
             or board.is_seventyfive_moves()
             or board.is_fivefold_repetition()
         ):
-            return 0.0
-
+            return 0.0, None
         features = self.components(board, context)
-        if features is None:
-            return 0.0
-        weights = self.weights.as_dict()
-        return sum(weights.get(name, 0.0) * value for name, value in features.items())
+        return self.value_from_components(features), features
+
+    def evaluate(self, board: chess.Board, context: BoardFeatureContext | None = None) -> float:
+        value, _components = self.evaluate_with_components(board, context=context)
+        return value
 
 
 def static_evaluation_components(

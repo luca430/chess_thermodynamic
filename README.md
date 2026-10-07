@@ -85,10 +85,10 @@ Upgrade `pip` and install the dependencies:
 
 ```bash
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install -e ".[dev]"
 ```
 
-Run commands from the repository root so that the local `thermo_chess/` package and the default `data/...` paths resolve correctly.
+The editable install makes the local `src/thermo_chess/` package importable without setting `PYTHONPATH`. Run commands from the repository root so that the default `data/...` paths resolve correctly.
 
 Quick import test:
 
@@ -574,26 +574,53 @@ Examples:
 
 ---
 
-# 9. Shallow subjective landscape `U_p(B)`
+# 9. Considered subjective landscape `U_p(B)`
 
-The shallow subjective landscape is
+The raw Boltzmann distribution is first computed over all legal moves. Its entropy defines
+
+$$
+\boxed{
+K_{\rm eff}(B)
+=
+\min\left(
+|\mathcal M(B)|,
+\max\left[1,\left\lceil N_{\rm eff}(B)\right\rceil\right]
+\right).
+}
+$$
+
+The `K_eff` moves with largest raw probability form the consideration set `C_p(B)`. Raw probabilities are then renormalized on that set:
+
+$$
+\boxed{
+\bar P_p(m\mid B)=
+\frac{P_p(m\mid B)}
+{\sum_{a\in C_p(B)}P_p(a\mid B)}
+\quad m\in C_p(B).
+}
+$$
+
+Excluded legal moves receive considered probability zero. They remain legal chess moves, but they are outside the agent's effective subjective decision support.
+
+The shallow subjective landscape is therefore
 
 $$
 \boxed{
 U_p(B)
 =
-\sum_{m\in\mathcal M(B)}P_p(m\mid B)E(B_m).
+\sum_{m\in C_p(B)}\bar P_p(m\mid B)E(B_m).
 }
 $$
 
-This is a complete normalized expectation over all legal moves.
+This is a complete normalized expectation over the moves the agent effectively considers.
 
 Important distinctions:
 
 - `E(B)` describes one board;
 - `Phi_p(m,B)` describes how attractive one move is to player `p`;
-- `P_p(m|B)` is the subjective measure induced by `Phi_p`;
-- `U_p(B)` is the expected static value under that measure.
+- `P_p(m|B)` is the raw subjective measure over legal moves;
+- `Pbar_p(m|B)` is the renormalized measure over considered moves;
+- `U_p(B)` is the expected static value under the considered measure.
 
 Because `E` is White-positive:
 
@@ -619,54 +646,72 @@ Custom styles can be supplied directly with `Style(...)`.
 
 ---
 
-# 11. Entropy-adaptive deepening
+# 11. Entropy-adaptive support and quantile deepening
 
 The search does not recursively expand every legal move to the same depth.
 
-At every searched board, the number of branches selected for recursive refinement is
+At every searched board the model separates two questions.
+
+First, the entropy effective number defines which moves are part of the subjective decision support:
 
 $$
 \boxed{
-K
+K_{\rm eff}
 =
 \min\left(
 N_{\rm legal},
-\max\left[1,\left\lceil cN_{\rm eff}\right\rceil\right]
+\max\left[1,\left\lceil N_{\rm eff}\right\rceil\right]
 \right)
 }
 $$
 
-where `c = adaptive_c > 0`.
+The `K_eff` highest raw-probability moves form `C_p(B)`. Only these moves enter the shallow landscape, recursive backup, and root move choice.
 
-The selected branches are the `K` moves with the largest **original Boltzmann probabilities** `P_p(m|B)`.
+Second, recursive deepening is applied to the highest renormalized-probability considered moves until a cumulative probability threshold is reached:
 
-The probabilities are not renormalized over this selected subset.
+$$
+\boxed{
+K_q
+=
+\min\left\{
+k:\sum_{i=1}^{k}\bar P_{(i)}\ge q
+\right\}.
+}
+$$
 
-The role of `K` is computational/attentional:
+The default is `q = deepening_quantile = 0.8`.
 
-> high-probability subjective moves receive deeper recursive analysis; other moves terminate at their current shallow landscape.
+Thus
 
-At the next recursive node, a new entropy and a new effective number are computed, generating a new breadth `K'`. Further levels similarly produce `K''`, etc.
+$$
+\boxed{
+D_p(B)\subseteq C_p(B)\subseteq\mathcal M(B).
+}
+$$
+
+The role of `C_p(B)` is behavioral: it says which legal moves are effectively accessible to the agent. The role of `D_p(B)` is computational: it says which considered moves receive recursive reasoning.
+
+At the next recursive node, a new entropy, consideration set, and deepening set are computed. Further levels similarly produce new local sets.
 
 Thus different branches can terminate at different effective depths.
 
-## 11.1 Meaning of `adaptive_c`
+## 11.1 Meaning of `deepening_quantile`
 
 Default:
 
 ```python
-adaptive_c = 0.3
+deepening_quantile = 0.8
 ```
 
-Smaller values deepen fewer branches. Larger values deepen more branches.
+Smaller values deepen fewer considered branches. Larger values deepen more considered branches.
 
-Because
+The parameter must satisfy
 
 $$
-K\sim \lceil cN_{\rm eff}\rceil,
+\boxed{0<q\le 1.}
 $$
 
-high-entropy positions automatically receive broader search than strongly concentrated positions.
+It does not decide which legal moves are considered. That is determined only by `N_eff`.
 
 ---
 
@@ -704,7 +749,7 @@ For example:
 
 # 13. Subjective minimax recursion
 
-The probability measure defines the shallow landscape and adaptive breadth, but recursive backup is **not** a probability-weighted expectation.
+The probability measure defines the shallow landscape, consideration set, and deepening set, but recursive backup is **not** a probability-weighted expectation.
 
 Fix one search owner `p`. Define
 
@@ -712,13 +757,13 @@ $$
 F_p(B,0)=U_p(B).
 $$
 
-At positive remaining recursive depth, each legal move `a` is assigned an endpoint value
+At positive remaining recursive depth, each considered move `a in C_p(B)` is assigned an endpoint value
 
 $$
 X_a=
 \begin{cases}
-F_p(B_a,n-1), & a\text{ selected among the adaptive top-}K,\\[4pt]
-U_p(B_a), & a\text{ not selected for deeper refinement}.
+F_p(B_a,n-1), & a\in D_p(B),\\[4pt]
+U_p(B_a), & a\in C_p(B)\setminus D_p(B).
 \end{cases}
 $$
 
@@ -728,8 +773,8 @@ $$
 \boxed{
 F_p(B,n)=
 \begin{cases}
-\max_a X_a, & \text{White to move},\\[4pt]
-\min_a X_a, & \text{Black to move}.
+\max_{a\in C_p(B)} X_a, & \text{White to move},\\[4pt]
+\min_{a\in C_p(B)} X_a, & \text{Black to move}.
 \end{cases}
 }
 $$
@@ -1173,7 +1218,7 @@ kappa                 = 1.0
 white_strategy        = material_conservative
 black_strategy        = pressure_aggressive
 cdepth                = 2
-adaptive_c            = 0.3
+deepening_quantile    = 0.8
 viewer_workers        = 1
 search_workers        = 1
 parallel_min_branches = 8
@@ -1335,38 +1380,44 @@ python run_match.py --cdepth 3
 
 `cdepth` must be at least 1.
 
-### `--adaptive-c X`
+### `--deepening-quantile X`
 
-Positive breadth coefficient controlling entropy-adaptive refinement.
+Cumulative considered-probability mass used for recursive refinement.
 
 Default:
 
 ```text
-0.3
+0.8
 ```
 
-At each node,
+At each node, legal moves first enter the consideration set according to
 
 $$
-K
+K_{\rm eff}
 =\min\!\left(
 N_{\rm legal},
-\max\left[1,\left\lceil cN_{\rm eff}\right\rceil\right]
+\max\left[1,\left\lceil N_{\rm eff}\right\rceil\right]
 \right),
 $$
 
-where `c = adaptive_c` and
+where
 
 $$
 N_{\rm eff}=e^S.
 $$
 
-Larger values recursively deepen more moves; smaller values concentrate computation on fewer high-probability branches.
+Then the considered probabilities are renormalized and the highest-probability considered moves are deepened until cumulative mass reaches `deepening_quantile`.
+
+The value must satisfy
+
+$$
+0<\texttt{deepening\_quantile}\le 1.
+$$
 
 Example:
 
 ```bash
-python run_match.py --adaptive-c 0.5
+python run_match.py --deepening-quantile 0.9
 ```
 
 ### `--search-workers N|auto`
@@ -1465,7 +1516,7 @@ python run_match.py \
     --beta-black 4.0 \
     --kappa 1.0 \
     --cdepth 3 \
-    --adaptive-c 0.3 \
+    --deepening-quantile 0.8 \
     --search-workers auto \
     --parallel-min-branches 8 \
     --max-plies 120 \
@@ -2090,20 +2141,20 @@ Default:
 4.0
 ```
 
-### `--adaptive-c X`
+### `--deepening-quantile X`
 
-Adaptive breadth coefficient.
+Recursive deepening quantile over the renormalized consideration set.
 
 Default:
 
 ```text
-0.3
+0.8
 ```
 
 Example:
 
 ```bash
-python benchmark_adaptive.py --beta 5.0 --adaptive-c 0.5
+python benchmark_adaptive.py --beta 5.0 --deepening-quantile 0.9
 ```
 
 ---
@@ -2195,7 +2246,7 @@ python run_match.py \
     --white-strategy material_conservative \
     --black-strategy positional_controller \
     --cdepth 2 \
-    --adaptive-c 0.3 \
+    --deepening-quantile 0.8 \
     --name example_match
 ```
 
@@ -2243,7 +2294,7 @@ Then select `example_match` and inspect the played move, subjective landscape, a
 Benchmark adaptive search:
 
 ```bash
-python benchmark_adaptive.py --beta 4.0 --adaptive-c 0.3
+python benchmark_adaptive.py --beta 4.0 --deepening-quantile 0.8
 ```
 
 Inspect feature scales:

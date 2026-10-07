@@ -11,25 +11,33 @@ from pathlib import Path
 import chess
 import pytest
 
+import thermo_chess.features as feature_module
 from thermo_chess.evaluation import EvaluationWeights, StaticEvaluator
 from thermo_chess.features import (
     DEFAULT_SCALES,
     board_context,
     center_control,
+    center_control_from_raw,
     center_control_raw,
+    development_score_from_slots,
     development_score,
     development_slots,
     game_phase,
     king_freedom,
+    king_freedom_from_safe_squares,
     king_safety,
+    king_safety_from_raw,
     king_safety_raw,
     king_safe_squares,
     legal_mobility,
+    legal_mobility_with_stats,
+    mobility_score_from_count,
     material_balance,
     move_features,
     move_feature_breakdown,
     pawn_structure_counts,
     pawn_structure_score,
+    pawn_structure_score_from_counts,
     unshielded_king_files,
 )
 from thermo_chess.measure import (
@@ -38,6 +46,9 @@ from thermo_chess.measure import (
     Style,
     beta_from_temperature,
     boltzmann_probabilities,
+    consideration_indices,
+    deepening_count_for_quantile,
+    effective_support_size,
     effective_style_weights,
     move_distribution,
     potential,
@@ -105,6 +116,15 @@ def _move_record(board: chess.Board, style: Style, uci: str) -> dict[str, object
         if record.uci == uci:
             return record.as_dict()
     raise AssertionError(f"move {uci} not found")
+
+
+def _old_legal_mobility(board: chess.Board, color: chess.Color) -> int:
+    probe = board.copy(stack=False)
+    probe.turn = color
+    probe.ep_square = None
+    if probe.is_checkmate() or probe.is_stalemate() or probe.is_insufficient_material():
+        return 0
+    return probe.legal_moves.count()
 
 
 def test_starting_board_static_symmetry_and_phase() -> None:
@@ -220,6 +240,98 @@ def test_king_pressure_uses_local_freedom_not_check_feature() -> None:
     assert "mate" not in features
 
 
+def test_raw_to_scaled_feature_helpers_match_public_helpers() -> None:
+    boards = [
+        chess.Board(),
+        chess.Board("r1bq1rk1/ppp2ppp/2np1n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQ1RK1 w - - 4 8"),
+        chess.Board("8/8/8/8/8/3PPP2/8/4K2k w - - 0 1"),
+    ]
+
+    for board in boards:
+        for color in (chess.WHITE, chess.BLACK):
+            pawn_counts = pawn_structure_counts(board, color)
+            mobility = legal_mobility(board, color)
+            center_raw = center_control_raw(board, color)
+            safety_raw = king_safety_raw(board, color)
+            slots = development_slots(board, color)
+            safe_squares = king_safe_squares(board, color, not color)
+
+            assert pawn_structure_score_from_counts(pawn_counts) == pytest.approx(
+                pawn_structure_score(board, color)
+            )
+            assert mobility_score_from_count(mobility) == pytest.approx(0.03 * mobility)
+            assert center_control_from_raw(center_raw) == pytest.approx(center_control(board, color))
+            assert king_safety_from_raw(safety_raw) == pytest.approx(king_safety(board, color))
+            assert development_score_from_slots(slots) == pytest.approx(development_score(board, color))
+            assert king_freedom_from_safe_squares(safe_squares) == pytest.approx(
+                king_freedom(board, color, not color)
+            )
+
+
+def test_board_context_fields_match_public_helpers_for_representative_positions() -> None:
+    boards = [
+        chess.Board(),
+        chess.Board("r1bq1rk1/ppp2ppp/2np1n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQ1RK1 w - - 4 8"),
+        chess.Board("8/8/8/2pPp3/2P1P3/8/8/4K2k w - e6 0 1"),
+        chess.Board("r4rk1/ppp2ppp/2n5/8/8/2N2N2/PPP2PPP/R4RK1 w - - 0 1"),
+        chess.Board("8/8/8/8/8/8/4p3/4K2k w - - 0 1"),
+        chess.Board("8/8/8/8/8/8/P7/K1k5 w - - 0 1"),
+    ]
+
+    for board in boards:
+        context = board_context(board)
+        for color in (chess.WHITE, chess.BLACK):
+            assert context.pawn_counts_by_side[color] == pawn_structure_counts(board, color)
+            assert context.pawn_structure_by_side[color] == pytest.approx(pawn_structure_score(board, color))
+            assert context.mobility_by_side[color] == legal_mobility(board, color)
+            assert context.mobility_score_by_side[color] == pytest.approx(
+                mobility_score_from_count(context.mobility_by_side[color])
+            )
+            assert context.center_raw_by_side[color] == pytest.approx(center_control_raw(board, color))
+            assert context.center_by_side[color] == pytest.approx(center_control(board, color))
+            assert context.king_safety_raw_by_side[color] == pytest.approx(king_safety_raw(board, color))
+            assert context.king_safety_by_side[color] == pytest.approx(king_safety(board, color))
+            assert context.development_slots_by_side[color] == development_slots(board, color)
+            assert context.development_by_side[color] == pytest.approx(development_score(board, color))
+            assert context.king_safe_squares_by_side[color] == king_safe_squares(board, color, not color)
+            assert context.king_freedom_by_side[color] == pytest.approx(king_freedom(board, color, not color))
+
+
+def test_board_context_computes_primitives_once_per_side(monkeypatch: pytest.MonkeyPatch) -> None:
+    counts = {
+        "pawn_structure_counts": 0,
+        "legal_mobility_with_stats": 0,
+        "center_control_raw": 0,
+        "king_safety_raw": 0,
+        "development_slots": 0,
+        "king_safe_squares": 0,
+    }
+    originals = {name: getattr(feature_module, name) for name in counts}
+
+    def counted(name: str):
+        original = originals[name]
+
+        def wrapper(*args, **kwargs):
+            counts[name] += 1
+            return original(*args, **kwargs)
+
+        return wrapper
+
+    for name in counts:
+        monkeypatch.setattr(feature_module, name, counted(name))
+
+    board_context(chess.Board("r1bq1rk1/ppp2ppp/2np1n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQ1RK1 w - - 4 8"))
+
+    assert counts == {
+        "pawn_structure_counts": 2,
+        "legal_mobility_with_stats": 2,
+        "center_control_raw": 2,
+        "king_safety_raw": 2,
+        "development_slots": 2,
+        "king_safe_squares": 2,
+    }
+
+
 def test_phase_depends_on_non_pawn_material_only() -> None:
     start = chess.Board()
     no_pawns = chess.Board("rnbqkbnr/8/8/8/8/8/8/RNBQKBNR w KQkq - 0 1")
@@ -332,6 +444,69 @@ def test_hypothetical_mobility_does_not_inherit_en_passant_right() -> None:
     assert legal_mobility(board, chess.WHITE) == without_ep.legal_moves.count()
 
 
+def test_legal_mobility_matches_old_probe_semantics_for_representative_positions() -> None:
+    positions = [
+        chess.Board(),
+        chess.Board("r1bq1rk1/ppp2ppp/2np1n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQ1RK1 w - - 4 8"),
+        chess.Board("4k3/8/8/8/8/3r4/4N3/4K3 w - - 0 1"),
+        chess.Board("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"),
+        chess.Board("r3k2r/8/8/8/8/8/8/R3K2R w - - 0 1"),
+        chess.Board("rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 2"),
+        chess.Board("8/P7/8/8/8/8/8/K1k5 w - - 0 1"),
+        chess.Board("8/8/8/8/8/8/P7/K1k5 w - - 0 1"),
+        chess.Board("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1"),
+        chess.Board("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1"),
+    ]
+
+    for board in positions:
+        for color in (chess.WHITE, chess.BLACK):
+            assert legal_mobility(board, color) == _old_legal_mobility(board, color)
+
+
+def test_legal_mobility_uses_direct_path_for_actual_side_without_ep() -> None:
+    board = chess.Board()
+    stats: dict[str, int] = {}
+
+    value = legal_mobility_with_stats(board, board.turn, stats)
+
+    assert value == board.legal_moves.count()
+    assert stats["legal_mobility_requests"] == 1
+    assert stats["legal_mobility_direct_counts"] == 1
+    assert stats.get("legal_mobility_probe_counts", 0) == 0
+    assert stats.get("legal_mobility_board_copies", 0) == 0
+
+
+def test_legal_mobility_probe_path_preserves_opposite_side_and_ep_semantics() -> None:
+    board = chess.Board()
+    for san in ("e4", "a5", "e5", "d5"):
+        board.push_san(san)
+    before_fen = board.fen()
+    stats: dict[str, int] = {}
+
+    actual = legal_mobility_with_stats(board, board.turn, stats)
+    opposite = legal_mobility_with_stats(board, not board.turn, stats)
+
+    assert board.fen() == before_fen
+    assert actual == _old_legal_mobility(board, board.turn)
+    assert opposite == _old_legal_mobility(board, not board.turn)
+    assert stats["legal_mobility_requests"] == 2
+    assert stats["legal_mobility_probe_counts"] == 2
+    assert stats["legal_mobility_board_copies"] == 2
+    assert stats.get("legal_mobility_direct_counts", 0) == 0
+
+
+def test_board_context_mobility_uses_one_probe_copy_without_ep() -> None:
+    stats: dict[str, int] = {}
+    context = board_context(chess.Board(), stats=stats)
+
+    assert context.mobility_by_side[chess.WHITE] == 20
+    assert context.mobility_by_side[chess.BLACK] == 20
+    assert stats["legal_mobility_requests"] == 2
+    assert stats["legal_mobility_direct_counts"] == 1
+    assert stats["legal_mobility_probe_counts"] == 1
+    assert stats["legal_mobility_board_copies"] == 1
+
+
 def test_probabilities_sum_and_beta_changes_concentration_not_phi() -> None:
     board = chess.Board()
     evaluator = StaticEvaluator()
@@ -378,6 +553,63 @@ def test_static_component_decomposition_matches_scalar_evaluator() -> None:
     assert reconstructed == pytest.approx(evaluator.evaluate(board))
 
 
+def test_combined_static_evaluator_matches_scalar_and_components() -> None:
+    positions = [
+        chess.Board(),
+        chess.Board("r1bq1rk1/ppp2ppp/2np1n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQ1RK1 w - - 4 8"),
+        chess.Board("4k3/8/8/8/8/8/8/4KQ2 w - - 0 1"),
+    ]
+    evaluator = StaticEvaluator(
+        EvaluationWeights(
+            material=1.2,
+            pawn_structure=0.7,
+            mobility=1.4,
+            center=0.8,
+            king_safety=1.1,
+        )
+    )
+
+    for board in positions:
+        context = board_context(board)
+        value, components = evaluator.evaluate_with_components(board, context=context)
+        assert value == pytest.approx(evaluator.evaluate(board, context=context))
+        assert components == evaluator.components(board, context=context)
+
+
+def test_combined_static_evaluator_preserves_terminal_values() -> None:
+    evaluator = StaticEvaluator()
+    boards = [
+        chess.Board("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1"),
+        chess.Board("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1"),
+        chess.Board("8/8/8/8/8/8/8/K1k5 w - - 0 1"),
+    ]
+
+    for board in boards:
+        value, components = evaluator.evaluate_with_components(board)
+        assert value == pytest.approx(evaluator.evaluate(board))
+        assert components is None
+
+
+def test_move_distribution_computes_static_components_once_per_considered_child() -> None:
+    class ComponentCountingEvaluator(StaticEvaluator):
+        def __init__(self) -> None:
+            super().__init__()
+            self.component_calls = 0
+
+        def components(self, board: chess.Board, context=None):  # type: ignore[override]
+            self.component_calls += 1
+            return super().components(board, context=context)
+
+    board = chess.Board()
+    evaluator = ComponentCountingEvaluator()
+    landscape = move_distribution(board, Style(center=1.5), 2.0, evaluator)
+
+    assert evaluator.component_calls == landscape.consideration_count
+    assert landscape.consideration_count == sum(
+        1 for record in landscape.records if record.in_consideration_set
+    )
+
+
 def test_static_components_are_null_for_terminal_positions() -> None:
     evaluator = StaticEvaluator()
     black_mated = chess.Board("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1")
@@ -407,6 +639,30 @@ def test_kappa_beta_temperature_and_entropy_helpers() -> None:
     assert temperature_from_beta(4.0, KAPPA) == pytest.approx(0.25)
     assert entropy([0.2, 0.3, 0.5]) >= 0.0
     assert effective_number(entropy([0.25] * 4)) == pytest.approx(4.0)
+
+
+def test_effective_support_uses_ceil_neff_and_top_raw_probabilities() -> None:
+    probabilities = [0.60, 0.20, 0.10, 0.05, 0.05]
+    s = -sum(probability * math.log(probability) for probability in probabilities)
+    n_eff = math.exp(s)
+
+    assert entropy(probabilities) == pytest.approx(s)
+    assert effective_number(s) == pytest.approx(n_eff)
+    assert effective_support_size(probabilities) == math.ceil(n_eff)
+    assert consideration_indices(probabilities) == [0, 1, 2, 3]
+
+
+def test_considered_probabilities_renormalize_and_quantile_deepens_subset() -> None:
+    probabilities = [0.60, 0.20, 0.10, 0.05, 0.05]
+    considered = consideration_indices(probabilities)
+    mass = sum(probabilities[index] for index in considered)
+    considered_probabilities = [probabilities[index] / mass for index in considered]
+
+    assert sum(considered_probabilities) == pytest.approx(1.0)
+    assert considered_probabilities == pytest.approx([12 / 19, 4 / 19, 2 / 19, 1 / 19])
+    assert deepening_count_for_quantile(considered_probabilities, 0.8) == 2
+    with pytest.raises(ValueError):
+        deepening_count_for_quantile(considered_probabilities, 0.0)
 
 
 @pytest.mark.parametrize(
@@ -449,6 +705,183 @@ def test_search_result_serialization_and_parallel_match() -> None:
     serial = AdaptiveExpectedValue(Style(), 1.0, evaluator, cdepth=2, search_workers=1).search_result(board)
     parallel = AdaptiveExpectedValue(Style(), 1.0, evaluator, cdepth=2, search_workers=2, parallel_min_branches=1).search_result(board)
     assert serial.U == pytest.approx(parallel.U)
+    serial_selected = max((move for move in serial.moves if move.g_tilde is not None), key=lambda move: move.g_tilde)
+    parallel_selected = max((move for move in parallel.moves if move.g_tilde is not None), key=lambda move: move.g_tilde)
+    assert serial_selected.uci == parallel_selected.uci
+    assert serial_selected.g_tilde == pytest.approx(parallel_selected.g_tilde)
+    assert serial_selected.thermo_g_tilde == pytest.approx(parallel_selected.thermo_g_tilde)
+    assert serial_selected.q_tilde == pytest.approx(parallel_selected.q_tilde)
+    assert serial_selected.w_tilde == pytest.approx(parallel_selected.w_tilde)
+    assert serial_selected.a_tilde == pytest.approx(parallel_selected.a_tilde)
+    assert serial_selected.deepened_cycles == parallel_selected.deepened_cycles
+    assert serial_selected.principal_variation == parallel_selected.principal_variation
+    assert serial_selected.search_endpoint_fen == parallel_selected.search_endpoint_fen
+    assert serial_selected.thermodynamic_endpoint_fen == parallel_selected.thermodynamic_endpoint_fen
+
+
+def test_search_and_player_transient_caches_can_be_cleared_after_materialization() -> None:
+    board = chess.Board("7k/8/8/8/8/8/6K1/7R w - - 0 1")
+    evaluator = StaticEvaluator()
+    player = ThermoPlayer("white", chess.WHITE, Style(), beta=1.0, cdepth=2)
+
+    analysis = player.analyze(board, evaluator)
+    result = analysis.search_result
+    serialized_before_clear = result.as_dict()
+    search = player.search(evaluator)
+
+    assert player._analysis_cache  # noqa: SLF001
+    assert search._result_cache  # noqa: SLF001
+    assert search._value_cache  # noqa: SLF001
+    assert search._selection_cache  # noqa: SLF001
+    assert search._static_cache  # noqa: SLF001
+    assert search._context_cache  # noqa: SLF001
+    assert search._landscape_cache  # noqa: SLF001
+
+    player.clear_transient_caches()
+
+    assert not player._analysis_cache  # noqa: SLF001
+    assert not search._static_cache  # noqa: SLF001
+    assert not search._context_cache  # noqa: SLF001
+    assert not search._landscape_cache  # noqa: SLF001
+    assert not search._response_landscape_cache  # noqa: SLF001
+    assert not search._value_cache  # noqa: SLF001
+    assert not search._selection_cache  # noqa: SLF001
+    assert not search._future_value_cache  # noqa: SLF001
+    assert not search._future_selection_cache  # noqa: SLF001
+    assert not search._recursive_result_cache  # noqa: SLF001
+    assert not search._result_cache  # noqa: SLF001
+    assert result.as_dict() == serialized_before_clear
+
+    player.clear_transient_caches()
+
+
+def test_board_context_cache_reuses_same_position_request() -> None:
+    board = chess.Board()
+    search = AdaptiveExpectedValue(Style(), 1.0, StaticEvaluator())
+
+    ctx1 = search._get_board_context(board)  # noqa: SLF001
+    ctx2 = search._get_board_context(board)  # noqa: SLF001
+
+    assert ctx1 == board_context(board)
+    assert ctx1 is ctx2
+    assert search.diagnostics.board_context_requests == 2
+    assert search.diagnostics.board_context_computations == 1
+    assert search.diagnostics.board_context_cache_hits == 1
+    assert search.diagnostics.board_context_requests == (
+        search.diagnostics.board_context_computations
+        + search.diagnostics.board_context_cache_hits
+    )
+
+
+def test_board_context_cache_is_position_based_not_object_identity() -> None:
+    first = chess.Board()
+    second = chess.Board(first.fen())
+    search = AdaptiveExpectedValue(Style(), 1.0, StaticEvaluator())
+
+    ctx1 = search._get_board_context(first)  # noqa: SLF001
+    ctx2 = search._get_board_context(second)  # noqa: SLF001
+
+    assert ctx1 is ctx2
+    assert search.diagnostics.board_context_computations == 1
+    assert search.diagnostics.board_context_cache_hits == 1
+
+
+def test_board_context_cache_key_distinguishes_state_affecting_context() -> None:
+    search = AdaptiveExpectedValue(Style(), 1.0, StaticEvaluator())
+    white_to_move = chess.Board()
+    black_to_move = chess.Board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1")
+    castling = chess.Board("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1")
+    no_castling = chess.Board("r3k2r/8/8/8/8/8/8/R3K2R w - - 0 1")
+    en_passant = chess.Board()
+    en_passant.push_san("e4")
+    no_en_passant = chess.Board(en_passant.fen())
+    no_en_passant.ep_square = None
+
+    for board in (white_to_move, black_to_move, castling, no_castling, en_passant, no_en_passant):
+        search._get_board_context(board)  # noqa: SLF001
+
+    assert search.diagnostics.board_context_computations == 6
+    assert search.diagnostics.board_context_cache_hits == 0
+
+
+def test_board_context_cache_cleanup_leaves_search_reusable() -> None:
+    board = chess.Board()
+    search = AdaptiveExpectedValue(Style(), 1.0, StaticEvaluator())
+
+    search._get_board_context(board)  # noqa: SLF001
+    assert search._context_cache  # noqa: SLF001
+    search.clear_transient_caches()
+
+    assert not search._context_cache  # noqa: SLF001
+    assert search.diagnostics.board_context_cache_entries == 0
+    search._get_board_context(board)  # noqa: SLF001
+    assert search._context_cache  # noqa: SLF001
+
+
+def test_serial_root_branch_contexts_are_cleared_between_candidates() -> None:
+    board = chess.Board("7k/8/8/8/8/8/6K1/7R w - - 0 1")
+    evaluator = StaticEvaluator()
+    search = AdaptiveExpectedValue(Style(), 1.0, evaluator, cdepth=2, search_workers=1)
+
+    result = search.search_result(board)
+    lifecycle = search._branch_cache_lifecycle  # noqa: SLF001
+
+    assert len(result.moves) >= 2
+    assert len(lifecycle) >= 2
+    assert all(sum(snapshot["before_clear"].values()) > 0 for snapshot in lifecycle)
+    assert all(sum(snapshot["after_clear"].values()) == 0 for snapshot in lifecycle)
+    assert all(snapshot["after_clear"]["context"] == 0 for snapshot in lifecycle)
+    assert search._result_cache  # noqa: SLF001
+    assert all(
+        key[0] == search.position_key(board)
+        for key in search._value_cache  # noqa: SLF001
+    )
+
+
+def test_root_candidates_are_materialized_in_one_branch_pass() -> None:
+    board = chess.Board()
+    evaluator = StaticEvaluator()
+    search = AdaptiveExpectedValue(
+        Style(center=1.5, development=1.0),
+        2.0,
+        evaluator,
+        cdepth=2,
+        deepening_quantile=0.2,
+        search_workers=1,
+    )
+
+    result = search.search_result(board)
+    considered = [move for move in result.moves if move.in_consideration_set]
+    deepened = [move for move in considered if move.selected_for_refinement]
+
+    assert len(considered) > 1
+    assert deepened
+    assert result.diagnostics["root_candidate_branch_evaluations"] == len(considered)
+    assert result.diagnostics["root_candidate_recursive_evaluations"] == len(deepened)
+    assert len(search._branch_cache_lifecycle) == len(considered)  # noqa: SLF001
+
+
+def test_serial_and_parallel_root_materialization_counters_match() -> None:
+    board = chess.Board("7k/8/8/8/8/8/6K1/7R w - - 0 1")
+    evaluator = StaticEvaluator()
+
+    serial = AdaptiveExpectedValue(Style(), 1.0, evaluator, cdepth=2, search_workers=1).search_result(board)
+    parallel = AdaptiveExpectedValue(
+        Style(),
+        1.0,
+        evaluator,
+        cdepth=2,
+        search_workers=2,
+        parallel_min_branches=1,
+    ).search_result(board)
+
+    serial_values = {move.uci: move.g_tilde for move in serial.moves if move.in_consideration_set}
+    parallel_values = {move.uci: move.g_tilde for move in parallel.moves if move.in_consideration_set}
+    assert serial_values.keys() == parallel_values.keys()
+    for uci, value in serial_values.items():
+        assert parallel_values[uci] == pytest.approx(value)
+    assert serial.diagnostics["root_candidate_branch_evaluations"] == parallel.diagnostics["root_candidate_branch_evaluations"]
+    assert serial.diagnostics["root_candidate_recursive_evaluations"] == parallel.diagnostics["root_candidate_recursive_evaluations"]
 
 
 def test_recursive_backup_uses_side_to_move_minimax_over_available_endpoints() -> None:
@@ -459,7 +892,7 @@ def test_recursive_backup_uses_side_to_move_minimax_over_available_endpoints() -
         2.0,
         evaluator,
         cdepth=1,
-        adaptive_c=0.2,
+        deepening_quantile=0.2,
     )
     value = search.expected_value(board)
     selection = search.node_selection(board)
@@ -481,7 +914,7 @@ def test_root_adaptive_g_tilde_does_not_deepen_unselected_moves() -> None:
         2.0,
         evaluator,
         cdepth=2,
-        adaptive_c=0.05,
+        deepening_quantile=0.05,
     )
     result = search.search_result(board)
     selected = {move.uci for move in result.moves if move.selected_for_refinement}
@@ -514,7 +947,7 @@ def test_internal_adaptive_backup_uses_minimax_not_weighted_sum() -> None:
         2.0,
         evaluator,
         cdepth=2,
-        adaptive_c=0.2,
+        deepening_quantile=0.2,
     )
     root_result = search.search_result(board)
     selected = next(move for move in root_result.moves if move.selected_for_refinement)
@@ -539,7 +972,7 @@ def test_qwa_uses_selected_same_turn_endpoint_and_nontrivial_decomposition() -> 
         Style(center=1.5, development=1.0),
         beta=2.0,
         cdepth=1,
-        adaptive_c=0.2,
+        deepening_quantile=0.2,
     )
     result = player.evaluate_landscape(board, evaluator)
     move = next(
@@ -570,7 +1003,7 @@ def test_selected_principal_variation_endpoint_is_same_turn_for_cycle_depths(cde
         1.0,
         evaluator,
         cdepth=cdepth,
-        adaptive_c=0.2,
+        deepening_quantile=0.2,
     ).search_result(board)
     move = next(candidate for candidate in result.moves if candidate.selected_for_refinement)
     endpoint = chess.Board(move.endpoint_fen)
@@ -588,7 +1021,7 @@ def test_partial_cycle_deepening_uses_thermodynamic_checkpoint() -> None:
         1.0,
         evaluator,
         cdepth=3,
-        adaptive_c=0.01,
+        deepening_quantile=0.01,
     ).search_result(board)
     move = next(candidate for candidate in result.moves if candidate.selected_for_refinement)
 
@@ -610,7 +1043,7 @@ def test_full_cycle_deepening_aligns_search_and_thermodynamic_endpoints() -> Non
         1.0,
         evaluator,
         cdepth=3,
-        adaptive_c=10.0,
+        deepening_quantile=1.0,
     ).search_result(board)
 
     assert result.moves
@@ -688,7 +1121,7 @@ def test_adaptive_configuration_and_strategy_presets() -> None:
     with pytest.raises(ValueError, match="complete move-response cycles"):
         MatchConfig(cdepth=0)
     with pytest.raises(ValueError):
-        MatchConfig(adaptive_c=0.0)
+        MatchConfig(deepening_quantile=0.0)
     assert set(STRATEGY_NAMES) == {
         "material_conservative",
         "pressure_aggressive",
@@ -755,10 +1188,12 @@ def test_simulation_saves_viewer_ready_panels(tmp_path: Path) -> None:
         games_dir=tmp_path / "games",
         match_name="viewer_payload",
     )
+    progress_lines: list[str] = []
     result = simulate_match(
         white_style=_quiet_style(material=1.0, center=0.5),
         black_style=_quiet_style(material=1.0, center=0.5),
         config=config,
+        progress=progress_lines.append,
     )
     data = json.loads(Path(result["json"]).read_text(encoding="utf-8"))
     states = data["viewer_states"]
@@ -770,6 +1205,15 @@ def test_simulation_saves_viewer_ready_panels(tmp_path: Path) -> None:
     assert Path(result["pgn"]).parent == tmp_path / "games" / "pgn"
     assert set(data["white_style"]) == set(STRATEGY_FEATURES)
     assert len(states) == len(data["plies"]) + 1
+    assert result["result"] == data["result"]
+    assert result["terminal_reason"] == data["terminal_reason"]
+    assert result["plies_played"] == len(data["plies"])
+    assert result["full_moves_played"] == 1
+    assert progress_lines[0].startswith("Ply 1 | White to move | fullmove 1")
+    assert " | selected " in progress_lines[1]
+    assert " | G=" in progress_lines[1]
+    assert " | cycles " in progress_lines[1]
+    assert progress_lines[1].endswith("s")
     assert states[0]["fen"] == chess.STARTING_FEN
     assert first_move["features"]["lambda_sum"] == pytest.approx(1.0)
     assert first_move["g_tilde"] == pytest.approx(first_move["terminal_u"] - states[0]["white_panel"]["expected_value"])
@@ -780,7 +1224,7 @@ def test_simulation_saves_static_components_for_deepened_responses(tmp_path: Pat
         max_plies=1,
         seed=1,
         cdepth=1,
-        adaptive_c=0.2,
+        deepening_quantile=0.2,
         games_dir=tmp_path / "games",
         match_name="static_components",
     )
@@ -1064,7 +1508,7 @@ def test_deep_search_divergence_cli_with_generated_game(tmp_path: Path) -> None:
         max_plies=1,
         seed=2,
         cdepth=1,
-        adaptive_c=0.2,
+        deepening_quantile=0.2,
         games_dir=tmp_path / "games",
         match_name="divergence_game",
     )

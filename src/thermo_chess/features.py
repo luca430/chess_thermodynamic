@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, MutableMapping
 
 import chess
 
@@ -73,6 +73,8 @@ class FeatureScales:
 
 DEFAULT_SCALES = FeatureScales()
 
+FeatureComputationStats = MutableMapping[str, int]
+
 
 @dataclass(frozen=True)
 class PawnStructureCounts:
@@ -103,6 +105,11 @@ class BoardFeatureContext:
 
     def material_for_side(self, side: chess.Color) -> float:
         return self.material_by_side[side] - self.material_by_side[not side]
+
+
+def _count_feature_computation(stats: FeatureComputationStats | None, name: str) -> None:
+    if stats is not None:
+        stats[name] = int(stats.get(name, 0)) + 1
 
 
 def material_value(board: chess.Board, color: chess.Color) -> float:
@@ -183,6 +190,13 @@ def pawn_structure_score(
     scales: FeatureScales = DEFAULT_SCALES,
 ) -> float:
     counts = pawn_structure_counts(board, color)
+    return pawn_structure_score_from_counts(counts, scales)
+
+
+def pawn_structure_score_from_counts(
+    counts: PawnStructureCounts,
+    scales: FeatureScales = DEFAULT_SCALES,
+) -> float:
     return (
         scales.passed_pawn * counts.passed
         + scales.connected_pawn * counts.connected
@@ -191,9 +205,36 @@ def pawn_structure_score(
     )
 
 
-def legal_mobility(board: chess.Board, color: chess.Color) -> int:
+def legal_mobility(
+    board: chess.Board,
+    color: chess.Color,
+    stats: FeatureComputationStats | None = None,
+) -> int:
+    return legal_mobility_with_stats(board, color, stats)
+
+
+def legal_mobility_with_stats(
+    board: chess.Board,
+    color: chess.Color,
+    stats: FeatureComputationStats | None = None,
+) -> int:
+    _count_feature_computation(stats, "legal_mobility_requests")
+    if color == board.turn and board.ep_square is None:
+        _count_feature_computation(stats, "legal_mobility_direct_counts")
+        if (
+            board.is_checkmate()
+            or board.is_stalemate()
+            or board.is_insufficient_material()
+        ):
+            return 0
+        return board.legal_moves.count()
+
+    _count_feature_computation(stats, "legal_mobility_probe_counts")
+    _count_feature_computation(stats, "legal_mobility_board_copies")
     probe = board.copy(stack=False)
     probe.turn = color
+    # En-passant state is valid only for the actual side-to-move position.
+    # The historical mobility definition clears it before counting legal moves.
     probe.ep_square = None
     if (
         probe.is_checkmate()
@@ -209,7 +250,14 @@ def mobility_score(
     color: chess.Color,
     scales: FeatureScales = DEFAULT_SCALES,
 ) -> float:
-    return scales.mobility_per_legal_move * legal_mobility(board, color)
+    return mobility_score_from_count(legal_mobility(board, color), scales)
+
+
+def mobility_score_from_count(
+    legal_move_count: int,
+    scales: FeatureScales = DEFAULT_SCALES,
+) -> float:
+    return scales.mobility_per_legal_move * legal_move_count
 
 
 def center_control_raw(
@@ -229,7 +277,14 @@ def center_control(
     color: chess.Color,
     scales: FeatureScales = DEFAULT_SCALES,
 ) -> float:
-    return scales.center_control * center_control_raw(board, color, scales)
+    return center_control_from_raw(center_control_raw(board, color, scales), scales)
+
+
+def center_control_from_raw(
+    raw: float,
+    scales: FeatureScales = DEFAULT_SCALES,
+) -> float:
+    return scales.center_control * raw
 
 
 def _king_zone(board: chess.Board, color: chess.Color) -> tuple[chess.Square, ...]:
@@ -270,7 +325,14 @@ def king_safety(
     color: chess.Color,
     scales: FeatureScales = DEFAULT_SCALES,
 ) -> float:
-    return scales.king_safety * king_safety_raw(board, color, scales)
+    return king_safety_from_raw(king_safety_raw(board, color, scales), scales)
+
+
+def king_safety_from_raw(
+    raw: float,
+    scales: FeatureScales = DEFAULT_SCALES,
+) -> float:
+    return scales.king_safety * raw
 
 
 def king_safety_raw(
@@ -314,7 +376,14 @@ def development_score(
     color: chess.Color,
     scales: FeatureScales = DEFAULT_SCALES,
 ) -> float:
-    return scales.development_per_minor * development_slots(board, color)
+    return development_score_from_slots(development_slots(board, color), scales)
+
+
+def development_score_from_slots(
+    slots: int,
+    scales: FeatureScales = DEFAULT_SCALES,
+) -> float:
+    return scales.development_per_minor * slots
 
 
 def king_safe_squares(
@@ -339,7 +408,17 @@ def king_freedom(
     attacking_side: chess.Color,
     scales: FeatureScales = DEFAULT_SCALES,
 ) -> float:
-    return scales.king_freedom * king_safe_squares(board, king_color, attacking_side)
+    return king_freedom_from_safe_squares(
+        king_safe_squares(board, king_color, attacking_side),
+        scales,
+    )
+
+
+def king_freedom_from_safe_squares(
+    safe_squares: int,
+    scales: FeatureScales = DEFAULT_SCALES,
+) -> float:
+    return scales.king_freedom * safe_squares
 
 
 def non_pawn_phase_material(board: chess.Board) -> float:
@@ -377,72 +456,69 @@ def phase_weights(phase: float) -> tuple[float, float, float]:
 def board_context(
     board: chess.Board,
     scales: FeatureScales = DEFAULT_SCALES,
+    *,
+    stats: FeatureComputationStats | None = None,
 ) -> BoardFeatureContext:
+    sides = (chess.WHITE, chess.BLACK)
     material_by_side = {
-        chess.WHITE: material_value(board, chess.WHITE),
-        chess.BLACK: material_value(board, chess.BLACK),
+        color: material_value(board, color)
+        for color in sides
     }
-    pawn_counts_by_side = {
-        chess.WHITE: pawn_structure_counts(board, chess.WHITE),
-        chess.BLACK: pawn_structure_counts(board, chess.BLACK),
-    }
-    mobility_by_side = {
-        chess.WHITE: legal_mobility(board, chess.WHITE),
-        chess.BLACK: legal_mobility(board, chess.BLACK),
-    }
+    pawn_counts_by_side = {}
+    mobility_by_side = {}
+    center_raw_by_side = {}
+    king_safety_raw_by_side = {}
+    development_slots_by_side = {}
+    king_safe_squares_by_side = {}
+    for color in sides:
+        _count_feature_computation(stats, "pawn_structure_counts_computations")
+        pawn_counts_by_side[color] = pawn_structure_counts(board, color)
+        _count_feature_computation(stats, "legal_mobility_computations")
+        mobility_by_side[color] = legal_mobility_with_stats(board, color, stats)
+        _count_feature_computation(stats, "center_control_raw_computations")
+        center_raw_by_side[color] = center_control_raw(board, color, scales)
+        _count_feature_computation(stats, "king_safety_raw_computations")
+        king_safety_raw_by_side[color] = king_safety_raw(board, color, scales)
+        _count_feature_computation(stats, "development_slots_computations")
+        development_slots_by_side[color] = development_slots(board, color)
+        _count_feature_computation(stats, "king_safe_squares_computations")
+        king_safe_squares_by_side[color] = king_safe_squares(board, color, not color)
     return BoardFeatureContext(
         material_by_side=material_by_side,
         material_balance=material_by_side[chess.WHITE] - material_by_side[chess.BLACK],
         pawn_structure_by_side={
-            color: (
-                scales.passed_pawn * counts.passed
-                + scales.connected_pawn * counts.connected
-                - scales.isolated_pawn * counts.isolated
-                - scales.doubled_pawn * counts.doubled
-            )
+            color: pawn_structure_score_from_counts(counts, scales)
             for color, counts in pawn_counts_by_side.items()
         },
         pawn_counts_by_side=pawn_counts_by_side,
         mobility_by_side=mobility_by_side,
         mobility_score_by_side={
-            color: scales.mobility_per_legal_move * count
+            color: mobility_score_from_count(count, scales)
             for color, count in mobility_by_side.items()
         },
         center_by_side={
-            chess.WHITE: center_control(board, chess.WHITE, scales),
-            chess.BLACK: center_control(board, chess.BLACK, scales),
+            color: center_control_from_raw(raw, scales)
+            for color, raw in center_raw_by_side.items()
         },
-        center_raw_by_side={
-            chess.WHITE: center_control_raw(board, chess.WHITE, scales),
-            chess.BLACK: center_control_raw(board, chess.BLACK, scales),
-        },
+        center_raw_by_side=center_raw_by_side,
         king_safety_by_side={
-            chess.WHITE: king_safety(board, chess.WHITE, scales),
-            chess.BLACK: king_safety(board, chess.BLACK, scales),
+            color: king_safety_from_raw(raw, scales)
+            for color, raw in king_safety_raw_by_side.items()
         },
-        king_safety_raw_by_side={
-            chess.WHITE: king_safety_raw(board, chess.WHITE, scales),
-            chess.BLACK: king_safety_raw(board, chess.BLACK, scales),
-        },
+        king_safety_raw_by_side=king_safety_raw_by_side,
         castling_rights_by_side={
             chess.WHITE: castling_rights_count(board, chess.WHITE),
             chess.BLACK: castling_rights_count(board, chess.BLACK),
         },
         development_by_side={
-            chess.WHITE: development_score(board, chess.WHITE, scales),
-            chess.BLACK: development_score(board, chess.BLACK, scales),
+            color: development_score_from_slots(slots, scales)
+            for color, slots in development_slots_by_side.items()
         },
-        development_slots_by_side={
-            chess.WHITE: development_slots(board, chess.WHITE),
-            chess.BLACK: development_slots(board, chess.BLACK),
-        },
-        king_safe_squares_by_side={
-            chess.WHITE: king_safe_squares(board, chess.WHITE, chess.BLACK),
-            chess.BLACK: king_safe_squares(board, chess.BLACK, chess.WHITE),
-        },
+        development_slots_by_side=development_slots_by_side,
+        king_safe_squares_by_side=king_safe_squares_by_side,
         king_freedom_by_side={
-            chess.WHITE: king_freedom(board, chess.WHITE, chess.BLACK, scales),
-            chess.BLACK: king_freedom(board, chess.BLACK, chess.WHITE, scales),
+            color: king_freedom_from_safe_squares(safe_squares, scales)
+            for color, safe_squares in king_safe_squares_by_side.items()
         },
         game_phase=game_phase(board),
     )
@@ -516,8 +592,8 @@ def move_feature_breakdown(
             - before.king_safety_raw_by_side[color]
         ),
         "king_pressure": float(
-            king_safe_squares(board, enemy, color)
-            - king_safe_squares(after, enemy, color)
+            before.king_safe_squares_by_side[enemy]
+            - after_values.king_safe_squares_by_side[enemy]
         ),
     }
     scale = {

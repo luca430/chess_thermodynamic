@@ -14,7 +14,7 @@ import chess
 
 from .evaluation import StaticEvaluator
 from .features import BoardFeatureContext, board_context
-from .measure import KAPPA, MoveLandscape, MoveRecord, Style, move_distribution
+from .measure import KAPPA, MoveLandscape, MoveRecord, Style, deepening_count_for_quantile, move_distribution
 
 
 PositionKey = Tuple[str, bool, bool, bool]
@@ -39,8 +39,14 @@ def requested_recursive_plies_for_cdepth(cdepth: int) -> int:
     return 2 * validate_cdepth(cdepth) - 1
 
 
+def validate_deepening_quantile(deepening_quantile: float) -> float:
+    if deepening_quantile <= 0.0 or deepening_quantile > 1.0:
+        raise ValueError("deepening_quantile must satisfy 0 < q <= 1")
+    return deepening_quantile
+
+
 def adaptive_breadth(effective_moves: float, adaptive_c: float, legal_moves: int) -> int:
-    """Return the entropy-adaptive number of branches to refine."""
+    """Deprecated compatibility helper for the former c*N_eff rule."""
     if adaptive_c <= 0.0:
         raise ValueError("adaptive_c must be greater than 0")
     if legal_moves <= 0:
@@ -52,7 +58,7 @@ def ranked_for_refinement(
     records: Iterable[MoveRecord],
     side_to_move: chess.Color | None = None,
 ) -> Tuple[MoveRecord, ...]:
-    """Rank retained branches by original transition probability."""
+    """Rank considered branches by renormalized transition probability."""
     return tuple(sorted(records, key=lambda record: record.probability, reverse=True))
 
 
@@ -284,10 +290,14 @@ class MoveEvaluation:
     branch_value: float
     g_tilde: float | None
     selected_for_refinement: bool
-    static_value_after_move: float
+    static_value_after_move: float | None
     base_potential: float
     phase_potential: float
     features: Dict[str, float]
+    raw_probability: float | None = None
+    considered_probability: float | None = None
+    in_consideration_set: bool = True
+    consideration_rank: int | None = None
     static_components_after_move: Dict[str, float] | None = None
     static_terminal_after_move: bool = False
     static_terminal_reason_after_move: str | None = None
@@ -341,6 +351,10 @@ class MoveEvaluation:
             "san": self.san,
             "uci": self.uci,
             "probability": self.probability,
+            "raw_probability": self.raw_probability if self.raw_probability is not None else self.probability,
+            "considered_probability": self.considered_probability if self.considered_probability is not None else self.probability,
+            "in_consideration_set": self.in_consideration_set,
+            "consideration_rank": self.consideration_rank,
             "phi": self.potential,
             "potential": self.potential,
             "static_after": self.static_value_after_move,
@@ -401,10 +415,14 @@ class MoveEvaluation:
             branch_value=float(data.get("branch_value", 0.0)),
             g_tilde=None if data.get("g_tilde") is None else float(data["g_tilde"]),
             selected_for_refinement=bool(data.get("selected_for_refinement", False)),
-            static_value_after_move=float(data.get("static_value_after_move", data.get("static_after", 0.0))),
+            static_value_after_move=None if data.get("static_value_after_move", data.get("static_after")) is None else float(data.get("static_value_after_move", data.get("static_after"))),
             base_potential=float(data.get("base_potential", 0.0)),
             phase_potential=float(data.get("phase_potential", 0.0)),
             features=dict(data.get("features", {})),
+            raw_probability=None if data.get("raw_probability") is None else float(data["raw_probability"]),
+            considered_probability=None if data.get("considered_probability") is None else float(data["considered_probability"]),
+            in_consideration_set=bool(data.get("in_consideration_set", True)),
+            consideration_rank=None if data.get("consideration_rank") is None else int(data["consideration_rank"]),
             static_components_after_move=None if data.get("static_components_after_move") is None else {str(key): float(value) for key, value in dict(data["static_components_after_move"]).items()},
             static_terminal_after_move=bool(data.get("static_terminal_after_move", False)),
             static_terminal_reason_after_move=None if data.get("static_terminal_reason_after_move") is None else str(data["static_terminal_reason_after_move"]),
@@ -446,7 +464,7 @@ class SearchResult:
     requested_recursive_plies: int
     search_mode: SearchMode
     beta: float
-    adaptive_c: float
+    deepening_quantile: float
     U: float
     entropy: float
     N_eff: float
@@ -490,11 +508,14 @@ class SearchResult:
             "entropy": self.entropy,
             "effective_moves": self.N_eff,
             "expanded_count": self.K,
+            "legal_move_count": self.diagnostics.get("legal_move_count"),
+            "consideration_count": self.K,
+            "deepened_move_count": len(self.selected_uci),
             "cdepth": self.cdepth,
             "requested_cycles": self.cdepth,
             "requested_recursive_plies": self.requested_recursive_plies,
             "search_mode": self.search_mode,
-            "adaptive_c": self.adaptive_c,
+            "deepening_quantile": self.deepening_quantile,
             "kappa": self.kappa,
             "temperature": 1.0 / (self.kappa * self.beta),
             "diagnostics": self.diagnostics,
@@ -514,11 +535,14 @@ class SearchResult:
             "beta": self.beta,
             "kappa": self.kappa,
             "temperature": 1.0 / (self.kappa * self.beta),
-            "adaptive_c": self.adaptive_c,
+            "deepening_quantile": self.deepening_quantile,
             "U": self.U,
             "entropy": self.entropy,
             "N_eff": self.N_eff,
             "K": self.K,
+            "legal_move_count": self.diagnostics.get("legal_move_count"),
+            "consideration_count": self.K,
+            "deepened_move_count": len(self.selected_uci),
             "selected_uci": list(self.selected_uci),
             "moves": [move.as_dict() for move in self.moves],
             "diagnostics": self.diagnostics,
@@ -542,7 +566,7 @@ class SearchResult:
             search_mode=_validate_search_mode(str(data.get("search_mode", "accurate"))),
             beta=float(data.get("beta", 1.0)),
             kappa=float(data.get("kappa", KAPPA)),
-            adaptive_c=float(data.get("adaptive_c", 0.3)),
+            deepening_quantile=float(data.get("deepening_quantile", data.get("adaptive_c", 0.8))),
             U=float(data.get("U", data.get("expected_value", 0.0))),
             entropy=float(data.get("entropy", 0.0)),
             N_eff=float(data.get("N_eff", data.get("effective_moves", 0.0))),
@@ -576,12 +600,33 @@ class RecursiveResult:
 class SearchDiagnostics:
     cdepth: int
     requested_recursive_plies: int
-    adaptive_c: float
+    deepening_quantile: float
     search_mode: SearchMode = "accurate"
     search_workers: int = 1
     parallel_min_branches: int = 0
     nodes_evaluated: int = 0
     static_evaluations: int = 0
+    static_value_requests: int = 0
+    scalar_evaluations: int = 0
+    combined_evaluations: int = 0
+    static_component_computations: int = 0
+    board_context_calls: int = 0
+    board_context_requests: int = 0
+    board_context_computations: int = 0
+    board_context_cache_hits: int = 0
+    board_context_cache_entries: int = 0
+    board_context_cache_peak_entries: int = 0
+    center_control_raw_computations: int = 0
+    king_safety_raw_computations: int = 0
+    development_slots_computations: int = 0
+    king_safe_squares_computations: int = 0
+    legal_mobility_computations: int = 0
+    legal_mobility_requests: int = 0
+    legal_mobility_direct_counts: int = 0
+    legal_mobility_probe_counts: int = 0
+    legal_mobility_board_copies: int = 0
+    pawn_structure_counts_computations: int = 0
+    move_distribution_calls: int = 0
     recursive_nodes: int = 0
     maximum_depth_reached: int = 0
     cache_hits: int = 0
@@ -591,6 +636,8 @@ class SearchDiagnostics:
     response_expanded_nodes: int = 0
     parallel_branches: int = 0
     search_result_reuse_count: int = 0
+    root_candidate_branch_evaluations: int = 0
+    root_candidate_recursive_evaluations: int = 0
     elapsed_time: float = 0.0
 
     @property
@@ -608,6 +655,30 @@ class SearchDiagnostics:
     def add_child(self, child: "SearchDiagnostics") -> None:
         self.nodes_evaluated += child.nodes_evaluated
         self.static_evaluations += child.static_evaluations
+        self.static_value_requests += child.static_value_requests
+        self.scalar_evaluations += child.scalar_evaluations
+        self.combined_evaluations += child.combined_evaluations
+        self.static_component_computations += child.static_component_computations
+        self.board_context_calls += child.board_context_calls
+        self.board_context_requests += child.board_context_requests
+        self.board_context_computations += child.board_context_computations
+        self.board_context_cache_hits += child.board_context_cache_hits
+        self.board_context_cache_entries += child.board_context_cache_entries
+        self.board_context_cache_peak_entries = max(
+            self.board_context_cache_peak_entries,
+            child.board_context_cache_peak_entries,
+        )
+        self.center_control_raw_computations += child.center_control_raw_computations
+        self.king_safety_raw_computations += child.king_safety_raw_computations
+        self.development_slots_computations += child.development_slots_computations
+        self.king_safe_squares_computations += child.king_safe_squares_computations
+        self.legal_mobility_computations += child.legal_mobility_computations
+        self.legal_mobility_requests += child.legal_mobility_requests
+        self.legal_mobility_direct_counts += child.legal_mobility_direct_counts
+        self.legal_mobility_probe_counts += child.legal_mobility_probe_counts
+        self.legal_mobility_board_copies += child.legal_mobility_board_copies
+        self.pawn_structure_counts_computations += child.pawn_structure_counts_computations
+        self.move_distribution_calls += child.move_distribution_calls
         self.recursive_nodes += child.recursive_nodes
         self.maximum_depth_reached = max(self.maximum_depth_reached, child.maximum_depth_reached)
         self.cache_hits += child.cache_hits
@@ -617,6 +688,8 @@ class SearchDiagnostics:
         self.response_expanded_nodes += child.response_expanded_nodes
         self.parallel_branches += child.parallel_branches
         self.search_result_reuse_count += child.search_result_reuse_count
+        self.root_candidate_branch_evaluations += child.root_candidate_branch_evaluations
+        self.root_candidate_recursive_evaluations += child.root_candidate_recursive_evaluations
 
     def as_dict(self) -> Dict[str, float | int | str]:
         result = asdict(self)
@@ -635,10 +708,18 @@ class _CachedEvaluator:
     def evaluate(self, board: chess.Board, context: BoardFeatureContext | None = None) -> float:
         return self.search.static_value(board, context=context)
 
+    def evaluate_with_components(
+        self, board: chess.Board, context: BoardFeatureContext | None = None
+    ) -> tuple[float, Dict[str, float] | None]:
+        return self.search.static_value_with_components(board, context=context)
+
     def components(
         self, board: chess.Board, context: BoardFeatureContext | None = None
     ) -> Dict[str, float] | None:
-        return self.search.evaluator.components(board, context=context)
+        components = self.search.evaluator.components(board, context=context)
+        if components is not None:
+            self.search.diagnostics.static_component_computations += 1
+        return components
 
     def terminal_reason(self, board: chess.Board) -> str | None:
         return self.search.evaluator.terminal_reason(board)
@@ -674,14 +755,14 @@ def side_to_move_backup(
     return max(values) if side_to_move == chess.WHITE else min(values)
 
 
-def _branch_worker(args: Dict[str, object]) -> tuple[LandscapeObservation, Dict[str, float | int | str]]:
+def _branch_observation_worker(args: Dict[str, object]) -> tuple[LandscapeObservation, Dict[str, float | int | str]]:
     evaluator = StaticEvaluator(args["eval_weights"])  # type: ignore[arg-type]
     search = AdaptiveExpectedValue(
         args["style"],  # type: ignore[arg-type]
         float(args["beta"]),
         evaluator,
         cdepth=int(args["cdepth"]),
-        adaptive_c=float(args["adaptive_c"]),
+        deepening_quantile=float(args["deepening_quantile"]),
         search_mode=_validate_search_mode(str(args["search_mode"])),
         search_workers=1,
         parallel_min_branches=int(args["parallel_min_branches"]),
@@ -696,8 +777,39 @@ def _branch_worker(args: Dict[str, object]) -> tuple[LandscapeObservation, Dict[
         set(args["selected"]),  # type: ignore[arg-type]
         int(args["remaining_plies"]),
         int(args["level"]),
+        None if args.get("node_shallow_value") is None else float(args["node_shallow_value"]),
     )
     return branch, search.finish_diagnostics()
+
+
+def _branch_worker(args: Dict[str, object]) -> tuple[MoveEvaluation, LandscapeObservation, Dict[str, float | int | str]]:
+    evaluator = StaticEvaluator(args["eval_weights"])  # type: ignore[arg-type]
+    search = AdaptiveExpectedValue(
+        args["style"],  # type: ignore[arg-type]
+        float(args["beta"]),
+        evaluator,
+        cdepth=int(args["cdepth"]),
+        deepening_quantile=float(args["deepening_quantile"]),
+        search_mode=_validate_search_mode(str(args["search_mode"])),
+        search_workers=1,
+        parallel_min_branches=int(args["parallel_min_branches"]),
+        kappa=float(args.get("kappa", KAPPA)),
+    )
+    search.begin_diagnostics()
+    board = chess.Board(str(args["fen"]))
+    record = args["record"]  # type: ignore[assignment]
+    move, branch = search._evaluate_root_candidate_once(  # noqa: SLF001 - process worker for this class.
+        board,
+        record,  # type: ignore[arg-type]
+        set(args["selected"]),  # type: ignore[arg-type]
+        int(args["remaining_plies"]),
+        int(args["level"]),
+        None if args.get("node_shallow_value") is None else float(args["node_shallow_value"]),
+        float(args["current_u"]),
+        tuple(args["current_branches"]),  # type: ignore[arg-type]
+        bool(args["detailed"]),
+    )
+    return move, branch, search.finish_diagnostics()
 
 
 class AdaptiveExpectedValue:
@@ -709,16 +821,19 @@ class AdaptiveExpectedValue:
         beta: float,
         evaluator: StaticEvaluator,
         cdepth: int = 2,
-        adaptive_c: float = 0.3,
+        deepening_quantile: float = 0.8,
+        adaptive_c: float | None = None,
         search_mode: SearchMode = "accurate",
         search_workers: int | None = 1,
         parallel_min_branches: int = 8,
         kappa: float = KAPPA,
+        use_context_cache: bool = True,
     ) -> None:
         cdepth = validate_cdepth(cdepth)
         requested_recursive_plies = requested_recursive_plies_for_cdepth(cdepth)
-        if adaptive_c <= 0.0:
-            raise ValueError("adaptive_c must be greater than 0")
+        if adaptive_c is not None:
+            raise ValueError("adaptive_c is deprecated; use deepening_quantile instead")
+        deepening_quantile = validate_deepening_quantile(deepening_quantile)
         if kappa <= 0.0:
             raise ValueError("kappa must be greater than 0")
         if search_workers is None:
@@ -733,10 +848,11 @@ class AdaptiveExpectedValue:
         self.evaluator = evaluator
         self.cdepth = cdepth
         self.requested_recursive_plies = requested_recursive_plies
-        self.adaptive_c = adaptive_c
+        self.deepening_quantile = deepening_quantile
         self.search_mode = _validate_search_mode(search_mode)
         self.search_workers = search_workers
         self.parallel_min_branches = parallel_min_branches
+        self.use_context_cache = use_context_cache
         self._static_cache: Dict[PositionKey, float] = {}
         self._context_cache: Dict[PositionKey, BoardFeatureContext] = {}
         self._landscape_cache: Dict[PositionKey, MoveLandscape] = {}
@@ -748,15 +864,64 @@ class AdaptiveExpectedValue:
         self._recursive_result_cache: Dict[Tuple[PositionKey, int], RecursiveResult] = {}
         self._result_cache: Dict[Tuple[PositionKey, int, str], SearchResult] = {}
         self._cached_evaluator = _CachedEvaluator(self)
+        self._branch_cache_lifecycle: list[Dict[str, Dict[str, int]]] = []
         self.diagnostics = SearchDiagnostics(
             cdepth,
             requested_recursive_plies,
-            adaptive_c,
+            deepening_quantile,
             self.search_mode,
             self.search_workers,
             self.parallel_min_branches,
         )
         self._started_at = 0.0
+
+    def clear_transient_caches(self) -> None:
+        """Release root-search data that should not survive an actual turn."""
+        self._static_cache.clear()
+        self._context_cache.clear()
+        self.diagnostics.board_context_cache_entries = 0
+        self._landscape_cache.clear()
+        self._response_landscape_cache.clear()
+        self._value_cache.clear()
+        self._selection_cache.clear()
+        self._future_value_cache.clear()
+        self._future_selection_cache.clear()
+        self._recursive_result_cache.clear()
+        self._result_cache.clear()
+        self._branch_cache_lifecycle.clear()
+        self._qwa_root_board = None
+
+    def clear_branch_caches(self) -> None:
+        """Release recursive state for a completed root candidate branch."""
+        self.clear_transient_caches()
+
+    def _cache_sizes(self) -> Dict[str, int]:
+        return {
+            "static": len(self._static_cache),
+            "context": len(self._context_cache),
+            "landscape": len(self._landscape_cache),
+            "response_landscape": len(self._response_landscape_cache),
+            "value": len(self._value_cache),
+            "selection": len(self._selection_cache),
+            "future_value": len(self._future_value_cache),
+            "future_selection": len(self._future_selection_cache),
+            "recursive_result": len(self._recursive_result_cache),
+            "result": len(self._result_cache),
+        }
+
+    def _new_branch_context(self) -> "AdaptiveExpectedValue":
+        return AdaptiveExpectedValue(
+            self.style,
+            self.beta,
+            self.evaluator,
+            cdepth=self.cdepth,
+            deepening_quantile=self.deepening_quantile,
+            search_mode=self.search_mode,
+            search_workers=1,
+            parallel_min_branches=self.parallel_min_branches,
+            kappa=self.kappa,
+            use_context_cache=self.use_context_cache,
+        )
 
     @staticmethod
     def position_key(board: chess.Board) -> PositionKey:
@@ -771,7 +936,7 @@ class AdaptiveExpectedValue:
         self.diagnostics = SearchDiagnostics(
             self.cdepth,
             self.requested_recursive_plies,
-            self.adaptive_c,
+            self.deepening_quantile,
             self.search_mode,
             self.search_workers,
             self.parallel_min_branches,
@@ -782,17 +947,34 @@ class AdaptiveExpectedValue:
         self.diagnostics.elapsed_time = time.perf_counter() - self._started_at
         return self.diagnostics.as_dict()
 
-    def board_context(
+    def _get_board_context(
         self, board: chess.Board, key: PositionKey | None = None
     ) -> BoardFeatureContext:
         position_key = key or self.position_key(board)
-        cached = self._context_cache.get(position_key)
-        if cached is not None:
-            self.diagnostics.cache_hits += 1
-            return cached
-        context = board_context(board)
-        self._context_cache[position_key] = context
+        self.diagnostics.board_context_requests += 1
+        if self.use_context_cache:
+            cached = self._context_cache.get(position_key)
+            if cached is not None:
+                self.diagnostics.cache_hits += 1
+                self.diagnostics.board_context_cache_hits += 1
+                return cached
+        context = board_context(board, stats=self.diagnostics.__dict__)
+        if self.use_context_cache:
+            self._context_cache[position_key] = context
+            entries = len(self._context_cache)
+            self.diagnostics.board_context_cache_entries = entries
+            self.diagnostics.board_context_cache_peak_entries = max(
+                self.diagnostics.board_context_cache_peak_entries,
+                entries,
+            )
+        self.diagnostics.board_context_calls += 1
+        self.diagnostics.board_context_computations += 1
         return context
+
+    def board_context(
+        self, board: chess.Board, key: PositionKey | None = None
+    ) -> BoardFeatureContext:
+        return self._get_board_context(board, key)
 
     def static_value(
         self,
@@ -800,15 +982,42 @@ class AdaptiveExpectedValue:
         key: PositionKey | None = None,
         context: BoardFeatureContext | None = None,
     ) -> float:
+        self.diagnostics.static_value_requests += 1
+        self.diagnostics.scalar_evaluations += 1
         position_key = key or self.position_key(board)
         if position_key in self._static_cache:
             self.diagnostics.cache_hits += 1
             return self._static_cache[position_key]
         values = context or self.board_context(board, position_key)
-        value = self.evaluator.evaluate(board, context=values)
+        value, components = self.evaluator.evaluate_with_components(board, context=values)
         self._static_cache[position_key] = value
         self.diagnostics.static_evaluations += 1
+        if components is not None:
+            self.diagnostics.static_component_computations += 1
         return value
+
+    def static_value_with_components(
+        self,
+        board: chess.Board,
+        key: PositionKey | None = None,
+        context: BoardFeatureContext | None = None,
+    ) -> tuple[float, Dict[str, float] | None]:
+        self.diagnostics.static_value_requests += 1
+        self.diagnostics.combined_evaluations += 1
+        position_key = key or self.position_key(board)
+        values = context or self.board_context(board, position_key)
+        if position_key in self._static_cache:
+            self.diagnostics.cache_hits += 1
+            components = self.evaluator.components(board, context=values)
+            if components is not None:
+                self.diagnostics.static_component_computations += 1
+            return self._static_cache[position_key], components
+        value, components = self.evaluator.evaluate_with_components(board, context=values)
+        self._static_cache[position_key] = value
+        self.diagnostics.static_evaluations += 1
+        if components is not None:
+            self.diagnostics.static_component_computations += 1
+        return value, components
 
     def landscape(
         self, board: chess.Board, key: PositionKey | None = None
@@ -818,6 +1027,7 @@ class AdaptiveExpectedValue:
             self.diagnostics.cache_hits += 1
             return self._landscape_cache[position_key]
         context = self.board_context(board, position_key)
+        self.diagnostics.move_distribution_calls += 1
         landscape = move_distribution(
             board,
             self.style,
@@ -838,6 +1048,7 @@ class AdaptiveExpectedValue:
             self.diagnostics.cache_hits += 1
             return self._response_landscape_cache[position_key]
         context = self.board_context(board, position_key)
+        self.diagnostics.move_distribution_calls += 1
         landscape = move_distribution(
             board,
             self.style,
@@ -852,7 +1063,12 @@ class AdaptiveExpectedValue:
 
     def node_selection(self, board: chess.Board, remaining_plies: int | None = None) -> NodeSelection | None:
         remaining = self.requested_recursive_plies if remaining_plies is None else remaining_plies
-        return self._selection_cache.get((self.position_key(board), remaining))
+        cache_key = (self.position_key(board), remaining)
+        selection = self._selection_cache.get(cache_key)
+        if selection is None and remaining >= 0:
+            self.expected_value(board, remaining)
+            selection = self._selection_cache.get(cache_key)
+        return selection
 
     def branch_observations(
         self, board: chess.Board, remaining_plies: int | None = None
@@ -879,6 +1095,7 @@ class AdaptiveExpectedValue:
             self.diagnostics.cache_hits += 1
             return cached
 
+        self.diagnostics.recursive_nodes += 1
         value = self._expected_value(board, remaining_depth, level)
         if board.is_game_over(claim_draw=False):
             result = RecursiveResult(
@@ -973,6 +1190,162 @@ class AdaptiveExpectedValue:
             "thermodynamic_endpoint_fen": thermodynamic_endpoint_fen,
         }
 
+    def _root_shallow_observations(self, landscape: MoveLandscape) -> Tuple[LandscapeObservation, ...]:
+        return tuple(
+            LandscapeObservation(
+                move=record.move,
+                uci=record.uci,
+                probability=record.probability,
+                observable_value=float(record.static_after),
+                was_deepened=False,
+                depth_used=0,
+                search_mode=self.search_mode,
+                remaining_plies=0,
+            )
+            for record in landscape.considered_records
+        )
+
+    def _outside_consideration_move(self, record: MoveRecord, current_u: float) -> MoveEvaluation:
+        return MoveEvaluation(
+            move=record.move,
+            san=record.san,
+            uci=record.uci,
+            probability=record.probability,
+            potential=record.phi,
+            branch_value=current_u,
+            selected_for_refinement=False,
+            static_value_after_move=None,
+            base_potential=record.base_potential,
+            phase_potential=record.phase_potential,
+            features=record.features,
+            raw_probability=record.raw_probability,
+            considered_probability=record.considered_probability,
+            in_consideration_set=False,
+            consideration_rank=record.consideration_rank,
+            static_components_after_move=None,
+            static_terminal_after_move=False,
+            static_terminal_reason_after_move=None,
+            terminal_u=None,
+            g_tilde=None,
+            cdepth=self.cdepth,
+            requested_cycles=self.cdepth,
+            requested_recursive_plies=self.requested_recursive_plies,
+            qwa_unavailable_reason="outside_consideration_set",
+        )
+
+    def _materialize_root_candidate(
+        self,
+        record: MoveRecord,
+        branch: LandscapeObservation | None,
+        thermo: Dict[str, object],
+    ) -> MoveEvaluation:
+        branch_value = (
+            float(thermo["terminal_u"])
+            if thermo["terminal_u"] is not None
+            else (branch.observable_value if branch else float(record.static_after or 0.0))
+        )
+        return MoveEvaluation(
+            move=record.move,
+            san=record.san,
+            uci=record.uci,
+            probability=record.probability,
+            potential=record.phi,
+            branch_value=branch_value,
+            selected_for_refinement=branch.was_deepened if branch else False,
+            static_value_after_move=record.static_after,
+            base_potential=record.base_potential,
+            phase_potential=record.phase_potential,
+            features=record.features,
+            raw_probability=record.raw_probability,
+            considered_probability=record.considered_probability,
+            in_consideration_set=record.in_consideration_set,
+            consideration_rank=record.consideration_rank,
+            static_components_after_move=record.static_components_after,
+            static_terminal_after_move=record.static_terminal_after,
+            static_terminal_reason_after_move=record.static_terminal_reason_after,
+            terminal_u=thermo["terminal_u"],
+            g_tilde=thermo["g_tilde"],
+            q_tilde=thermo["q_tilde"],
+            thermo_g_tilde=thermo["thermo_g_tilde"],
+            w_tilde=thermo["w_tilde"],
+            a_tilde=thermo["a_tilde"],
+            retained_probability_mass=thermo["retained_probability_mass"],
+            retained_response_count=thermo["retained_response_count"],
+            total_probability_mass=thermo["total_probability_mass"],
+            deepened_probability_mass=thermo["deepened_probability_mass"],
+            nondeepened_probability_mass=thermo["nondeepened_probability_mass"],
+            thermo_decomposition_error=thermo["thermo_decomposition_error"],
+            response_entropy=thermo["response_entropy"],
+            response_N_eff=thermo["response_N_eff"],
+            response_K=thermo["response_K"],
+            responses=thermo["responses"],
+            depth_used=branch.depth_used if branch else 0,
+            cdepth=self.cdepth,
+            requested_cycles=self.cdepth,
+            requested_recursive_plies=self.requested_recursive_plies,
+            recursive_plies_used=thermo["recursive_plies_used"],
+            deepened_cycles=thermo["deepened_cycles"],
+            principal_variation=thermo["principal_variation"],
+            endpoint_fen=thermo["endpoint_fen"],
+            search_endpoint_fen=thermo["search_endpoint_fen"],
+            thermodynamic_endpoint_fen=thermo["thermodynamic_endpoint_fen"],
+            qwa_unavailable_reason=thermo["qwa_unavailable_reason"],
+        )
+
+    def _evaluate_root_candidate_once(
+        self,
+        board: chess.Board,
+        record: MoveRecord,
+        selected: set[str],
+        remaining_plies: int,
+        level: int,
+        node_shallow_value: float | None,
+        current_u: float,
+        current_branches: Tuple[LandscapeObservation, ...],
+        detailed: bool,
+    ) -> tuple[MoveEvaluation, LandscapeObservation]:
+        self.diagnostics.root_candidate_branch_evaluations += 1
+        own_selected = record.uci in selected
+        if own_selected:
+            self.diagnostics.root_candidate_recursive_evaluations += 1
+        branch_seed = LandscapeObservation(
+            move=record.move,
+            uci=record.uci,
+            probability=record.probability,
+            observable_value=float(record.static_after),
+            was_deepened=own_selected,
+            depth_used=remaining_plies if own_selected else 0,
+            search_mode=self.search_mode,
+            remaining_plies=remaining_plies,
+        )
+        thermo = self._candidate_thermodynamics(
+            board,
+            record,
+            branch_seed,
+            current_u,
+            current_branches,
+            detailed=detailed,
+        )
+        move = self._materialize_root_candidate(record, branch_seed, thermo)
+        response_observations = tuple(response.as_observation() for response in move.responses)
+        branch = LandscapeObservation(
+            move=record.move,
+            uci=record.uci,
+            probability=record.probability,
+            observable_value=move.branch_value,
+            was_deepened=move.selected_for_refinement,
+            depth_used=move.depth_used,
+            response_neff=move.response_N_eff,
+            response_k=move.response_K,
+            total_probability_mass=move.total_probability_mass,
+            deepened_probability_mass=move.deepened_probability_mass,
+            nondeepened_probability_mass=move.nondeepened_probability_mass,
+            response_branches=response_observations,
+            search_mode=self.search_mode,
+            remaining_plies=remaining_plies,
+        )
+        return move, branch
+
     def search_result(self, board: chess.Board, player: str = "", side: str | None = None) -> SearchResult:
         result_side = side or ("white" if board.turn == chess.WHITE else "black")
         key = (self.position_key(board), self.requested_recursive_plies, result_side)
@@ -980,117 +1353,144 @@ class AdaptiveExpectedValue:
         if cached is not None:
             self.diagnostics.search_result_reuse_count += 1
             return cached
-        self.expected_value(board, self.requested_recursive_plies)
-        selection = self.node_selection(board, self.requested_recursive_plies)
+        self._branch_cache_lifecycle.clear()
         landscape = self.landscape(board)
-        if selection is None:
-            moves: Tuple[MoveEvaluation, ...] = ()
-            selected_uci: Tuple[str, ...] = ()
-            expanded_count = 0
+        current_u = landscape.expected_value
+        current_branches = self._root_shallow_observations(landscape)
+        considered = tuple(record for record in landscape.records if record.in_consideration_set)
+        expanded_count = deepening_count_for_quantile(
+            (record.probability for record in ranked_for_refinement(considered, board.turn)),
+            self.deepening_quantile,
+        )
+        ranked = ranked_for_refinement(considered, board.turn)
+        selected_uci = tuple(record.uci for record in ranked[:expanded_count])
+        selected = set(selected_uci)
+        self.diagnostics.nodes_evaluated += 1
+        self.diagnostics.expanded_total += expanded_count
+        self.diagnostics.expanded_nodes += 1
+        root_diagnostics = {
+            **self.diagnostics.as_dict(),
+            "legal_move_count": landscape.legal_move_count,
+            "entropy": landscape.entropy,
+            "n_eff": landscape.effective_moves,
+            "consideration_count": landscape.consideration_count,
+            "consideration_probability_mass_raw": landscape.consideration_probability_mass_raw,
+            "deepening_quantile": self.deepening_quantile,
+            "deepened_move_count": len(selected_uci),
+            "deepening_probability_mass_considered": sum(
+                record.probability for record in landscape.considered_records if record.uci in selected
+            ),
+        }
+        moves_by_uci: dict[str, MoveEvaluation] = {}
+        branch_by_uci: dict[str, LandscapeObservation] = {}
+        detailed_uci = set(selected_uci)
+        if self.search_workers > 1 and len(considered) >= self.parallel_min_branches and self.requested_recursive_plies > 0:
+            args = [
+                {
+                    "fen": board.fen(),
+                    "record": record,
+                    "selected": selected_uci,
+                    "remaining_plies": self.requested_recursive_plies,
+                    "cdepth": self.cdepth,
+                    "level": 0,
+                    "style": self.style,
+                    "beta": self.beta,
+                    "deepening_quantile": self.deepening_quantile,
+                    "search_mode": self.search_mode,
+                    "eval_weights": self.evaluator.weights,
+                    "parallel_min_branches": self.parallel_min_branches,
+                    "kappa": self.kappa,
+                    "node_shallow_value": current_u,
+                    "current_u": current_u,
+                    "current_branches": current_branches,
+                    "detailed": record.uci in detailed_uci,
+                }
+                for record in considered
+            ]
+            self.diagnostics.parallel_branches += len(considered)
+            with ProcessPoolExecutor(
+                max_workers=self.search_workers,
+                mp_context=multiprocessing.get_context("fork"),
+            ) as executor:
+                worker_results = list(executor.map(_branch_worker, args))
+            for move, branch, child_diag in worker_results:
+                moves_by_uci[move.uci] = move
+                branch_by_uci[branch.uci] = branch
+                child = SearchDiagnostics(
+                    self.cdepth,
+                    self.requested_recursive_plies,
+                    self.deepening_quantile,
+                    self.search_mode,
+                    self.search_workers,
+                    self.parallel_min_branches,
+                )
+                for diag_key, value in child_diag.items():
+                    if diag_key in {"average_k", "average_response_k"}:
+                        continue
+                    if diag_key in child.__dataclass_fields__:
+                        setattr(child, diag_key, value)
+                self.diagnostics.add_child(child)
         else:
-            branch_by_uci = {branch.uci: branch for branch in selection.branches}
-            current_u = self._future_subjective_value(board, 0, 0)
-            current_branches = self._future_branch_observations(board, 0, 0)
-            self._qwa_root_board = board.copy(stack=False)
-            fast_thermos = {}
-            for record in landscape.records:
-                branch = branch_by_uci.get(record.uci)
-                fast_thermos[record.uci] = self._candidate_thermodynamics(
-                    board, record, branch, current_u, current_branches, detailed=False
+            for record in considered:
+                branch_search = self._new_branch_context()
+                move, branch = branch_search._evaluate_root_candidate_once(  # noqa: SLF001
+                    board,
+                    record,
+                    selected,
+                    self.requested_recursive_plies,
+                    0,
+                    current_u,
+                    current_u,
+                    current_branches,
+                    record.uci in detailed_uci,
                 )
+                before_clear = branch_search._cache_sizes()  # noqa: SLF001
+                self.diagnostics.add_child(branch_search.diagnostics)
+                branch_search.clear_branch_caches()
+                self._branch_cache_lifecycle.append(
+                    {"before_clear": before_clear, "after_clear": branch_search._cache_sizes()}  # noqa: SLF001
+                )
+                moves_by_uci[record.uci] = move
+                branch_by_uci[record.uci] = branch
 
-            refined_records = [record for record in landscape.records if record.uci in selection.selected_uci]
-            if not refined_records:
-                moves = ()
-                selected_uci = selection.selected_uci
-                expanded_count = selection.expanded_count
-                self._qwa_root_board = None
-                return SearchResult(
-                    board_fen=board.fen(),
-                    player=player,
-                    side=result_side,
-                    cdepth=self.cdepth,
-                    requested_recursive_plies=self.requested_recursive_plies,
-                    search_mode=self.search_mode,
-                    beta=self.beta,
-                    adaptive_c=self.adaptive_c,
-                    kappa=self.kappa,
-                    U=self._future_subjective_value(board, 0, 0),
-                    entropy=landscape.entropy,
-                    N_eff=landscape.effective_moves,
-                    K=expanded_count,
-                    selected_uci=selected_uci,
-                    moves=moves,
-                    diagnostics=self.diagnostics.as_dict(),
-                    evaluation_weights=self.evaluator.weights.as_dict(),
-                )
-            detailed_uci = set(selection.selected_uci)
-
-            moves_list = []
-            for record in landscape.records:
-                branch = branch_by_uci.get(record.uci)
-                thermo = fast_thermos[record.uci]
-                if record.uci in detailed_uci:
-                    detailed_thermo = self._candidate_thermodynamics(
-                        board, record, branch, current_u, current_branches, detailed=True
-                    )
-                    thermo = {**thermo, **detailed_thermo}
-                    thermo["terminal_u"] = fast_thermos[record.uci]["terminal_u"]
-                    thermo["g_tilde"] = fast_thermos[record.uci]["g_tilde"]
-                branch_value = (
-                    float(thermo["terminal_u"])
-                    if thermo["terminal_u"] is not None
-                    else (branch.observable_value if branch else record.static_after)
-                )
-                moves_list.append(
-                    MoveEvaluation(
-                        move=record.move,
-                        san=record.san,
-                        uci=record.uci,
-                        probability=record.probability,
-                        potential=record.phi,
-                        branch_value=branch_value,
-                        selected_for_refinement=branch.was_deepened if branch else False,
-                        static_value_after_move=record.static_after,
-                        base_potential=record.base_potential,
-                        phase_potential=record.phase_potential,
-                        features=record.features,
-                        static_components_after_move=record.static_components_after,
-                        static_terminal_after_move=record.static_terminal_after,
-                        static_terminal_reason_after_move=record.static_terminal_reason_after,
-                        terminal_u=thermo["terminal_u"],
-                        g_tilde=thermo["g_tilde"],
-                        q_tilde=thermo["q_tilde"],
-                        thermo_g_tilde=thermo["thermo_g_tilde"],
-                        w_tilde=thermo["w_tilde"],
-                        a_tilde=thermo["a_tilde"],
-                        retained_probability_mass=thermo["retained_probability_mass"],
-                        retained_response_count=thermo["retained_response_count"],
-                        total_probability_mass=thermo["total_probability_mass"],
-                        deepened_probability_mass=thermo["deepened_probability_mass"],
-                        nondeepened_probability_mass=thermo["nondeepened_probability_mass"],
-                        thermo_decomposition_error=thermo["thermo_decomposition_error"],
-                        response_entropy=thermo["response_entropy"],
-                        response_N_eff=thermo["response_N_eff"],
-                        response_K=thermo["response_K"],
-                        responses=thermo["responses"],
-                        depth_used=branch.depth_used if branch else 0,
-                        cdepth=self.cdepth,
-                        requested_cycles=self.cdepth,
-                        requested_recursive_plies=self.requested_recursive_plies,
-                        recursive_plies_used=thermo["recursive_plies_used"],
-                        deepened_cycles=thermo["deepened_cycles"],
-                        principal_variation=thermo["principal_variation"],
-                        endpoint_fen=thermo["endpoint_fen"],
-                        search_endpoint_fen=thermo["search_endpoint_fen"],
-                        thermodynamic_endpoint_fen=thermo["thermodynamic_endpoint_fen"],
-                        qwa_unavailable_reason=thermo["qwa_unavailable_reason"],
-                    )
-                )
-            moves = tuple(moves_list)
-            selected_uci = selection.selected_uci
-            expanded_count = selection.expanded_count
-            self._qwa_root_board = None
+        moves = tuple(
+            self._outside_consideration_move(record, current_u)
+            if not record.in_consideration_set
+            else moves_by_uci[record.uci]
+            for record in landscape.records
+        )
+        root_branches = tuple(branch_by_uci[record.uci] for record in considered)
+        root_value = side_to_move_backup(board.turn, root_branches) if root_branches else current_u
+        root_key = self.position_key(board)
+        self._value_cache[(root_key, 0)] = current_u
+        self._selection_cache[(root_key, 0)] = NodeSelection(
+            entropy=landscape.entropy,
+            effective_moves=landscape.effective_moves,
+            expanded_count=0,
+            selected_uci=(),
+            branches=current_branches,
+        )
+        self._value_cache[(root_key, self.requested_recursive_plies)] = root_value
+        self._selection_cache[(root_key, self.requested_recursive_plies)] = NodeSelection(
+            entropy=landscape.entropy,
+            effective_moves=landscape.effective_moves,
+            expanded_count=expanded_count,
+            selected_uci=selected_uci,
+            branches=root_branches,
+        )
+        root_diagnostics = {
+            **self.diagnostics.as_dict(),
+            "legal_move_count": landscape.legal_move_count,
+            "entropy": landscape.entropy,
+            "n_eff": landscape.effective_moves,
+            "consideration_count": landscape.consideration_count,
+            "consideration_probability_mass_raw": landscape.consideration_probability_mass_raw,
+            "deepening_quantile": self.deepening_quantile,
+            "deepened_move_count": len(selected_uci),
+            "deepening_probability_mass_considered": sum(
+                record.probability for record in landscape.considered_records if record.uci in selected
+            ),
+        }
         result = SearchResult(
             board_fen=board.fen(),
             player=player,
@@ -1099,15 +1499,15 @@ class AdaptiveExpectedValue:
             requested_recursive_plies=self.requested_recursive_plies,
             search_mode=self.search_mode,
             beta=self.beta,
-            adaptive_c=self.adaptive_c,
+            deepening_quantile=self.deepening_quantile,
             kappa=self.kappa,
-            U=self._future_subjective_value(board, 0, 0),
+            U=current_u,
             entropy=landscape.entropy,
             N_eff=landscape.effective_moves,
-            K=expanded_count,
+            K=landscape.consideration_count,
             selected_uci=selected_uci,
             moves=moves,
-            diagnostics=self.diagnostics.as_dict(),
+            diagnostics=root_diagnostics,
             evaluation_weights=self.evaluator.weights.as_dict(),
         )
         self._result_cache[key] = result
@@ -1319,13 +1719,13 @@ class AdaptiveExpectedValue:
                     move=record.move,
                     uci=record.uci,
                     probability=record.probability,
-                    observable_value=record.static_after,
+                    observable_value=float(record.static_after),
                     was_deepened=False,
                     depth_used=0,
                     search_mode=self.search_mode,
                     remaining_plies=remaining_plies,
                 )
-                for record in landscape.records
+                for record in landscape.considered_records
             )
             self._selection_cache[cache_key] = NodeSelection(
                 entropy=landscape.entropy,
@@ -1337,16 +1737,25 @@ class AdaptiveExpectedValue:
             self._value_cache[cache_key] = landscape.expected_value
             return landscape.expected_value
 
-        expanded_count = adaptive_breadth(
-            landscape.effective_moves, self.adaptive_c, len(landscape.records)
+        considered = tuple(record for record in landscape.records if record.in_consideration_set)
+        expanded_count = deepening_count_for_quantile(
+            (record.probability for record in ranked_for_refinement(considered, board.turn)),
+            self.deepening_quantile,
         )
-        ranked = ranked_for_refinement(landscape.records, board.turn)
+        ranked = ranked_for_refinement(considered, board.turn)
         selected_uci = tuple(record.uci for record in ranked[:expanded_count])
         selected = set(selected_uci)
         self.diagnostics.expanded_total += expanded_count
         self.diagnostics.expanded_nodes += 1
 
-        branches = self._evaluate_branches(board, landscape.records, selected, remaining_plies, level)
+        branches = self._evaluate_branches(
+            board,
+            considered,
+            selected,
+            remaining_plies,
+            level,
+            landscape.expected_value,
+        )
         value = side_to_move_backup(board.turn, branches)
 
         self._selection_cache[cache_key] = NodeSelection(
@@ -1366,6 +1775,7 @@ class AdaptiveExpectedValue:
         selected: set[str],
         remaining_plies: int,
         level: int,
+        node_shallow_value: float | None = None,
     ) -> Tuple[LandscapeObservation, ...]:
         records = tuple(records)
         should_parallel = (
@@ -1374,9 +1784,31 @@ class AdaptiveExpectedValue:
             and len(records) >= self.parallel_min_branches
             and remaining_plies > 0
         )
+        if not should_parallel and level == 0 and remaining_plies > 0:
+            branches: list[LandscapeObservation] = []
+            for record in records:
+                branch_search = self._new_branch_context()
+                branch = branch_search._evaluate_branch(  # noqa: SLF001
+                    board,
+                    record,
+                    selected,
+                    remaining_plies,
+                    level,
+                    node_shallow_value,
+                )
+                before_clear = branch_search._cache_sizes()  # noqa: SLF001
+                child = branch_search.diagnostics
+                self.diagnostics.add_child(child)
+                branch_search.clear_branch_caches()
+                self._branch_cache_lifecycle.append(
+                    {"before_clear": before_clear, "after_clear": branch_search._cache_sizes()}  # noqa: SLF001
+                )
+                branches.append(branch)
+            return tuple(branches)
+
         if not should_parallel:
             return tuple(
-                self._evaluate_branch(board, record, selected, remaining_plies, level)
+                self._evaluate_branch(board, record, selected, remaining_plies, level, node_shallow_value)
                 for record in records
             )
 
@@ -1390,11 +1822,12 @@ class AdaptiveExpectedValue:
                 "level": level,
                 "style": self.style,
                 "beta": self.beta,
-                "adaptive_c": self.adaptive_c,
+                "deepening_quantile": self.deepening_quantile,
                 "search_mode": self.search_mode,
                 "eval_weights": self.evaluator.weights,
                 "parallel_min_branches": self.parallel_min_branches,
                 "kappa": self.kappa,
+                "node_shallow_value": node_shallow_value,
             }
             for record in records
         ]
@@ -1403,14 +1836,14 @@ class AdaptiveExpectedValue:
             max_workers=self.search_workers,
             mp_context=multiprocessing.get_context("fork"),
         ) as executor:
-            results = list(executor.map(_branch_worker, args))
+            results = list(executor.map(_branch_observation_worker, args))
         branches: list[LandscapeObservation] = []
         for branch, child_diag in results:
             branches.append(branch)
             child = SearchDiagnostics(
                 self.cdepth,
                 self.requested_recursive_plies,
-                self.adaptive_c,
+                self.deepening_quantile,
                 self.search_mode,
                 self.search_workers,
                 self.parallel_min_branches,
@@ -1430,9 +1863,10 @@ class AdaptiveExpectedValue:
         selected: set[str],
         remaining_plies: int,
         level: int,
+        node_shallow_value: float | None = None,
     ) -> LandscapeObservation:
         own_selected = record.uci in selected
-        branch_value = record.static_after
+        branch_value = float(record.static_after)
         response_neff = None
         response_k = None
         response_branches: list[ResponseObservation] = []
@@ -1462,7 +1896,7 @@ class AdaptiveExpectedValue:
                     response.uci: response
                     for response in (reply_selection.branches if reply_selection is not None else ())
                 }
-                for reply in reply_landscape.records:
+                for reply in reply_landscape.considered_records:
                     child = after.copy(stack=False)
                     child.push(reply.move)
                     response = response_by_uci.get(reply.uci)
@@ -1473,7 +1907,10 @@ class AdaptiveExpectedValue:
                         else self._future_subjective_value(child, 0, level + 1)
                     )
                     child_depth = remaining_after_move - 1 if reply_selected else 0
-                    du = reply_value - self._future_subjective_value(board, 0, 0)
+                    shallow_value = node_shallow_value
+                    if shallow_value is None:
+                        shallow_value = self._future_subjective_value(board, 0, 0)
+                    du = reply_value - shallow_value
                     response_branches.append(
                         ResponseObservation(
                             move=reply.move,

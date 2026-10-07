@@ -1,5 +1,6 @@
 .pytest_cache/
 __pycache__
+*.egg-info/
 data/games/csv/*
 data/games/json/*
 data/games/pgn/*
