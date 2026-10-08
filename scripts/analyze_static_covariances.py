@@ -390,24 +390,18 @@ def main() -> None:
         rows.extend(game_rows)
         details.extend(game_details)
         warnings.extend(game_warnings)
-        if game_rows:
-            csv_path = _csv_output_path(args.output, path, len(files))
-            csv_path.parent.mkdir(parents=True, exist_ok=True)
-            write_csv(game_rows, csv_path)
-            wrote_paths.append(csv_path)
+        csv_path = _csv_output_path(args.output, path, len(files))
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        write_csv(game_rows, csv_path)
+        wrote_paths.append(csv_path)
         json_path = _json_output_path(args.json_output, path, len(files))
-        if json_path is not None and game_details:
+        if json_path is not None:
             json_path.parent.mkdir(parents=True, exist_ok=True)
             json_path.write_text(json.dumps(game_details, indent=2), encoding="utf-8")
             wrote_paths.append(json_path)
 
     for warning in warnings:
         print(f"warning: {warning}", file=sys.stderr)
-
-    if not rows:
-        raise SystemExit(
-            "No analyzable response records found. New JSON with response static_components is required."
-        )
 
     for path in wrote_paths:
         print(f"Wrote {path}", file=sys.stderr)

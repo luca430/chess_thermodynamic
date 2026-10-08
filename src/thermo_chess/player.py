@@ -159,7 +159,7 @@ class ThermoPlayer:
 
         search.begin_diagnostics()
         result = self.evaluate_landscape(board, evaluator)
-        diagnostics = search.finish_diagnostics()
+        diagnostics = {**search.finish_diagnostics(), **result.diagnostics}
         result = SearchResult(
             board_fen=result.board_fen,
             player=result.player,
@@ -177,6 +177,7 @@ class ThermoPlayer:
             selected_uci=result.selected_uci,
             moves=result.moves,
             diagnostics=diagnostics,
+            evaluation_weights=result.evaluation_weights,
         )
         # Keep the cache authoritative for later consumers in this turn.
         search._result_cache[(key, search.requested_recursive_plies, result.side)] = result  # noqa: SLF001

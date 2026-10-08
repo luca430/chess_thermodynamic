@@ -19,6 +19,9 @@ from .measure import KAPPA, MoveLandscape, MoveRecord, Style, deepening_count_fo
 
 PositionKey = Tuple[str, bool, bool, bool]
 SearchMode = Literal["accurate"]
+FULL_DEPTH_MAX_CONSIDERATION = 5
+TWO_CYCLE_MAX_CONSIDERATION = 15
+CacheKey = Tuple[PositionKey, int, int]
 
 
 def validate_cdepth(cdepth: int) -> int:
@@ -37,6 +40,39 @@ def validate_cdepth(cdepth: int) -> int:
 
 def requested_recursive_plies_for_cdepth(cdepth: int) -> int:
     return 2 * validate_cdepth(cdepth) - 1
+
+
+def adaptive_cycle_limit(deepening_branch_count: int, cdepth: int) -> int | None:
+    if not isinstance(deepening_branch_count, int) or isinstance(deepening_branch_count, bool):
+        raise ValueError("deepening_branch_count must be a non-negative integer")
+    if deepening_branch_count < 0:
+        raise ValueError("deepening_branch_count must be a non-negative integer")
+    cdepth = validate_cdepth(cdepth)
+    if deepening_branch_count == 0:
+        return 0
+    if deepening_branch_count == 1:
+        return None
+    if deepening_branch_count > TWO_CYCLE_MAX_CONSIDERATION:
+        return min(1, cdepth)
+    if deepening_branch_count >= FULL_DEPTH_MAX_CONSIDERATION + 1:
+        return min(2, cdepth)
+    return cdepth
+
+
+def adaptive_recursive_plies_for_root(cycle_limit: int) -> int:
+    if cycle_limit < 0:
+        raise ValueError("cycle_limit must be non-negative")
+    return 0 if cycle_limit == 0 else 2 * cycle_limit - 1
+
+
+def adaptive_recursive_plies_from_node(cycle_limit: int, level: int) -> int:
+    if cycle_limit < 0:
+        raise ValueError("cycle_limit must be non-negative")
+    if level < 0:
+        raise ValueError("level must be non-negative")
+    if cycle_limit == 0:
+        return 0
+    return 2 * cycle_limit - 1 if level % 2 == 1 else 2 * cycle_limit
 
 
 def validate_deepening_quantile(deepening_quantile: float) -> float:
@@ -638,6 +674,15 @@ class SearchDiagnostics:
     search_result_reuse_count: int = 0
     root_candidate_branch_evaluations: int = 0
     root_candidate_recursive_evaluations: int = 0
+    adaptive_depth_zero_nodes: int = 0
+    adaptive_depth_one_cycle_nodes: int = 0
+    adaptive_depth_two_cycle_nodes: int = 0
+    adaptive_depth_full_nodes: int = 0
+    adaptive_depth_reductions: int = 0
+    forced_continuation_nodes: int = 0
+    objective_forced_nodes: int = 0
+    subjective_forced_nodes: int = 0
+    quantile_forced_nodes: int = 0
     elapsed_time: float = 0.0
 
     @property
@@ -690,6 +735,15 @@ class SearchDiagnostics:
         self.search_result_reuse_count += child.search_result_reuse_count
         self.root_candidate_branch_evaluations += child.root_candidate_branch_evaluations
         self.root_candidate_recursive_evaluations += child.root_candidate_recursive_evaluations
+        self.adaptive_depth_zero_nodes += child.adaptive_depth_zero_nodes
+        self.adaptive_depth_one_cycle_nodes += child.adaptive_depth_one_cycle_nodes
+        self.adaptive_depth_two_cycle_nodes += child.adaptive_depth_two_cycle_nodes
+        self.adaptive_depth_full_nodes += child.adaptive_depth_full_nodes
+        self.adaptive_depth_reductions += child.adaptive_depth_reductions
+        self.forced_continuation_nodes += child.forced_continuation_nodes
+        self.objective_forced_nodes += child.objective_forced_nodes
+        self.subjective_forced_nodes += child.subjective_forced_nodes
+        self.quantile_forced_nodes += child.quantile_forced_nodes
 
     def as_dict(self) -> Dict[str, float | int | str]:
         result = asdict(self)
@@ -857,11 +911,11 @@ class AdaptiveExpectedValue:
         self._context_cache: Dict[PositionKey, BoardFeatureContext] = {}
         self._landscape_cache: Dict[PositionKey, MoveLandscape] = {}
         self._response_landscape_cache: Dict[PositionKey, MoveLandscape] = {}
-        self._value_cache: Dict[Tuple[PositionKey, int], float] = {}
-        self._selection_cache: Dict[Tuple[PositionKey, int], NodeSelection] = {}
-        self._future_value_cache: Dict[Tuple[PositionKey, int], float] = {}
-        self._future_selection_cache: Dict[Tuple[PositionKey, int], NodeSelection] = {}
-        self._recursive_result_cache: Dict[Tuple[PositionKey, int], RecursiveResult] = {}
+        self._value_cache: Dict[CacheKey, float] = {}
+        self._selection_cache: Dict[CacheKey, NodeSelection] = {}
+        self._future_value_cache: Dict[CacheKey, float] = {}
+        self._future_selection_cache: Dict[CacheKey, NodeSelection] = {}
+        self._recursive_result_cache: Dict[CacheKey, RecursiveResult] = {}
         self._result_cache: Dict[Tuple[PositionKey, int, str], SearchResult] = {}
         self._cached_evaluator = _CachedEvaluator(self)
         self._branch_cache_lifecycle: list[Dict[str, Dict[str, int]]] = []
@@ -1061,21 +1115,85 @@ class AdaptiveExpectedValue:
         self._response_landscape_cache[position_key] = landscape
         return landscape
 
-    def node_selection(self, board: chess.Board, remaining_plies: int | None = None) -> NodeSelection | None:
+    def _record_adaptive_depth_decision(
+        self,
+        *,
+        cycle_limit: int | None,
+        inherited_remaining: int,
+        effective_remaining: int,
+        legal_move_count: int,
+        consideration_count: int,
+        deepening_branch_count: int,
+    ) -> None:
+        if cycle_limit is None:
+            self.diagnostics.forced_continuation_nodes += 1
+            if legal_move_count == 1:
+                self.diagnostics.objective_forced_nodes += 1
+            elif consideration_count == 1:
+                self.diagnostics.subjective_forced_nodes += 1
+            elif deepening_branch_count == 1:
+                self.diagnostics.quantile_forced_nodes += 1
+        elif cycle_limit == 0:
+            self.diagnostics.adaptive_depth_zero_nodes += 1
+        elif cycle_limit == 1:
+            self.diagnostics.adaptive_depth_one_cycle_nodes += 1
+        elif cycle_limit == 2:
+            self.diagnostics.adaptive_depth_two_cycle_nodes += 1
+        else:
+            self.diagnostics.adaptive_depth_full_nodes += 1
+        if effective_remaining < inherited_remaining:
+            self.diagnostics.adaptive_depth_reductions += 1
+
+    def _effective_remaining_plies(
+        self,
+        deepening_branch_count: int,
+        remaining_plies: int,
+        level: int,
+    ) -> tuple[int, int | None, int]:
+        cycle_limit = adaptive_cycle_limit(deepening_branch_count, self.cdepth)
+        if cycle_limit is None:
+            locally_allowed = remaining_plies
+        else:
+            locally_allowed = adaptive_recursive_plies_from_node(cycle_limit, level)
+        effective_remaining = min(remaining_plies, locally_allowed)
+        return effective_remaining, cycle_limit, locally_allowed
+
+    def node_selection(
+        self,
+        board: chess.Board,
+        remaining_plies: int | None = None,
+        level: int = 0,
+    ) -> NodeSelection | None:
         remaining = self.requested_recursive_plies if remaining_plies is None else remaining_plies
-        cache_key = (self.position_key(board), remaining)
+        position_key = self.position_key(board)
+        phase = level % 2
+        cache_key = (position_key, remaining, phase)
         selection = self._selection_cache.get(cache_key)
         if selection is None and remaining >= 0:
-            self.expected_value(board, remaining)
+            self._expected_value(board, remaining, level)
             selection = self._selection_cache.get(cache_key)
+            if selection is None and not board.is_game_over(claim_draw=False):
+                landscape = self.landscape(board, position_key)
+                considered = tuple(record for record in landscape.records if record.in_consideration_set)
+                ranked = ranked_for_refinement(considered, board.turn)
+                expanded_count = (
+                    0
+                    if remaining == 0
+                    else deepening_count_for_quantile(
+                        (record.probability for record in ranked),
+                        self.deepening_quantile,
+                    )
+                )
+                effective_remaining, _, _ = self._effective_remaining_plies(expanded_count, remaining, level)
+                selection = self._selection_cache.get((position_key, effective_remaining, phase))
         return selection
 
     def branch_observations(
-        self, board: chess.Board, remaining_plies: int | None = None
+        self, board: chess.Board, remaining_plies: int | None = None, level: int = 0
     ) -> Tuple[LandscapeObservation, ...]:
         remaining = self.requested_recursive_plies if remaining_plies is None else remaining_plies
-        self.expected_value(board, remaining)
-        selection = self.node_selection(board, remaining)
+        self._expected_value(board, remaining, level)
+        selection = self.node_selection(board, remaining, level)
         return selection.branches if selection is not None else ()
 
     def expected_value(self, board: chess.Board, remaining_plies: int | None = None) -> float:
@@ -1089,7 +1207,7 @@ class AdaptiveExpectedValue:
     ) -> RecursiveResult:
         if remaining_depth < 0:
             raise ValueError("remaining_depth must be non-negative")
-        cache_key = (self.position_key(board), remaining_depth)
+        cache_key = (self.position_key(board), remaining_depth, level % 2)
         cached = self._recursive_result_cache.get(cache_key)
         if cached is not None:
             self.diagnostics.cache_hits += 1
@@ -1107,7 +1225,9 @@ class AdaptiveExpectedValue:
             )
             self._recursive_result_cache[cache_key] = result
             return result
-        if remaining_depth == 0:
+
+        selection = self.node_selection(board, remaining_depth, level)
+        if remaining_depth == 0 or selection is None or not selection.selected_uci:
             result = RecursiveResult(
                 value=value,
                 endpoint_fen=board.fen(),
@@ -1117,8 +1237,7 @@ class AdaptiveExpectedValue:
             self._recursive_result_cache[cache_key] = result
             return result
 
-        selection = self.node_selection(board, remaining_depth)
-        if selection is None or not selection.branches:
+        if not selection.branches:
             result = RecursiveResult(value=value, endpoint_fen=board.fen(), principal_variation=(), depth_reached=0)
             self._recursive_result_cache[cache_key] = result
             return result
@@ -1128,7 +1247,7 @@ class AdaptiveExpectedValue:
         child = board.copy(stack=False)
         child.push(chosen.move)
         if chosen.was_deepened:
-            child_result = self._recursive_result(child, remaining_depth - 1, level + 1)
+            child_result = self._recursive_result(child, max(0, chosen.depth_used - 1), level + 1)
             result = RecursiveResult(
                 value=chosen.observable_value,
                 endpoint_fen=child_result.endpoint_fen,
@@ -1158,7 +1277,7 @@ class AdaptiveExpectedValue:
         self, board: chess.Board, remaining_depth: int, level: int
     ) -> Tuple[LandscapeObservation, ...]:
         self._expected_value(board, remaining_depth, level)
-        selection = self.node_selection(board, remaining_depth)
+        selection = self.node_selection(board, remaining_depth, level)
         return selection.branches if selection is not None else ()
 
     def _principal_variation_cycle_metadata(
@@ -1358,12 +1477,26 @@ class AdaptiveExpectedValue:
         current_u = landscape.expected_value
         current_branches = self._root_shallow_observations(landscape)
         considered = tuple(record for record in landscape.records if record.in_consideration_set)
+        ranked = ranked_for_refinement(considered, board.turn)
         expanded_count = deepening_count_for_quantile(
-            (record.probability for record in ranked_for_refinement(considered, board.turn)),
+            (record.probability for record in ranked),
             self.deepening_quantile,
         )
-        ranked = ranked_for_refinement(considered, board.turn)
         selected_uci = tuple(record.uci for record in ranked[:expanded_count])
+        root_cycle_limit = adaptive_cycle_limit(expanded_count, self.cdepth)
+        root_forced_continuation = root_cycle_limit is None
+        if root_cycle_limit is None:
+            root_recursive_plies = self.requested_recursive_plies
+        else:
+            root_recursive_plies = adaptive_recursive_plies_for_root(root_cycle_limit)
+        self._record_adaptive_depth_decision(
+            cycle_limit=root_cycle_limit,
+            inherited_remaining=self.requested_recursive_plies,
+            effective_remaining=root_recursive_plies,
+            legal_move_count=landscape.legal_move_count,
+            consideration_count=landscape.consideration_count,
+            deepening_branch_count=expanded_count,
+        )
         selected = set(selected_uci)
         self.diagnostics.nodes_evaluated += 1
         self.diagnostics.expanded_total += expanded_count
@@ -1374,6 +1507,7 @@ class AdaptiveExpectedValue:
             "entropy": landscape.entropy,
             "n_eff": landscape.effective_moves,
             "consideration_count": landscape.consideration_count,
+            "deepening_branch_count": expanded_count,
             "consideration_probability_mass_raw": landscape.consideration_probability_mass_raw,
             "deepening_quantile": self.deepening_quantile,
             "deepened_move_count": len(selected_uci),
@@ -1384,13 +1518,13 @@ class AdaptiveExpectedValue:
         moves_by_uci: dict[str, MoveEvaluation] = {}
         branch_by_uci: dict[str, LandscapeObservation] = {}
         detailed_uci = set(selected_uci)
-        if self.search_workers > 1 and len(considered) >= self.parallel_min_branches and self.requested_recursive_plies > 0:
+        if self.search_workers > 1 and len(considered) >= self.parallel_min_branches and root_recursive_plies > 0:
             args = [
                 {
                     "fen": board.fen(),
                     "record": record,
                     "selected": selected_uci,
-                    "remaining_plies": self.requested_recursive_plies,
+                    "remaining_plies": root_recursive_plies,
                     "cdepth": self.cdepth,
                     "level": 0,
                     "style": self.style,
@@ -1437,7 +1571,7 @@ class AdaptiveExpectedValue:
                     board,
                     record,
                     selected,
-                    self.requested_recursive_plies,
+                    root_recursive_plies,
                     0,
                     current_u,
                     current_u,
@@ -1462,16 +1596,25 @@ class AdaptiveExpectedValue:
         root_branches = tuple(branch_by_uci[record.uci] for record in considered)
         root_value = side_to_move_backup(board.turn, root_branches) if root_branches else current_u
         root_key = self.position_key(board)
-        self._value_cache[(root_key, 0)] = current_u
-        self._selection_cache[(root_key, 0)] = NodeSelection(
+        root_phase = 0
+        self._value_cache[(root_key, 0, root_phase)] = current_u
+        self._selection_cache[(root_key, 0, root_phase)] = NodeSelection(
             entropy=landscape.entropy,
             effective_moves=landscape.effective_moves,
             expanded_count=0,
             selected_uci=(),
             branches=current_branches,
         )
-        self._value_cache[(root_key, self.requested_recursive_plies)] = root_value
-        self._selection_cache[(root_key, self.requested_recursive_plies)] = NodeSelection(
+        self._value_cache[(root_key, self.requested_recursive_plies, root_phase)] = root_value
+        self._selection_cache[(root_key, self.requested_recursive_plies, root_phase)] = NodeSelection(
+            entropy=landscape.entropy,
+            effective_moves=landscape.effective_moves,
+            expanded_count=expanded_count,
+            selected_uci=selected_uci,
+            branches=root_branches,
+        )
+        self._value_cache[(root_key, root_recursive_plies, root_phase)] = root_value
+        self._selection_cache[(root_key, root_recursive_plies, root_phase)] = NodeSelection(
             entropy=landscape.entropy,
             effective_moves=landscape.effective_moves,
             expanded_count=expanded_count,
@@ -1480,10 +1623,19 @@ class AdaptiveExpectedValue:
         )
         root_diagnostics = {
             **self.diagnostics.as_dict(),
+            "configured_cdepth": self.cdepth,
+            "configured_recursive_plies": self.requested_recursive_plies,
+            "root_legal_move_count": landscape.legal_move_count,
+            "root_consideration_count": landscape.consideration_count,
+            "root_deepening_branch_count": expanded_count,
+            "root_forced_continuation": root_forced_continuation,
+            "root_adaptive_cycle_limit": root_cycle_limit,
+            "root_adaptive_recursive_plies": root_recursive_plies,
             "legal_move_count": landscape.legal_move_count,
             "entropy": landscape.entropy,
             "n_eff": landscape.effective_moves,
             "consideration_count": landscape.consideration_count,
+            "deepening_branch_count": expanded_count,
             "consideration_probability_mass_raw": landscape.consideration_probability_mass_raw,
             "deepening_quantile": self.deepening_quantile,
             "deepened_move_count": len(selected_uci),
@@ -1528,7 +1680,7 @@ class AdaptiveExpectedValue:
         after = board.copy(stack=False)
         after.push(record.move)
         root_selected = branch.was_deepened if branch is not None else False
-        remaining_depth = self.requested_recursive_plies if root_selected else 0
+        remaining_depth = branch.remaining_plies if root_selected and branch is not None else 0
         recursive = self._recursive_result(after, remaining_depth, 1)
         terminal_u = recursive.value
         g_tilde = terminal_u - current_u
@@ -1616,7 +1768,7 @@ class AdaptiveExpectedValue:
                 "qwa_unavailable_reason": qwa_unavailable_reason,
             }
 
-        candidate_selection = self.node_selection(after, remaining_depth)
+        candidate_selection = self.node_selection(after, remaining_depth, 1)
         response_records = candidate_selection.branches if candidate_selection is not None else ()
         reply_records = {reply.uci: reply for reply in self.response_landscape(after).records}
         selected_rank = {
@@ -1694,23 +1846,24 @@ class AdaptiveExpectedValue:
             self.diagnostics.maximum_depth_reached, level
         )
         position_key = self.position_key(board)
-        cache_key = (position_key, remaining_plies)
-        if cache_key in self._value_cache:
+        phase = level % 2
+        inherited_cache_key = (position_key, remaining_plies, phase)
+        if inherited_cache_key in self._value_cache:
             self.diagnostics.cache_hits += 1
-            return self._value_cache[cache_key]
+            return self._value_cache[inherited_cache_key]
 
         self.diagnostics.nodes_evaluated += 1
         if board.is_game_over(claim_draw=False):
             value = self.static_value(board)
-            self._selection_cache[cache_key] = _terminal_observation(value, remaining_plies, self.search_mode)
-            self._value_cache[cache_key] = value
+            self._selection_cache[inherited_cache_key] = _terminal_observation(value, remaining_plies, self.search_mode)
+            self._value_cache[inherited_cache_key] = value
             return value
 
         landscape = self.landscape(board)
         if not landscape.records:
             value = self.static_value(board)
-            self._selection_cache[cache_key] = _terminal_observation(value, remaining_plies, self.search_mode)
-            self._value_cache[cache_key] = value
+            self._selection_cache[inherited_cache_key] = _terminal_observation(value, remaining_plies, self.search_mode)
+            self._value_cache[inherited_cache_key] = value
             return value
 
         if remaining_plies == 0:
@@ -1723,28 +1876,80 @@ class AdaptiveExpectedValue:
                     was_deepened=False,
                     depth_used=0,
                     search_mode=self.search_mode,
-                    remaining_plies=remaining_plies,
+                    remaining_plies=0,
                 )
                 for record in landscape.considered_records
             )
-            self._selection_cache[cache_key] = NodeSelection(
+            selection = NodeSelection(
                 entropy=landscape.entropy,
                 effective_moves=landscape.effective_moves,
                 expanded_count=0,
                 selected_uci=(),
                 branches=branches,
             )
-            self._value_cache[cache_key] = landscape.expected_value
+            self._selection_cache[inherited_cache_key] = selection
+            self._value_cache[inherited_cache_key] = landscape.expected_value
             return landscape.expected_value
 
         considered = tuple(record for record in landscape.records if record.in_consideration_set)
+        ranked = ranked_for_refinement(considered, board.turn)
         expanded_count = deepening_count_for_quantile(
-            (record.probability for record in ranked_for_refinement(considered, board.turn)),
+            (record.probability for record in ranked),
             self.deepening_quantile,
         )
-        ranked = ranked_for_refinement(considered, board.turn)
         selected_uci = tuple(record.uci for record in ranked[:expanded_count])
         selected = set(selected_uci)
+        effective_remaining, local_cycles, _ = self._effective_remaining_plies(
+            expanded_count,
+            remaining_plies,
+            level,
+        )
+        self._record_adaptive_depth_decision(
+            cycle_limit=local_cycles,
+            inherited_remaining=remaining_plies,
+            effective_remaining=effective_remaining,
+            legal_move_count=landscape.legal_move_count,
+            consideration_count=landscape.consideration_count,
+            deepening_branch_count=expanded_count,
+        )
+        cache_key = (position_key, effective_remaining, phase)
+        if cache_key in self._value_cache:
+            self.diagnostics.cache_hits += 1
+            value = self._value_cache[cache_key]
+            if cache_key != inherited_cache_key:
+                self._value_cache[inherited_cache_key] = value
+                selection = self._selection_cache.get(cache_key)
+                if selection is not None:
+                    self._selection_cache[inherited_cache_key] = selection
+            return value
+
+        if effective_remaining == 0:
+            branches = tuple(
+                LandscapeObservation(
+                    move=record.move,
+                    uci=record.uci,
+                    probability=record.probability,
+                    observable_value=float(record.static_after),
+                    was_deepened=False,
+                    depth_used=0,
+                    search_mode=self.search_mode,
+                    remaining_plies=effective_remaining,
+                )
+                for record in landscape.considered_records
+            )
+            selection = NodeSelection(
+                entropy=landscape.entropy,
+                effective_moves=landscape.effective_moves,
+                expanded_count=0,
+                selected_uci=(),
+                branches=branches,
+            )
+            self._selection_cache[cache_key] = selection
+            self._selection_cache[inherited_cache_key] = selection
+            self._value_cache[cache_key] = landscape.expected_value
+            self._value_cache[inherited_cache_key] = landscape.expected_value
+            return landscape.expected_value
+
         self.diagnostics.expanded_total += expanded_count
         self.diagnostics.expanded_nodes += 1
 
@@ -1752,20 +1957,23 @@ class AdaptiveExpectedValue:
             board,
             considered,
             selected,
-            remaining_plies,
+            effective_remaining,
             level,
             landscape.expected_value,
         )
         value = side_to_move_backup(board.turn, branches)
 
-        self._selection_cache[cache_key] = NodeSelection(
+        selection = NodeSelection(
             entropy=landscape.entropy,
             effective_moves=landscape.effective_moves,
             expanded_count=expanded_count,
             selected_uci=selected_uci,
             branches=tuple(branches),
         )
+        self._selection_cache[cache_key] = selection
+        self._selection_cache[inherited_cache_key] = selection
         self._value_cache[cache_key] = value
+        self._value_cache[inherited_cache_key] = value
         return value
 
     def _evaluate_branches(
@@ -1879,7 +2087,7 @@ class AdaptiveExpectedValue:
             remaining_after_move = remaining_plies - 1 if own_selected else 0
             branch_value = self._expected_value(after, remaining_after_move, level + 1)
             if own_selected:
-                reply_selection = self.node_selection(after, remaining_after_move)
+                reply_selection = self.node_selection(after, remaining_after_move, level + 1)
                 reply_landscape = self.response_landscape(after)
                 response_neff = reply_landscape.effective_moves
                 response_k = reply_selection.expanded_count if reply_selection is not None else 0

@@ -6,6 +6,7 @@ import importlib.util
 import math
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import chess
@@ -59,7 +60,7 @@ from thermo_chess.measure import (
 )
 from thermo_chess.metrics import effective_number, entropy
 from thermo_chess.player import ThermoPlayer
-from thermo_chess.search import AdaptiveExpectedValue, LandscapeObservation, SearchResult, adaptive_breadth, mass_preserving_expectation, requested_recursive_plies_for_cdepth, side_to_move_backup, validate_cdepth
+from thermo_chess.search import AdaptiveExpectedValue, LandscapeObservation, SearchResult, adaptive_breadth, adaptive_cycle_limit, adaptive_recursive_plies_from_node, mass_preserving_expectation, requested_recursive_plies_for_cdepth, side_to_move_backup, validate_cdepth
 from thermo_chess.simulation import (
     STRATEGY_NAMES,
     MatchConfig,
@@ -673,6 +674,71 @@ def test_adaptive_breadth_rule(effective_moves: float, adaptive_c: float, legal_
     assert adaptive_breadth(effective_moves, adaptive_c, legal_moves) == expected
 
 
+@pytest.mark.parametrize(
+    ("consideration_count", "cdepth", "expected"),
+    [
+        (100, 1, 1),
+        (16, 1, 1),
+        (15, 1, 1),
+        (6, 1, 1),
+        (5, 1, 1),
+        (2, 1, 1),
+        (16, 2, 1),
+        (15, 2, 2),
+        (6, 2, 2),
+        (5, 2, 2),
+        (2, 2, 2),
+        (16, 3, 1),
+        (15, 3, 2),
+        (6, 3, 2),
+        (5, 3, 3),
+        (2, 3, 3),
+    ],
+)
+def test_adaptive_cycle_limit_thresholds(
+    consideration_count: int,
+    cdepth: int,
+    expected: int,
+) -> None:
+    assert adaptive_cycle_limit(consideration_count, cdepth) == expected
+
+
+@pytest.mark.parametrize("cdepth", [1, 2, 3])
+def test_adaptive_cycle_limit_treats_single_deepening_branch_as_forced(cdepth: int) -> None:
+    assert adaptive_cycle_limit(1, cdepth) is None
+
+
+@pytest.mark.parametrize(
+    ("cycle_limit", "level", "expected"),
+    [
+        (1, 1, 1),
+        (1, 2, 2),
+        (1, 3, 1),
+        (1, 4, 2),
+        (2, 1, 3),
+        (2, 2, 4),
+        (2, 3, 3),
+        (2, 4, 4),
+        (3, 1, 5),
+        (3, 2, 6),
+        (3, 3, 5),
+        (3, 4, 6),
+    ],
+)
+def test_adaptive_recursive_plies_from_node_uses_phase_not_absolute_level(
+    cycle_limit: int,
+    level: int,
+    expected: int,
+) -> None:
+    assert adaptive_recursive_plies_from_node(cycle_limit, level) == expected
+
+
+def test_adaptive_recursive_plies_from_node_preserves_same_phase_allowance() -> None:
+    for cycle_limit in (1, 2, 3):
+        assert adaptive_recursive_plies_from_node(cycle_limit, 1) == adaptive_recursive_plies_from_node(cycle_limit, 3)
+        assert adaptive_recursive_plies_from_node(cycle_limit, 2) == adaptive_recursive_plies_from_node(cycle_limit, 4)
+
+
 def test_mass_preserving_expectation_synthetic_limits_and_partial_case() -> None:
     no_deep = (
         LandscapeObservation(chess.Move.from_uci("a2a3"), "a2a3", 0.2, 1.0, False, 0),
@@ -718,6 +784,332 @@ def test_search_result_serialization_and_parallel_match() -> None:
     assert serial_selected.search_endpoint_fen == parallel_selected.search_endpoint_fen
     assert serial_selected.thermodynamic_endpoint_fen == parallel_selected.thermodynamic_endpoint_fen
 
+
+def test_broad_cdepth_one_root_keeps_one_adaptive_cycle() -> None:
+    board = chess.Board()
+    evaluator = StaticEvaluator()
+    search = AdaptiveExpectedValue(Style(), 1.0, evaluator, cdepth=1, deepening_quantile=0.8)
+    result = search.search_result(board)
+
+    considered = [move for move in result.moves if move.in_consideration_set]
+    assert result.K > 15
+    assert result.diagnostics["root_adaptive_cycle_limit"] == 1
+    assert result.diagnostics["root_adaptive_recursive_plies"] == 1
+    assert result.diagnostics["deepened_move_count"] > 0
+    assert result.selected_uci
+    assert considered
+    assert all(move.g_tilde is not None for move in considered)
+    assert any(move.deepened_cycles == 1 for move in considered if move.selected_for_refinement)
+
+
+def test_broad_branching_clips_all_configured_depths_to_one_cycle() -> None:
+    board = chess.Board()
+    for cdepth in (1, 2, 3):
+        result = AdaptiveExpectedValue(
+            Style(),
+            1.0,
+            StaticEvaluator(),
+            cdepth=cdepth,
+            deepening_quantile=1.0,
+        ).search_result(board)
+
+        assert result.K > 15
+        assert result.diagnostics["root_adaptive_cycle_limit"] == 1
+        assert result.diagnostics["root_adaptive_recursive_plies"] == 1
+        assert result.selected_uci
+        assert max(move.deepened_cycles for move in result.moves if move.in_consideration_set) <= 1
+
+
+def test_medium_branching_caps_cdepth_three_at_two_cycles() -> None:
+    board = chess.Board("8/8/8/8/8/8/PPP5/K2k4 w - - 0 1")
+    result = AdaptiveExpectedValue(
+        Style(),
+        1.0,
+        StaticEvaluator(),
+        cdepth=3,
+        deepening_quantile=1.0,
+    ).search_result(board)
+
+    assert 6 <= result.K <= 15
+    assert result.diagnostics["root_adaptive_cycle_limit"] == 2
+    assert result.diagnostics["root_adaptive_recursive_plies"] == 3
+    assert result.selected_uci
+    assert max(move.deepened_cycles for move in result.moves if move.in_consideration_set) <= 2
+
+
+def test_narrow_branching_keeps_full_depth_available() -> None:
+    board = chess.Board("8/8/8/8/8/8/P7/K1k5 w - - 0 1")
+    result = AdaptiveExpectedValue(
+        Style(),
+        1.0,
+        StaticEvaluator(),
+        cdepth=2,
+        deepening_quantile=1.0,
+    ).search_result(board)
+
+    assert result.K <= 5
+    assert result.diagnostics["root_adaptive_cycle_limit"] == 2
+    assert result.diagnostics["root_adaptive_recursive_plies"] == 3
+    assert result.selected_uci
+    assert max(move.deepened_cycles for move in result.moves if move.in_consideration_set) <= 2
+    assert any(move.recursive_plies_used > 1 for move in result.moves if move.in_consideration_set)
+
+
+class _ForcedConsiderationSearch(AdaptiveExpectedValue):
+    def __init__(self, *args: object, forced_counts: dict[str, int], **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self._forced_counts = forced_counts
+
+    def landscape(self, board: chess.Board, key: object | None = None):  # type: ignore[override]
+        landscape = super().landscape(board, key)  # type: ignore[arg-type]
+        forced = self._forced_counts.get(board.fen())
+        if forced is None and "__non_root__" in self._forced_counts:
+            forced = self._forced_counts["__non_root__"]
+        return landscape if forced is None else replace(landscape, consideration_count=forced)
+
+    def _new_branch_context(self) -> "_ForcedConsiderationSearch":
+        return _ForcedConsiderationSearch(
+            self.style,
+            self.beta,
+            self.evaluator,
+            cdepth=self.cdepth,
+            deepening_quantile=self.deepening_quantile,
+            search_mode=self.search_mode,
+            search_workers=1,
+            parallel_min_branches=self.parallel_min_branches,
+            kappa=self.kappa,
+            use_context_cache=self.use_context_cache,
+            forced_counts=self._forced_counts,
+        )
+
+
+class _ControlledConsiderationSearch(AdaptiveExpectedValue):
+    def __init__(self, *args: object, considered_count: int, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self._considered_count = considered_count
+
+    def landscape(self, board: chess.Board, key: object | None = None):  # type: ignore[override]
+        landscape = super().landscape(board, key)  # type: ignore[arg-type]
+        records = list(landscape.records)
+        considered_count = min(self._considered_count, len(records))
+        probability = 1.0 / considered_count if considered_count else 0.0
+        controlled = tuple(
+            replace(
+                record,
+                probability=probability if index < considered_count else 0.0,
+                considered_probability=probability if index < considered_count else 0.0,
+                in_consideration_set=index < considered_count,
+                consideration_rank=index + 1 if index < considered_count else None,
+            )
+            for index, record in enumerate(records)
+        )
+        return replace(
+            landscape,
+            records=list(controlled),
+            consideration_count=considered_count,
+            consideration_probability_mass_raw=1.0,
+        )
+
+    def _new_branch_context(self) -> "_ControlledConsiderationSearch":
+        return _ControlledConsiderationSearch(
+            self.style,
+            self.beta,
+            self.evaluator,
+            cdepth=self.cdepth,
+            deepening_quantile=self.deepening_quantile,
+            search_mode=self.search_mode,
+            search_workers=1,
+            parallel_min_branches=self.parallel_min_branches,
+            kappa=self.kappa,
+            use_context_cache=self.use_context_cache,
+            considered_count=self._considered_count,
+        )
+
+
+def test_adaptive_depth_removed_by_ancestor_cannot_be_restored() -> None:
+    board = chess.Board()
+    result = AdaptiveExpectedValue(
+        Style(),
+        1.0,
+        StaticEvaluator(),
+        cdepth=3,
+        deepening_quantile=0.8,
+    ).search_result(board)
+
+    assert result.diagnostics["root_adaptive_cycle_limit"] == 1
+    assert result.diagnostics["root_adaptive_recursive_plies"] == 1
+    assert max(move.deepened_cycles for move in result.moves if move.in_consideration_set) <= 1
+
+
+def test_deeper_node_can_reduce_inherited_depth_to_two_cycles() -> None:
+    board = chess.Board("8/8/8/8/8/8/P1k5/K7 w - - 0 1")
+    result = AdaptiveExpectedValue(
+        Style(),
+        1.0,
+        StaticEvaluator(),
+        cdepth=3,
+        deepening_quantile=1.0,
+    ).search_result(board)
+
+    assert result.diagnostics["root_adaptive_cycle_limit"] == 3
+    assert result.diagnostics["root_adaptive_recursive_plies"] == 5
+    assert result.selected_uci
+    assert max(move.deepened_cycles for move in result.moves if move.in_consideration_set) <= 2
+
+
+def test_depth_uses_quantile_count_before_consideration_count() -> None:
+    board = chess.Board("8/8/8/8/8/8/RP6/K2k4 w - - 0 1")
+    concentrated = AdaptiveExpectedValue(
+        Style(center=10.0, development=0.1, material=0.1, castling=0.1, king_safety=0.1, king_pressure=0.1),
+        16.0,
+        StaticEvaluator(),
+        cdepth=3,
+        deepening_quantile=0.8,
+    ).search_result(board)
+    diffuse = AdaptiveExpectedValue(
+        Style(),
+        1.0,
+        StaticEvaluator(),
+        cdepth=3,
+        deepening_quantile=0.8,
+    ).search_result(board)
+
+    assert concentrated.diagnostics["root_consideration_count"] == 5
+    assert concentrated.diagnostics["root_deepening_branch_count"] == 2
+    assert concentrated.diagnostics["root_adaptive_cycle_limit"] == 3
+    assert diffuse.diagnostics["root_consideration_count"] == 9
+    assert diffuse.diagnostics["root_deepening_branch_count"] == 8
+    assert diffuse.diagnostics["root_adaptive_cycle_limit"] == 2
+
+
+def test_quantile_deterministic_continuation_is_forced_not_full_depth_table() -> None:
+    board = chess.Board("8/8/8/8/8/8/PPP5/K2k4 w - - 0 1")
+    result = AdaptiveExpectedValue(
+        Style(),
+        1.0,
+        StaticEvaluator(),
+        cdepth=3,
+        deepening_quantile=0.01,
+    ).search_result(board)
+
+    assert result.diagnostics["root_consideration_count"] > 1
+    assert result.diagnostics["root_deepening_branch_count"] == 1
+    assert result.diagnostics["root_forced_continuation"] is True
+    assert result.diagnostics["root_adaptive_cycle_limit"] is None
+    assert result.diagnostics["quantile_forced_nodes"] >= 1
+    assert len(result.selected_uci) == 1
+
+
+def test_objectively_forced_root_follows_sole_legal_move() -> None:
+    board = chess.Board("8/8/8/8/8/8/8/K1k5 w - - 0 1")
+    result = AdaptiveExpectedValue(
+        Style(),
+        1.0,
+        StaticEvaluator(),
+        cdepth=2,
+        deepening_quantile=0.8,
+    ).search_result(board)
+
+    assert result.diagnostics["root_legal_move_count"] == 1
+    assert result.diagnostics["root_forced_continuation"] is True
+    assert result.diagnostics["objective_forced_nodes"] >= 1
+    assert result.selected_uci == ("a1a2",)
+    assert next(move for move in result.moves if move.uci == "a1a2").selected_for_refinement
+
+
+def test_subjectively_forced_root_follows_sole_considered_move() -> None:
+    board = chess.Board()
+    result = _ControlledConsiderationSearch(
+        Style(),
+        1.0,
+        StaticEvaluator(),
+        cdepth=2,
+        deepening_quantile=0.8,
+        considered_count=1,
+    ).search_result(board)
+
+    considered = [move for move in result.moves if move.in_consideration_set]
+    outside = [move for move in result.moves if not move.in_consideration_set]
+    assert result.diagnostics["root_legal_move_count"] > 1
+    assert result.diagnostics["root_consideration_count"] == 1
+    assert result.diagnostics["root_deepening_branch_count"] == 1
+    assert result.diagnostics["root_forced_continuation"] is True
+    assert result.diagnostics["subjective_forced_nodes"] >= 1
+    assert len(considered) == 1
+    assert considered[0].selected_for_refinement
+    assert all(move.qwa_unavailable_reason == "outside_consideration_set" for move in outside)
+
+
+def test_cdepth_three_can_use_extra_cycle_in_narrow_positions() -> None:
+    board = chess.Board("8/8/8/8/8/8/P7/K1k5 w - - 0 1")
+    cdepth_two = AdaptiveExpectedValue(
+        Style(),
+        1.0,
+        StaticEvaluator(),
+        cdepth=2,
+        deepening_quantile=1.0,
+    ).search_result(board)
+    cdepth_three = AdaptiveExpectedValue(
+        Style(),
+        1.0,
+        StaticEvaluator(),
+        cdepth=3,
+        deepening_quantile=1.0,
+    ).search_result(board)
+
+    two_cycles = max(move.deepened_cycles for move in cdepth_two.moves if move.in_consideration_set)
+    three_cycles = max(move.deepened_cycles for move in cdepth_three.moves if move.in_consideration_set)
+    assert cdepth_two.diagnostics["root_adaptive_cycle_limit"] == 2
+    assert cdepth_three.diagnostics["root_adaptive_cycle_limit"] == 3
+    assert two_cycles <= 2
+    assert three_cycles == 3
+    assert max(move.recursive_plies_used for move in cdepth_three.moves) > max(
+        move.recursive_plies_used for move in cdepth_two.moves
+    )
+    assert {move.principal_variation for move in cdepth_two.moves} != {
+        move.principal_variation for move in cdepth_three.moves
+    }
+
+
+def test_phase_specific_cache_keys_prevent_cross_phase_reuse() -> None:
+    board = chess.Board("8/8/8/8/8/8/PPP5/K2k4 w - - 0 1")
+    search = _ForcedConsiderationSearch(
+        Style(),
+        1.0,
+        StaticEvaluator(),
+        cdepth=3,
+        deepening_quantile=1.0,
+        forced_counts={"__non_root__": 10},
+    )
+    key = search.position_key(board)
+
+    search._future_subjective_value(board, 4, 1)  # noqa: SLF001
+    search._future_subjective_value(board, 4, 2)  # noqa: SLF001
+
+    assert (key, 4, 1) in search._value_cache  # noqa: SLF001
+    assert (key, 4, 0) in search._value_cache  # noqa: SLF001
+    assert (key, 3, 1) in search._value_cache  # noqa: SLF001
+
+
+def test_quantile_selection_is_preserved_when_adaptive_depth_is_positive() -> None:
+    board = chess.Board("8/8/8/8/8/8/PPP5/K2k4 w - - 0 1")
+    quantile = 0.55
+    search = AdaptiveExpectedValue(
+        Style(),
+        1.0,
+        StaticEvaluator(),
+        cdepth=2,
+        deepening_quantile=quantile,
+    )
+    landscape = search.landscape(board)
+    expected_count = deepening_count_for_quantile(
+        (record.probability for record in sorted(landscape.considered_records, key=lambda record: record.probability, reverse=True)),
+        quantile,
+    )
+    result = search.search_result(board)
+
+    assert result.diagnostics["root_adaptive_cycle_limit"] == 2
+    assert len(result.selected_uci) == expected_count
 
 def test_search_and_player_transient_caches_can_be_cleared_after_materialization() -> None:
     board = chess.Board("7k/8/8/8/8/8/6K1/7R w - - 0 1")
@@ -841,13 +1233,14 @@ def test_serial_root_branch_contexts_are_cleared_between_candidates() -> None:
 def test_root_candidates_are_materialized_in_one_branch_pass() -> None:
     board = chess.Board()
     evaluator = StaticEvaluator()
-    search = AdaptiveExpectedValue(
+    search = _ForcedConsiderationSearch(
         Style(center=1.5, development=1.0),
         2.0,
         evaluator,
         cdepth=2,
         deepening_quantile=0.2,
         search_workers=1,
+        forced_counts={"__non_root__": 5},
     )
 
     result = search.search_result(board)
@@ -887,12 +1280,13 @@ def test_serial_and_parallel_root_materialization_counters_match() -> None:
 def test_recursive_backup_uses_side_to_move_minimax_over_available_endpoints() -> None:
     board = chess.Board()
     evaluator = StaticEvaluator()
-    search = AdaptiveExpectedValue(
+    search = _ForcedConsiderationSearch(
         Style(center=1.5, development=1.0),
         2.0,
         evaluator,
         cdepth=1,
         deepening_quantile=0.2,
+        forced_counts={"__non_root__": 10},
     )
     value = search.expected_value(board)
     selection = search.node_selection(board)
@@ -909,12 +1303,13 @@ def test_recursive_backup_uses_side_to_move_minimax_over_available_endpoints() -
 def test_root_adaptive_g_tilde_does_not_deepen_unselected_moves() -> None:
     board = chess.Board()
     evaluator = StaticEvaluator()
-    search = AdaptiveExpectedValue(
+    search = _ForcedConsiderationSearch(
         Style(center=1.5, development=1.0),
         2.0,
         evaluator,
         cdepth=2,
         deepening_quantile=0.05,
+        forced_counts={"__non_root__": 5},
     )
     result = search.search_result(board)
     selected = {move.uci for move in result.moves if move.selected_for_refinement}
@@ -942,12 +1337,13 @@ def test_root_adaptive_g_tilde_does_not_deepen_unselected_moves() -> None:
 def test_internal_adaptive_backup_uses_minimax_not_weighted_sum() -> None:
     board = chess.Board()
     evaluator = StaticEvaluator()
-    search = AdaptiveExpectedValue(
+    search = _ForcedConsiderationSearch(
         Style(center=1.5, development=1.0),
         2.0,
         evaluator,
         cdepth=2,
         deepening_quantile=0.2,
+        forced_counts={"__non_root__": 5},
     )
     root_result = search.search_result(board)
     selected = next(move for move in root_result.moves if move.selected_for_refinement)
@@ -964,7 +1360,7 @@ def test_internal_adaptive_backup_uses_minimax_not_weighted_sum() -> None:
 
 
 def test_qwa_uses_selected_same_turn_endpoint_and_nontrivial_decomposition() -> None:
-    board = chess.Board()
+    board = chess.Board("8/8/8/8/8/8/PPP5/K2k4 w - - 0 1")
     evaluator = StaticEvaluator()
     player = ThermoPlayer(
         "white",
@@ -1049,14 +1445,15 @@ def test_full_cycle_deepening_aligns_search_and_thermodynamic_endpoints() -> Non
     assert result.moves
     for move in result.moves:
         assert move.requested_cycles == 3
-        assert move.deepened_cycles == 3
-        assert move.search_endpoint_fen == move.thermodynamic_endpoint_fen
-        assert move.g_tilde == pytest.approx(move.thermo_g_tilde)
-        assert move.thermo_g_tilde == pytest.approx(move.q_tilde + move.w_tilde + move.a_tilde)
+        assert move.deepened_cycles <= 3
+        if move.deepened_cycles == 3:
+            assert move.search_endpoint_fen == move.thermodynamic_endpoint_fen
+            assert move.g_tilde == pytest.approx(move.thermo_g_tilde)
+            assert move.thermo_g_tilde == pytest.approx(move.q_tilde + move.w_tilde + move.a_tilde)
 
 
 def test_search_and_player_choice_identities() -> None:
-    board = chess.Board("7k/8/8/8/8/8/6K1/7R w - - 0 1")
+    board = chess.Board("8/8/8/8/8/8/P7/K1k5 w - - 0 1")
     evaluator = StaticEvaluator()
     player = ThermoPlayer("white", chess.WHITE, Style(), beta=1.0, cdepth=2)
     result = player.evaluate_landscape(board, evaluator)
@@ -1235,11 +1632,8 @@ def test_simulation_saves_static_components_for_deepened_responses(tmp_path: Pat
     )
     data = json.loads(Path(result["json"]).read_text(encoding="utf-8"))
     csv_rows = list(csv.DictReader(Path(result["csv"]).open(newline="", encoding="utf-8")))
-    move = next(
-        move
-        for move in data["plies"][0]["search_result"]["moves"]
-        if move["responses"]
-    )
+    moves = data["plies"][0]["search_result"]["moves"]
+    move = next(move for move in moves if move["responses"])
     response = move["responses"][0]
 
     assert set(move["static_components_after_move"]) == set(COMPONENT_ORDER)
@@ -1254,6 +1648,7 @@ def test_simulation_saves_static_components_for_deepened_responses(tmp_path: Pat
     assert "requested_cycles" in csv_rows[0]
     assert "deepened_cycles" in csv_rows[0]
     assert "thermo_g_tilde" in csv_rows[0]
+    assert data["plies"][0]["search_result"]["diagnostics"]["root_adaptive_cycle_limit"] == 1
     assert move["total_probability_mass"] == pytest.approx(1.0)
     assert (
         move["deepened_probability_mass"] + move["nondeepened_probability_mass"]
